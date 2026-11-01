@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xbox-wishlist-sync"
+version = "0.1.0"
+description = "Mirror an Xbox wishlist onto Deku Deals and TrueAchievements"
+requires-python = ">=3.13"
+dependencies = ["curl_cffi>=0.17.0,<1"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["wsync*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

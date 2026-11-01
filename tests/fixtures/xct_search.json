@@ -1,0 +1,81 @@
+{
+  "Alan Wake 2": {
+    "rows": [
+      {
+        "tid": "1693830737",
+        "productId": "9PNZH065X7PV",
+        "title": "Alan Wake 2",
+        "publisher": "Epic Games",
+        "status": "yes",
+        "platforms": [
+          "Xbox Series X|S"
+        ],
+        "xpa": false,
+        "region": "UK",
+        "edition": "Deluxe / Complete",
+        "note": "",
+        "variants": [],
+        "varies": false,
+        "source": "Google Sheet"
+      }
+    ],
+    "offset": 0,
+    "limit": 50,
+    "rebuilding": false,
+    "shown": 1,
+    "total": 1
+  },
+  "Alien Isolation": {
+    "rows": [],
+    "offset": 0,
+    "limit": 50,
+    "rebuilding": false,
+    "shown": 0,
+    "total": 0
+  },
+  "Battlefield 2042": {
+    "rows": [
+      {
+        "tid": "2106872096",
+        "productId": "9P0T51BDDWVT",
+        "title": "Battlefield 2042 (SX)",
+        "publisher": "Electronic Arts",
+        "status": "yes",
+        "platforms": [
+          "Xbox Series X|S",
+          "Xbox Cloud Gaming"
+        ],
+        "xpa": false,
+        "region": "",
+        "edition": "",
+        "note": "",
+        "variants": [],
+        "varies": false,
+        "source": "Form"
+      },
+      {
+        "tid": "1952300170",
+        "productId": "9PD5BFNZ4V7K",
+        "title": "Battlefield 2042 (X1)",
+        "publisher": "Electronic Arts",
+        "status": "yes",
+        "platforms": [
+          "Xbox One",
+          "Xbox Series X|S"
+        ],
+        "xpa": false,
+        "region": "",
+        "edition": "",
+        "note": "",
+        "variants": [],
+        "varies": false,
+        "source": "Form"
+      }
+    ],
+    "offset": 0,
+    "limit": 50,
+    "rebuilding": false,
+    "shown": 2,
+    "total": 2
+  }
+}
