@@ -37,6 +37,7 @@ PAGE_PAUSE = 0.5
 MAX_PAGES = 50
 MAX_REDIRECTS = 5
 RATE_LIMIT_WAITS = (20, 60)  # seconds to wait before retrying a GET answered HTTP 429
+NETWORK_RETRY_WAITS = (5, 15)  # seconds to wait before retrying a GET that got no answer at all
 FORMATS = ("", "either", "physical", "digital")
 # What the share page's "Desired format" detail says, as our format keys.
 _SHARED_FORMAT = {"physical": "physical", "digital": "digital", "physical or digital": "either"}
@@ -50,6 +51,10 @@ class DekuError(Exception):
 
 class AuthError(DekuError):
     """Not logged in, and logging in again didn't help."""
+
+
+class DekuNetworkError(DekuError):
+    """No HTTP answer at all (timeout, reset, DNS). Reads retry it; writes don't."""
 
 
 @dataclass(frozen=True)
@@ -123,7 +128,10 @@ class UrllibTransport:
         except urllib.error.HTTPError as e:
             result = Response(e.code, url, e.read().decode("utf-8", "replace"), e.headers.get("Location"))
         except (urllib.error.URLError, OSError) as e:
-            raise DekuError(f"network error: {type(e).__name__}") from None
+            # Name the cause (timeout, reset, DNS) but never the URL.
+            reason = getattr(e, "reason", None)
+            cause = f"({type(reason).__name__})" if isinstance(reason, BaseException) else ""
+            raise DekuNetworkError(f"network error: {type(e).__name__}{cause}") from None
         self._save()
         return result
 
@@ -323,12 +331,23 @@ class DekuClient:
     # ---- plumbing
 
     def _fetch(self, url: str) -> Response:
-        """One GET, retried after a pause while the site answers 429 (rate limited)."""
+        """One GET, retried after a pause while the site answers 429 (rate limited) or gives no
+        answer at all (a transient network error; a read is safe to repeat)."""
         for wait in (*RATE_LIMIT_WAITS, None):
-            resp = self._http.request("GET", url, None, None)
+            resp = self._fetch_once(url)
             if resp.status != 429 or wait is None:
                 return resp
             self._sleep(wait)
+        raise AssertionError("unreachable")
+
+    def _fetch_once(self, url: str) -> Response:
+        for wait in (*NETWORK_RETRY_WAITS, None):
+            try:
+                return self._http.request("GET", url, None, None)
+            except DekuNetworkError:
+                if wait is None:
+                    raise
+                self._sleep(wait)
         raise AssertionError("unreachable")
 
     def _get(self, url: str) -> Response:

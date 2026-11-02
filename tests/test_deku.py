@@ -56,7 +56,10 @@ class Fake:
         path = url[len(BASE):]
         for (m, prefix), queue in self.routes.items():
             if m == method and path.startswith(prefix):
-                return queue.pop(0) if len(queue) > 1 else queue[0]
+                r = queue.pop(0) if len(queue) > 1 else queue[0]
+                if isinstance(r, Exception):
+                    raise r
+                return r
         raise AssertionError(f"unexpected request {method} {path}")
 
     def posts(self):
@@ -602,3 +605,45 @@ def test_update_of_an_item_without_a_format_choice_sends_no_format_and_passes_re
     (_, fields, pairs, _), = fake.posts()
     assert "desired_format" not in fields
     assert fields["specific_price"] == "4499" and fields["note"] == "Wait for a sale & Game Pass"
+
+
+# ---- transient network errors
+
+def test_transient_network_error_on_a_get_is_retried():
+    waits = []
+    blip = deku.DekuNetworkError("network error: URLError(TimeoutError)")
+    fake = Fake({("GET", "/search?q="): [blip, page(SEARCH)]})
+    c = DekuClient("e", SECRET, WID, None, transport=fake, sleep=waits.append)
+    assert c.search("Hades")[0] == ("Hades", "hades")
+    assert deku.NETWORK_RETRY_WAITS[0] in waits
+
+
+def test_network_error_that_persists_on_a_get_raises_after_the_retries():
+    fake = Fake({("GET", "/search?q="): deku.DekuNetworkError("network error: URLError(TimeoutError)")})
+    c = DekuClient("e", SECRET, WID, None, transport=fake, sleep=lambda s: None)
+    with pytest.raises(DekuError, match="network error"):
+        c.search("Hades")
+    assert len(fake.requests) == len(deku.NETWORK_RETRY_WAITS) + 1
+
+
+def test_writes_are_not_retried_on_a_network_error():
+    fake = Fake({("GET", "/items/banishers"): page(LOGGED_IN),
+                 ("POST", f"/items/{ITEM_UUID}/watch"): deku.DekuNetworkError("network error: URLError(ConnectionResetError)")})
+    c = client(fake)
+    with pytest.raises(DekuError):
+        c.update(c.item("banishers"), "either", frozenset({"xbox_series"}))
+    assert len(fake.posts()) == 1
+
+
+def test_network_error_names_the_underlying_reason_but_not_the_url(tmp_path):
+    import urllib.error
+    t = deku.UrllibTransport(tmp_path / "cookies.txt")
+
+    def boom(req, timeout=None):
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    t._opener.open = boom
+    with pytest.raises(deku.DekuNetworkError) as err:
+        t.request("GET", BASE + "/wishlist/" + WID)
+    assert "URLError(TimeoutError)" in str(err.value)
+    assert "dekudeals" not in str(err.value) and WID not in str(err.value)
