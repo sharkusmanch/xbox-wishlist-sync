@@ -266,7 +266,17 @@ class Deps:
 
 
 def _query(title: str) -> str:
-    return " ".join(re.sub("[™®©]", " ", title).split())
+    # Drop the symbols outright: replacing them with a space turns "Batman™:" into "Batman :",
+    # which TrueAchievements' search no longer matches.
+    return " ".join(re.sub("[™®©]", "", title).split())
+
+
+def _subtitles(title: str) -> list[str]:
+    """The colon/dash-separated parts of a title with at least two words, for a fallback search
+    when the full title finds nothing (TrueAchievements' search can't match "Δ" or "Delta",
+    but "Snake Eater" finds "Metal Gear Solid Δ: Snake Eater")."""
+    parts = [p.strip() for p in re.split(r"\s*(?::|\s[-–—]\s)\s*", _query(title))]
+    return [p for p in parts if len(p.split()) >= 2 and norm(p) != norm(title)]
 
 
 def _strip_suffix(title: str) -> str:
@@ -807,6 +817,14 @@ class _Run:
             complete = complete and getattr(more, "complete", True)
             seen = {s for _, s in results}
             results += [(t, s) for t, s in more if s not in seen]
+        if complete and not exact_hits(title, results):
+            for part in _subtitles(title):
+                more = ta.search(part)
+                complete = complete and getattr(more, "complete", True)
+                seen = {s for _, s in results}
+                results += [(t, s) for t, s in more if s not in seen]
+                if exact_hits(title, results):
+                    break
         if not complete:
             # More result pages than we read: the page we want may be on one we didn't.
             return Match("ambiguous", None, [f"TrueAchievements search results truncated for {title!r}"]), None
