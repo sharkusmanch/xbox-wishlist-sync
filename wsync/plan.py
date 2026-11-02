@@ -183,7 +183,8 @@ def build_plan(
     def deku_changed(have: Entry, want: Entry) -> bool:
         # Only the Xbox checkboxes are ours; other platforms on the page are left alone.
         return (
-            have.format != want.format
+            # format None: the Deku item has no format choice (DLC), so only platforms count
+            (have.format is not None and have.format != want.format)
             or (have.platforms & XBOX_PLATFORMS) != (want.platforms & XBOX_PLATFORMS)
         )
 

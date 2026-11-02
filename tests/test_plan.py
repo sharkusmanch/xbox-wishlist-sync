@@ -293,3 +293,17 @@ def test_only_transient_lookups_still_pause_removals():
     p = plan([item("B", "Beta")], dm={"B": transient("lookup failed (OSError)")}, dc={"stale": deku("stale")})
     assert [e.target for e in p.deku.paused_removes] == ["stale"] and p.deku.removes == []
     assert p.deku.pause_reason == "1 lookup retried next run"
+
+
+def test_no_update_when_the_item_has_no_format_choice():
+    # Digital-only items (DLC) have no Desired format field on Deku: current format is None.
+    cur = deku("a", fmt=None, platforms=XBOX)
+    p = plan([item("A", product_kind="durable")], dm={"A": matched("a")}, dc={"a": cur}, plats={"a": XBOX})
+    assert p.deku.updates == []
+
+
+def test_item_without_a_format_choice_still_updates_platforms():
+    cur = deku("a", fmt=None, platforms={"xbox_one"})
+    p = plan([item("A", product_kind="durable")], dm={"A": matched("a")}, dc={"a": cur}, plats={"a": XBOX})
+    assert len(p.deku.updates) == 1
+    assert p.deku.updates[0][1].platforms == XBOX
