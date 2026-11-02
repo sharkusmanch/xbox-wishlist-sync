@@ -570,3 +570,35 @@ def test_rate_limit_that_persists_is_an_error():
     with pytest.raises(DekuError, match="429"):
         c.search("Hades")
     assert len(fake.requests) == len(deku.RATE_LIMIT_WAITS) + 1
+
+
+# ---- items without a format choice (DLC and other digital-only items)
+
+def formatless(page_text):
+    """The item page as Deku renders it for a digital-only item: no Desired format radios."""
+    out = re.sub(r"<div class='form-group'>\n<label>Desired format</label>.*?(?=<div class='form-group'>)", "",
+                 page_text, count=1, flags=re.S)
+    assert "desired_format" not in out
+    return out
+
+
+def test_wishlist_reports_no_format_for_an_item_without_a_format_choice():
+    fake = Fake({
+        ("GET", f"/wishlist/{WID}"): page(WISHLIST.split("<div class='d-block col'>")[0].replace("5 items", "1 items")
+                                           + "<div class='d-block col'>" + WISHLIST.split("<div class='d-block col'>")[2]),
+        ("GET", "/items/test-game-physical"): page(formatless(LOGGED_IN)),
+    })
+    got = client(fake).wishlist(with_platforms=True)
+    assert got["test-game-physical"].format is None
+
+
+def test_update_of_an_item_without_a_format_choice_sends_no_format_and_passes_read_back():
+    before = formatless(LOGGED_IN)
+    after = with_settings(before, plats={"xbox_series"})
+    fake = Fake({("GET", "/items/dlc"): [page(before), page(after)],
+                 ("POST", f"/items/{ITEM_UUID}/watch"): redirect("/items/dlc")})
+    c = client(fake)
+    c.update(c.item("dlc"), "digital", frozenset({"xbox_series"}))
+    (_, fields, pairs, _), = fake.posts()
+    assert "desired_format" not in fields
+    assert fields["specific_price"] == "4499" and fields["note"] == "Wait for a sale & Game Pass"

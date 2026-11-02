@@ -430,7 +430,8 @@ class DekuClient:
                 self.last_items[slug] = item
                 if not item.on_wishlist:
                     raise DekuError(f"{slug!r} is on the share page but its item page says it isn't")
-                out[slug] = Entry(slug, entry.title, item.settings.get("desired_format", ""), item.platforms)
+                # Digital-only items (DLC) have no Desired format field: None means "format doesn't apply".
+                out[slug] = Entry(slug, entry.title, item.settings.get("desired_format"), item.platforms)
         return out
 
     def search(self, title: str) -> list[tuple[str, str]]:
@@ -479,7 +480,8 @@ class DekuClient:
         if missing:
             raise DekuError(f"{item.slug!r} has no {sorted(missing)} platform box")
         expected = dict(item.settings)
-        expected["desired_format"] = fmt
+        if "desired_format" in item.settings:  # absent on digital-only items (DLC): nothing to set
+            expected["desired_format"] = fmt
         fields: list[tuple[str, str]] = []
         for name, value in item.settings.items():
             if name == "desired_format":
