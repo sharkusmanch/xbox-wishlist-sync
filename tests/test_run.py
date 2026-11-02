@@ -866,3 +866,25 @@ def test_ta_match_falls_back_to_the_subtitle_when_the_full_title_finds_nothing(t
     plan = h.reporter.reviews[0][0]
     assert [e.target for e in plan.ta.adds] == ["777"]
     assert "SNAKE EATER" in h.ta.searches
+
+
+def test_unreleased_game_without_an_xbox_listing_on_deku_is_skipped_silently(tmp_path):
+    # Deku has a page for the game but no Xbox listing yet (it isn't out): like "no page yet",
+    # no task and no hold on removals; it's retried each run and matches once Deku lists Xbox.
+    h = basic(tmp_path, dry_run=True, records=[feed_record("PU", "Zeta Rising", kind="unannounced")])
+    h.deku.games["zeta-rising"] = ("Zeta Rising", set())
+    assert h.run() == 0
+    plan = h.reporter.reviews[0][0]
+    assert not any(p.product_id == "PU" and p.kind == "unmatched-deku" for p in h.reporter.problems)
+    assert plan.deku.paused_removes == []
+    assert "gamma-tale" in [e.target for e in plan.deku.removes]
+    assert "Zeta Rising" in plan.skipped_unannounced
+
+
+def test_released_game_without_an_xbox_listing_on_deku_is_still_a_problem(tmp_path):
+    h = basic(tmp_path, dry_run=True, records=[feed_record("PR", "Zeta Rising", kind="released")])
+    h.deku.games["zeta-rising"] = ("Zeta Rising", set())
+    assert h.run() == 0
+    plan = h.reporter.reviews[0][0]
+    assert any(p.product_id == "PR" and p.kind == "unmatched-deku" for p in h.reporter.problems)
+    assert plan.deku.removes == [] and plan.deku.paused_removes

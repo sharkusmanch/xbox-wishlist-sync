@@ -62,6 +62,7 @@ _DLC_WORDS = re.compile(
     r"[\s\-:–—]*\b(?:expansion pass|season pass|expansion|dlc|add-on|add on)\s*$", re.I
 )
 PLACEHOLDER = "pre-release placeholder page"  # TA: unreleased games have negative, unwritable ids
+NO_XBOX_YET = "no Xbox listing on Deku Deals yet"  # Deku: an unreleased game listed for other platforms only
 _PARENT_SPLIT = re.compile(r"\s+[-–—]\s+|:\s+")
 
 
@@ -782,6 +783,11 @@ class _Run:
             it = self._deku_item(slug)
             if it.offered & XBOX_PLATFORMS:
                 xbox.append(it)
+        if not xbox and item.kind != "released":
+            # Not out yet: Deku lists the Xbox version when it has one. Like "no page yet" --
+            # no task, no hold on removals (an entry it might own is still protected by
+            # _related_to_stale); retried each run.
+            return Match("none", None, [NO_XBOX_YET])
         if len(xbox) != 1:
             why = "" if xbox else " (no Xbox platform on Deku Deals)"
             return Match("ambiguous", None, [f"{t}{why}" for t, _ in hits])
@@ -929,7 +935,10 @@ class _Run:
         plan = Plan(deku=dp.deku, ta=tp.ta)
         # A TA placeholder page is "no page yet", like an unannounced game: no task, nothing to fix.
         placeholder = {pid for pid, m in ta.matches.items() if m.status == "none" and m.candidates == [PLACEHOLDER]}
-        plan.problems = ([p for p in dp.problems if p.kind in ("unmatched-deku", "d2d-disputed")]
+        # Likewise an unreleased game whose Deku page has no Xbox listing yet.
+        no_xbox_yet = {pid for pid, m in deku.matches.items() if m.status == "none" and m.candidates == [NO_XBOX_YET]}
+        plan.problems = ([p for p in dp.problems if p.kind == "d2d-disputed"
+                          or (p.kind == "unmatched-deku" and p.product_id not in no_xbox_yet)]
                          + [p for p in tp.problems if p.kind == "unmatched-ta" and p.product_id not in placeholder])
         # Transient lookup gaps stay ambiguous (removals pause) but open no "add an override" task;
         # an existing task for the item is kept open, since nothing was checked.
@@ -942,7 +951,8 @@ class _Run:
                 continue
             for item in lst.items:
                 m = lst.matches.get(item.product_id)
-                if ((item.kind == "unannounced" or item.product_id in placeholder) and m is not None and m.status == "none"
+                if ((item.kind == "unannounced" or item.product_id in placeholder or item.product_id in no_xbox_yet)
+                        and m is not None and m.status == "none"
                         and item.product_id not in unmatched and item.title not in plan.skipped_unannounced):
                     plan.skipped_unannounced.append(item.title)
 
