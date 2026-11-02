@@ -843,3 +843,26 @@ def test_related_candidate_rule(a, b, want):
 
     assert related(a, b) is want
     assert related(b, a) is want
+
+
+def test_query_drops_trademark_symbols_without_splitting_punctuation():
+    from wsync.run import _query
+    # "LEGO Batman : Legacy…" (space before the colon) finds nothing on TrueAchievements.
+    assert _query("LEGO® Batman™: Legacy of the Dark Knight") == "LEGO Batman: Legacy of the Dark Knight"
+    assert _query("STAR WARS Zero Company™") == "STAR WARS Zero Company"
+
+
+def test_ta_match_falls_back_to_the_subtitle_when_the_full_title_finds_nothing(tmp_path):
+    # TrueAchievements search can't match "Δ" (or "Delta"), but finds the page by its subtitle.
+    h = basic(tmp_path, dry_run=True, records=[feed_record("PD", "METAL GEAR SOLID Δ: SNAKE EATER")])
+    h.ta.pages["mgs-delta"] = tag("mgs-delta", 777, "Metal Gear Solid Δ: Snake Eater")
+
+    def search(q):
+        h.ta.searches.append(q)
+        return [("Metal Gear Solid Δ: Snake Eater", "mgs-delta")] if q == "SNAKE EATER" else []
+
+    h.ta.search = search
+    assert h.run() == 0
+    plan = h.reporter.reviews[0][0]
+    assert [e.target for e in plan.ta.adds] == ["777"]
+    assert "SNAKE EATER" in h.ta.searches
