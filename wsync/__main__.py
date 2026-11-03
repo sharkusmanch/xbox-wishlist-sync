@@ -1,4 +1,4 @@
-"""`python -m wsync [--only deku|ta] [--dry-run|--apply] [--no-report] [--accept-feed-count N]`."""
+"""`python -m wsync [--only deku|ta|collection] [--dry-run|--apply] [--no-report] [--accept-feed-count N]`."""
 
 from __future__ import annotations
 

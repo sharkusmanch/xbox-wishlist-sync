@@ -34,3 +34,27 @@ def test_ta_game_ids_roundtrip_and_old_files_load(tmp_path):
     assert load_state(path).ta_game_ids == {"elden-ring": 9001}
     path.write_text(json.dumps({"mapping": {}, "last_feed_count": 3}))
     assert load_state(path).ta_game_ids == {}
+
+
+def test_collection_fields_roundtrip_and_old_files_load(tmp_path):
+    path = tmp_path / "state.json"
+    rows = [{"ta_id": 1, "title": "Halo", "platform": "xbox-one", "ownership": "Owned", "media": "Disc"}]
+    state = State(
+        ta_collection={"fetched": "2026-11-02T00:00:00Z", "rows": rows},
+        collection={"1": {"status": "added", "slug": "halo", "checked": "2026-11-02T00:00:00Z"}},
+    )
+    save_state(path, state)
+    assert load_state(path) == state
+    path.write_text(json.dumps({"mapping": {}, "last_feed_count": 3}))
+    old = load_state(path)
+    assert old.ta_collection == {} and old.collection == {}
+
+
+def test_collection_unconfirmed_roundtrips_and_old_files_load(tmp_path):
+    path = tmp_path / "state.json"
+    state = State(collection_unconfirmed={"halo": {"since": "2026-11-02T00:00:00+00:00", "titles": ["Halo"]}},
+                  collection_review="abc123")
+    save_state(path, state)
+    assert load_state(path) == state
+    path.write_text(json.dumps({"mapping": {}, "collection": {"1": {"status": "partial", "slug": "halo"}}}))
+    assert load_state(path).collection_unconfirmed == {} and load_state(path).collection_review is None

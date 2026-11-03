@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html><body class="ta g-li d"><main>
+<select id="ddlSomethingElse" name="ddlSomethingElse"><option value="outside" selected>outside any filter container</option></select>
+<div class="topbar"><div class="search-and-filter ajaxlistfilter"><input type="text" name="txtSearchString" id="txtSearchString" value="" class="textbox cs-n" placeholder="Search titles..."/><ul id="btnGameCollectionFilter_Options" class="menuitems rightaligned filterbutton ajaxlistfilter">
+<li class="baseoptions"><ul>
+<li class="fp viewsettings"><div><div class="frm-grp frm-rad"><input type="radio" name="GameView" id="optImageView" value="optImageView" class="radiobutton"  onclick="GameCollection.FilterVisibility(); AJAXList.FilterList('oGameCollection',true); " data-default="False"/><label for="optImageView">Image view</label></div><div class="frm-grp frm-rad"><input type="radio" name="GameView" id="optListView" value="optListView" class="secondoption" checked="checked" onclick="GameCollection.FilterVisibility(); AJAXList.FilterList('oGameCollection',true); " data-default="True"/><label for="optListView">List view</label></div></div></div>
+<div><span>Sort by</span><div class="frm-sel"><select id="ddlSortBy" name="ddlSortBy" class=" dropdown cs-n" onchange="javascript:AJAXList.Buttons('oGameCollectionO', $('#ddlSortBy').val()); "   data-default="Lastunlock">
+<option value="Titlename">Title name</option>
+<option value="Timeplayed">Time played</option>
+<option value="Lastunlock" selected="selected">Last unlock</option>
+</select></div></div>
+<div><select id="ddlDLCInclusionSetting" name="ddlDLCInclusionSetting" class=" dropdown cs-n" onchange="javascript:AJAXList.FilterList('oGameCollection')"   data-default="NoDLC">
+<option value="AllDLC" selected="selected">All DLC</option>
+<option value="DLCIOwn">DLC I Own</option>
+<option value="NoDLC">No DLC</option>
+</select></div>
+<div><select id="ddlPlatformIDs" name="ddlPlatformIDs" class="funkydropdown dropdown cs-n" onchange="javascript:AJAXList.FilterList('oGameCollection'); AJAXList.UpdateJustThesePlatformsCheckboxState();"  style="display:none;"  multiple data-placeholder="All platforms" data-default=" ">
+<option value=" ">(All)</option>
+<option value="8">Xbox One</option>
+<option value="22">Xbox Series X|S</option>
+<option value="19">Xbox 360 (back compat)</option>
+<option value="24">Xbox 360 (no back compat)</option>
+<option value="2">Xbox 360</option>
+<option value="1">Windows</option>
+<option value="7">Windows Phone</option>
+<option value="6">Games For Windows Live</option>
+<option value="3">Web</option>
+<option value="5">iOS</option>
+<option value="9">Android</option>
+<option value="23">Xbox Original</option>
+<option value="18">Apple TV</option>
+<option value="20">Nintendo Switch</option>
+<option value="21">Windows (Pending)</option>
+</select></div>
+<div><input type="checkbox" class="checkbox" name="chkJustThesePlatforms" id="chkJustThesePlatforms" value="True"  onclick="javascript:AJAXList.FilterList('oGameCollection');" data-default="False" /></div>
+<div><span>Ownership</span><select id="sddOwnerShipStatusIDs" name="sddOwnerShipStatusIDs" class="funkydropdown dropdown cs-n" onchange="javascript:AJAXList.FilterList('oGameCollection')"  style="display:none;"  multiple data-placeholder="Any ownership" data-default=" ">
+<option value="1">Owned</option>
+<option value="2">Loaned out</option>
+<option value="6">No longer have</option>
+</select></div>
+<div><span>Play status</span><select id="sddPlayStatusIDs" name="sddPlayStatusIDs" class="funkydropdown dropdown cs-n" onchange="javascript:AJAXList.FilterList('oGameCollection')"  style="display:none;"  multiple data-placeholder="Any status" data-default=" ">
+<option value="1">Playing now</option>
+<option value="3">Done with</option>
+</select></div>
+<div><input type="checkbox" class="checkbox" name="chkExcludeNotOwned" id="chkExcludeNotOwned" value="True" checked onclick="javascript:AJAXList.FilterList('oGameCollection')" data-default="True" /></div>
+<div><select id="sddGameMediaID" name="sddGameMediaID" class=" dropdown cs-n" onchange="javascript:AJAXList.FilterList('oGameCollection')"   data-default=" ">
+<option value=" ">(All)</option>
+<option value="1">Disc</option>
+<option value="2">Digital</option>
+<option value="3">Disc & Digital</option>
+<option value="4">Disc-to-Digital</option>
+</select></div>
+<div><select id="ddlStartedStatus" name="ddlStartedStatus" class=" dropdown cs-n" onchange="javascript:AJAXList.FilterList('oGameCollection')"   data-default="0">
+<option value="0" selected>(All)</option>
+<option value="1">Started</option>
+<option value="2">Not started</option>
+</select></div>
+<div><select id="ddlTitleType" name="ddlTitleType" class=" dropdown cs-n" onchange="javascript:AJAXList.FilterList('oGameCollection')"   data-default=" ">
+<option value=" ">(All)</option>
+<option value="Game" selected="selected">Games only</option>
+<option value="Title">Apps only</option>
+</select></div>
+<div><select id="ddlCompletionStatus" name="ddlCompletionStatus" class=" dropdown cs-n" onchange="javascript:AJAXList.FilterList('oGameCollection')"   data-default=" ">
+<option value=" ">(All)</option>
+<option value="Complete only">Complete only</option>
+<option value="Incomplete only">Incomplete only</option>
+</select></div>
+<div><select id="ddlGameNotes" name="ddlGameNotes" class=" dropdown cs-n" onchange="javascript:AJAXList.FilterList('oGameCollection')"   data-default=" ">
+<option value=" ">(All)</option>
+<option value="Has notes">Has notes</option>
+<option value="No notes">No notes</option>
+</select></div>
+<div><select id="ddlMythicStatus" name="ddlMythicStatus" class=" dropdown cs-n" onchange="javascript:AJAXList.FilterList('oGameCollection')"   data-default=" ">
+<option value=" ">Any status</option>
+<option value="Mythic earned">Mythic earned</option>
+<option value="Mythic not earned">Mythic not earned</option>
+</select></div>
+<div><select id="asdGamePropertyID" name="asdGamePropertyID" class="dropdown cs-n" onchange="javascript:AJAXList.FilterList('oGameCollection')" data-default=" " >
+<option value=" ">(All)</option>
+<option value="133">Disc to Digital</option>
+</select></div>
+<div><select id="ddlDifficulty" name="ddlDifficulty" class=" dropdown cs-n" onchange="javascript:AJAXList.FilterList('oGameCollection')"   data-default="0">
+<option value="0" selected>(All)</option>
+<option value="1">Very Easy</option>
+<option value="2">Easy</option>
+<option value="3">Medium</option>
+<option value="4">Hard</option>
+<option value="5">Brutal</option>
+</select></div>
+<div><div class="frm-grp frm-rad"><input type="radio" name="MultiEditMode" id="optSingleEdit" value="optSingleEdit" class="radiobutton" checked="checked" onclick="GameCollection.ToggleMultiEdit(); "/><label for="optSingleEdit">Single game</label></div><div class="frm-grp frm-rad"><input type="radio" name="MultiEditMode" id="optMultiEdit" value="optMultiEdit" class="secondoption"  onclick="GameCollection.ToggleMultiEdit(); "/><label for="optMultiEdit">Multi game</label></div></div></div>
+<div><input type="checkbox" class="checkbox" name="chkColTitlename" id="chkColTitlename" value="True" checked onclick="javascript:AJAXList.FilterList('oGameCollection', true);" data-default="True" /><input type="checkbox" class="checkbox" name="chkColOfficialScore" id="chkColOfficialScore" value="True" checked onclick="javascript:AJAXList.FilterList('oGameCollection', true);" data-default="True" /><input type="checkbox" class="checkbox" name="chkColItems" id="chkColItems" value="True" checked onclick="javascript:AJAXList.FilterList('oGameCollection', true);" data-default="True" /></div>
+</li></ul></li></ul></div></div>
+<div id="oGameCollectionHolder" class="listholder ajax"><span class="ajaxlistfilter">
+<input type="hidden" name="oGameCollection_Order" id="oGameCollection_Order" value="Lastunlock" class="textbox cs-n"/><input type="hidden" name="oGameCollection_Page" id="oGameCollection_Page" value="1" class="textbox cs-n"/><input type="hidden" name="oGameCollection_ItemsPerPage" id="oGameCollection_ItemsPerPage" value="30" class="textbox cs-n"/><input type="hidden" name="oGameCollection_TimeZone" id="oGameCollection_TimeZone" value="UTC24hr" class="textbox cs-n"/><input type="hidden" name="oGameCollection_ShowAll" id="oGameCollection_ShowAll" value="False" class="textbox cs-n"/><input type="hidden" name="txtGamerID" id="txtGamerID" value="99999" class="textbox cs-n"/><input type="hidden" name="txtGameRegionID" id="txtGameRegionID" value="1" class="textbox cs-n"/><input type="hidden" name="txtUseAchievementsForProgress" id="txtUseAchievementsForProgress" value="True" class="textbox cs-n"/><input type="hidden" name="txtContestID" id="txtContestID" value="0" class="textbox cs-n"/></span></div>
+</main></body></html>

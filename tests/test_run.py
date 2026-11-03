@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from wsync.deku import DekuError, DekuItem
+from wsync.deku import DekuError, DekuItem, OwnedDetail, OwnedEntry
 from wsync.errors import TAError
 from wsync.match import norm
 from wsync.plan import Entry
@@ -34,6 +34,38 @@ class FakeDeku:
         self.fail_search = {}
         self.results = {}  # query -> canned results
         self.wishlist_calls = 0
+        # Deku collection: slug -> [OwnedDetail]; the share page is derived from it
+        self.owned = {}
+        self.calls = []  # every request the collection step can make, in order (plus sleeps)
+        self.paced_with = []
+        self.fail_collection = None
+        self.fail_item = {}  # slug -> exception raised by item()
+        self.fail_own = {}  # slug -> exception raised by own()
+        self.redirects = {}  # old slug -> current slug (Deku redirects renamed items)
+
+    def paced(self, seconds):
+        self.paced_with.append(seconds)
+        return self
+
+    def sleep(self, seconds):
+        self.calls.append(("sleep", seconds))
+
+    def collection(self):
+        self.calls.append(("collection",))
+        if self.fail_collection:
+            raise self.fail_collection
+        return [OwnedEntry(slug, self.games[slug][0], o.platform, o.format)
+                for slug, entries in self.owned.items() for o in entries]
+
+    def own(self, item, fmt, platform):
+        self.calls.append(("own", item.slug))
+        if item.slug in self.fail_own:
+            raise self.fail_own[item.slug]
+        assert platform in item.offered and not any(o.platform == platform for o in item.owned)
+        self.writes.append(("own", item.slug, fmt, platform))
+        self.journal.append(("deku", "own", item.slug))
+        n = len(self.owned.get(item.slug, []))
+        self.owned.setdefault(item.slug, []).append(OwnedDetail(f"o-{item.slug}-{n}", platform, fmt))
 
     def _item(self, slug):
         title, offered = self.games[slug]
@@ -45,7 +77,7 @@ class FakeDeku:
             for p in ("xbox_series", "xbox_one", "switch"):
                 settings[f"platform_{p}"] = "true" if p in ticked else "false"
         return DekuItem(slug, f"uuid-{slug}", title, on, frozenset(ticked) if on else frozenset(),
-                        frozenset(offered), settings)
+                        frozenset(offered), settings, tuple(self.owned.get(slug, ())))
 
     def wishlist(self, *, with_platforms=False):
         self.wishlist_calls += 1
@@ -59,6 +91,7 @@ class FakeDeku:
 
     def search(self, q):
         self.searches.append(q)
+        self.calls.append(("search", q))
         if q in self.fail_search:
             raise self.fail_search[q]
         if q in self.results:
@@ -67,7 +100,10 @@ class FakeDeku:
         return [(t, s) for s, (t, _) in self.games.items() if words & set(norm(t).split())]
 
     def item(self, slug):
-        return self._item(slug)
+        self.calls.append(("item", slug))
+        if slug in self.fail_item:
+            raise self.fail_item[slug]
+        return self._item(self.redirects.get(slug, slug))
 
     def add(self, item, fmt, platforms):
         assert not item.on_wishlist
@@ -102,6 +138,15 @@ class FakeTA:
         self.already = set()
         self.game_ids = dict(game_ids or {})
         self.wishlist_calls = 0
+        self.owned_rows = []  # the TA Game Collection (OwnedRow)
+        self.collection_calls = 0
+        self.fail_collection = None
+
+    def collection(self):
+        self.collection_calls += 1
+        if self.fail_collection:
+            raise self.fail_collection
+        return list(self.owned_rows)
 
     def wishlist(self):
         self.wishlist_calls += 1
@@ -151,6 +196,8 @@ class FakeReporter:
         self.problem_syncs = []
         self.reviews = []
         self.notes = []
+        self.collection_reviews = []  # (body, dry_run)
+        self._collection_body = None
 
     def sync_problems(self, problems, keep_kinds, keep_keys=frozenset()):
         self.problem_syncs.append((list(problems), set(keep_kinds)))
@@ -159,6 +206,15 @@ class FakeReporter:
     def plan_review(self, plan, *, dry_run):
         self.reviews.append((plan, dry_run))
         return True
+
+    def collection_review(self, body, *, dry_run):
+        self.collection_reviews.append((body, dry_run))
+        if not dry_run:
+            self._collection_body = None
+            return False
+        changed = body != self._collection_body
+        self._collection_body = body
+        return changed
 
     def notify(self, title, body):
         self.notes.append((title, body))
@@ -207,8 +263,14 @@ class Harness:
             ov.write_text(json.dumps(overrides))
         self.cfg = Config(feed=feed, state=tmp_path / "state" / "state.json", overrides=ov,
                           flaresolverr_url="http://fs.invalid/v1", vikunja_url="http://vk.invalid",
-                          **{**SECRETS, **cfg})
+                          **{**SECRETS, "collection": False, **cfg})
         self.clock = 0.0
+        self.now = NOW
+
+    def last_issues(self):
+        """The issues of the last failure ping (the ping is deduplicated, so read the latest one)."""
+        bodies = [b for t, b in self.reporter.notes if "failed" in t.lower()]
+        return bodies[-1].splitlines() if bodies else []
 
     def deps(self):
         def make_deku(cfg):
@@ -229,7 +291,8 @@ class Harness:
             return self.clock
 
         return Deps(make_deku=make_deku, make_ta=make_ta, make_reporter=lambda cfg: self.reporter,
-                    refresh_verdicts=verdicts, now=lambda: NOW, monotonic=mono)
+                    refresh_verdicts=verdicts, now=lambda: self.now, monotonic=mono,
+                    sleep=self.deku.sleep)
 
     def run(self):
         return run(self.cfg, self.deps())
@@ -888,3 +951,57 @@ def test_released_game_without_an_xbox_listing_on_deku_is_still_a_problem(tmp_pa
     plan = h.reporter.reviews[0][0]
     assert any(p.product_id == "PR" and p.kind == "unmatched-deku" for p in h.reporter.problems)
     assert plan.deku.removes == [] and plan.deku.paused_removes
+
+
+# --------------------------------------------------------------------------- Deku collection step wiring
+
+
+def test_collection_rate_limit_mid_step_leaves_the_wishlist_results_alone(tmp_path):
+    """Review Focus 4: a 429 in the collection step stops it; exit 0; the wishlist plan and writes
+    are what they are without the step."""
+    from wsync.deku import DekuRateLimited
+    from wsync.ta_coll import OwnedRow
+
+    (tmp_path / "plain").mkdir()
+    (tmp_path / "with").mkdir()
+    plain = basic(tmp_path / "plain", dry_run=False)
+    assert plain.run() == 0
+    h = basic(tmp_path / "with", dry_run=False, collection=True, collection_dry_run=False)
+    h.deku.games["gamma-tale"] = plain.deku.games["gamma-tale"] = ("Gamma Tale", {"xbox_series"})
+    h.ta.owned_rows = [OwnedRow(1, "Gamma Tale", "xbox-series-x-s", "Owned", "Digital"),
+                       OwnedRow(2, "Alpha Quest", "xbox-series-x-s", "Owned", "Digital")]
+    real_collection = h.deku.collection
+
+    def collection_then_429():  # armed once the wishlist step is over
+        h.deku.fail_item["alpha-quest"] = DekuRateLimited("GET /items/alpha-quest answered HTTP 429")
+        return real_collection()
+
+    h.deku.collection = collection_then_429
+    assert h.run() == 0
+    assert h.deku.writes[:3] == plain.deku.writes and h.ta.writes == plain.ta.writes
+    assert [r[0].deku.adds for r in h.reporter.reviews] == [r[0].deku.adds for r in plain.reporter.reviews]
+    assert not any("failed" in t.lower() for t, _ in h.reporter.notes)
+    after = [c for c in h.deku.calls if c[0] != "sleep"]
+    assert after[-1] == ("item", "alpha-quest")  # no Deku request after the 429
+
+
+def test_config_collection_switches():
+    env = {"DEKU_EMAIL": "e", "TA_GAMERTAG": "g"}
+    cfg = config_from([], env)
+    assert cfg.collection is True and cfg.collection_dry_run is True and cfg.lists == ("deku", "ta")
+    for value in ("false", "0", "no", "off", " FALSE "):
+        assert config_from(["--apply"], {**env, "COLLECTION_DRY_RUN": value}).collection_dry_run is False
+    for value in ("true", "", "garbage", "nope"):
+        assert config_from(["--apply"], {**env, "COLLECTION_DRY_RUN": value}).collection_dry_run is True
+    # A dry run is dry for the collection step too.
+    assert config_from([], {**env, "COLLECTION_DRY_RUN": "false"}).collection_dry_run is True
+    assert config_from(["--dry-run"], {**env, "DRY_RUN": "false", "COLLECTION_DRY_RUN": "false"}).collection_dry_run is True
+    only = config_from(["--only", "collection"], env)
+    assert only.lists == () and only.collection is True
+    assert config_from(["--only", "deku"], env).collection is False
+    assert config_from(["--only", "ta"], env).collection is False
+
+
+def test_only_collection_needs_both_logins_but_no_feed():
+    cfg = Config(lists=(), collection=True, flaresolverr_url="http://fs", report=False)
+    assert cfg.missing() == ["DEKU_EMAIL", "DEKU_PASSWORD", "DEKU_WISHLIST_ID", "TA_GAMERTAG", "TA_PASSWORD"]

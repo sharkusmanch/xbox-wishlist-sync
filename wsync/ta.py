@@ -35,10 +35,12 @@ from urllib.parse import quote, quote_plus, urlencode, urljoin, urlsplit
 from wsync.errors import TAError
 from wsync.flaresolverr import FlareSolverr
 from wsync.plan import Entry
+from wsync.ta_coll import OwnedRow, list_filters, list_url, parse_list, unknown_filters
 
 BASE = "https://www.trueachievements.com"
 AJAX = BASE + "/ajaxfunctions.aspx/"
 HTTP_TIMEOUT = 60
+MAX_COLLECTION = 20_000  # titles; a bigger claimed total is a misread page, not a collection
 CLEARANCE_URL = BASE + "/"  # the public page FlareSolverr fetches, anonymously, for a clearance
 MAX_REDIRECTS = 5
 _REDIRECTS = {301, 302, 303, 307, 308}
@@ -585,6 +587,51 @@ class TAClient:
                 raise IncompleteRead(f"wishlist lists {key} twice")
             out[key] = Entry(key, row.title)
         return out
+
+    def collection(self) -> list[OwnedRow]:
+        """The logged-in gamer's whole Game Collection (every ownership status, all platforms).
+
+        Reads `/gamecollection` for the list's filters, then each AjaxList page by GET until the
+        rows read match the footer's total. Raises IncompleteRead for anything short of that, so a
+        partial list is never mistaken for the collection.
+        """
+        base = BASE + self._gamer + "/gamecollection"
+        filters = list_filters(self._get(base, need_login=True).html)
+        names = {k for k, _ in filters}
+        if not {"txtGamerID", "oGameCollection_Order"} <= names:
+            raise IncompleteRead("collection page lacks its list filters (not the page we expected)")
+        unknown = unknown_filters(filters)
+        if unknown:
+            raise IncompleteRead("collection page has filters this client does not know: " + ", ".join(unknown))
+        rows: list[OwnedRow] = []
+        total: int | None = None
+        page_no = 1
+        while True:
+            fragment = self._get(list_url(base, filters, page_no), need_login=False).html
+            try:
+                got, got_total = parse_list(fragment)
+            except ValueError as e:
+                raise IncompleteRead(f"collection page {page_no}: {e}") from None
+            if got_total is None:
+                raise IncompleteRead(f"collection page {page_no} has no total")
+            if total is None:
+                total = got_total
+                if total > MAX_COLLECTION:
+                    raise IncompleteRead(f"collection claims {total} titles (more than {MAX_COLLECTION})")
+            elif got_total != total:
+                raise IncompleteRead(f"collection total changed from {total} to {got_total} between pages")
+            rows += got
+            if len(rows) >= total or not got:
+                break
+            page_no += 1
+        seen: set[int] = set()
+        for r in rows:
+            if r.ta_id in seen:
+                raise IncompleteRead(f"collection lists game {r.ta_id} twice")
+            seen.add(r.ta_id)
+        if len(rows) != total:
+            raise IncompleteRead(f"read {len(rows)} of {total} collection titles")
+        return rows
 
     def _game_id(self, slug: str) -> int:
         if slug not in self.game_ids:

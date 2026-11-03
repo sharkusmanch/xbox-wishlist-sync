@@ -9,6 +9,9 @@ Order (each list is handled independently; a failure on one never blocks the oth
      then search plus a confident pick;
   5. plan; 6. apply (dry run: nothing) adds, then updates, then removes, none started past the
      write deadline; 7. save state, report. SIGTERM stops the run, saves state and exits 1.
+  8. the Deku collection step (`wsync.collection`), after the wishlist step has finished and saved
+     its state: TrueAchievements "Owned" Xbox games -> Deku collection, add-only. Its failures
+     are issues of their own; nothing in it can change what the wishlist step did.
 
 Safety rules beyond the planner's:
   - every Xbox item gets a Match on every list it is mirrored to; a failed lookup is
@@ -36,12 +39,13 @@ from typing import Any, Callable
 from urllib.parse import quote, quote_plus
 
 from wsync import d2d, report
+from wsync.collection import run_collection_step
 from wsync.deku import AuthError as DekuAuthError
 from wsync.deku import DekuClient, DekuItem
 from wsync.feed import FeedError, XboxItem, check_count, is_dlc, load_feed
 from wsync.flaresolverr import FlareSolverr
 from wsync.match import Match, base_title, norm, pick, strip_edition_noise
-from wsync.overrides import SKIP, OverridesError, load_overrides
+from wsync.overrides import SKIP, OverridesError, load_collection_overrides, load_overrides
 from wsync.plan import XBOX_PLATFORMS, Entry, ListPlan, Plan, Problem, build_plan, is_transient, transient
 from wsync.state import State, load_state, save_state
 from wsync.ta import AlreadyListed
@@ -51,6 +55,7 @@ from wsync.ta import TAClient, TAGame, choose_ta_page, excluded_page
 log = logging.getLogger("wsync")
 
 LISTS = ("deku", "ta")
+COLLECTION = "collection"  # `--only collection`: the Deku collection step alone
 LABEL = {"deku": "Deku Deals", "ta": "TrueAchievements"}
 KIND = {"deku": "unmatched-deku", "ta": "unmatched-ta"}
 MAX_LOOKUP_ERRORS = 3  # consecutive failed lookups on a list before the rest are skipped
@@ -89,6 +94,8 @@ class Config:
     apprise_url: str = field(default="", repr=False)
     dry_run: bool = True
     lists: tuple[str, ...] = LISTS
+    collection: bool = True  # run the Deku collection step (off with --only deku|ta)
+    collection_dry_run: bool = True  # COLLECTION_DRY_RUN; a dry run is always dry here too
     report: bool = True
     accept_feed_count: int | None = None
     feed_max_age: timedelta = timedelta(hours=6)
@@ -110,10 +117,10 @@ class Config:
 
     def missing(self) -> list[str]:
         need = []
-        if "deku" in self.lists:
+        if "deku" in self.lists or self.collection:
             need += [("DEKU_EMAIL", self.deku_email), ("DEKU_PASSWORD", self.deku_password),
                      ("DEKU_WISHLIST_ID", self.deku_wishlist_id)]
-        if "ta" in self.lists:
+        if "ta" in self.lists or self.collection:
             need += [("TA_GAMERTAG", self.ta_gamertag), ("TA_PASSWORD", self.ta_password)]
         need.append(("FLARESOLVERR_URL", self.flaresolverr_url))
         if self.report:
@@ -137,7 +144,8 @@ def config_from(argv: list[str], env) -> Config:
         prog="python -m wsync",
         description="Mirror the Xbox wishlist feed onto Deku Deals and TrueAchievements.",
     )
-    p.add_argument("--only", choices=LISTS, help="sync one list only")
+    p.add_argument("--only", choices=(*LISTS, COLLECTION),
+                   help="sync one list only, or run only the Deku collection step")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", dest="mode", action="store_const", const="dry",
                       help="plan only, write nothing (overrides DRY_RUN)")
@@ -153,6 +161,7 @@ def config_from(argv: list[str], env) -> Config:
         dry = a.mode == "dry"
     else:
         dry = (env.get("DRY_RUN") or "true").strip().lower() not in _FALSE
+    collection_dry = dry or (env.get("COLLECTION_DRY_RUN") or "true").strip().lower() not in _FALSE
     accept = a.accept_feed_count if a.accept_feed_count is not None else _int_env(env, "WSYNC_ACCEPT_FEED_COUNT")
     hours = (env.get("WSYNC_FEED_MAX_AGE_HOURS") or "").strip()
     try:
@@ -173,7 +182,9 @@ def config_from(argv: list[str], env) -> Config:
         vikunja_token=env.get("VIKUNJA_TOKEN", ""),
         apprise_url=env.get("APPRISE_URL", ""),
         dry_run=dry,
-        lists=(a.only,) if a.only else LISTS,
+        lists=() if a.only == COLLECTION else (a.only,) if a.only else LISTS,
+        collection=a.only in (None, COLLECTION),
+        collection_dry_run=collection_dry,
         report=not a.no_report,
         accept_feed_count=accept,
         feed_max_age=max_age,
@@ -216,6 +227,9 @@ class NullReporter:
     def plan_review(self, plan, *, dry_run) -> bool:
         return False
 
+    def collection_review(self, body, *, dry_run) -> bool:
+        return False
+
     def notify(self, title, body) -> None:
         pass
 
@@ -230,6 +244,9 @@ class LiveReporter:
 
     def plan_review(self, plan, *, dry_run) -> bool:
         return report.plan_review_task(self._vk, plan, dry_run=dry_run)
+
+    def collection_review(self, body, *, dry_run) -> bool:
+        return report.collection_review_task(self._vk, body, dry_run=dry_run)
 
     def notify(self, title, body) -> None:
         report.notify(self._apprise, title, body)
@@ -260,6 +277,7 @@ class Deps:
     http_get: Callable | None = None  # XCT transport; None = d2d's default
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
     monotonic: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep  # the collection step's pacing
     d2d_pause: float = 1.0
 
 
@@ -450,6 +468,24 @@ class _Run:
     def fail(self) -> int:
         return self._finish()
 
+    def sleep(self, seconds: float) -> None:
+        self.deps.sleep(seconds)
+
+    def checkpoint(self) -> None:
+        """Save the state now (the collection step's write-ahead before an add). Raises on failure."""
+        save_state(self.cfg.state, self.state)
+
+    def past_deadline(self) -> bool:
+        return self.deps.monotonic() - self.start > self.cfg.write_deadline
+
+    def write_time_left(self) -> float:
+        """Seconds until the write deadline (negative once past it)."""
+        return self.cfg.write_deadline - (self.deps.monotonic() - self.start)
+
+    @property
+    def collection_dry(self) -> bool:
+        return self.cfg.dry_run or self.cfg.collection_dry_run
+
     def _finish(self) -> int:
         """Exit code; the failure ping goes out only when the set of issues changed since last run."""
         digest = failure_digest(self.issues) if self.issues else None
@@ -501,30 +537,40 @@ class _Run:
 
     def _go(self) -> int:
         cfg = self.cfg
+        step = ("off" if not cfg.collection else "DRY RUN" if self.collection_dry else "APPLY")
         self.say(f"wsync starting: {'DRY RUN (no writes)' if cfg.dry_run else 'APPLY'}, "
-                 f"lists: {', '.join(cfg.lists)}")
+                 f"lists: {', '.join(cfg.lists) or 'none'}; Deku collection step: {step}")
         missing = cfg.missing()
         if missing:
             self.issue(f"missing configuration: {', '.join(missing)}")
             return self.fail()
 
-        # 1. state, feed, overrides: all sound before any login
         try:
             self.state = load_state(cfg.state)
             self.state_ok = True
         except Exception as e:  # noqa: BLE001 - corrupt JSON surfaces as several error types
             self.issue(f"state file unreadable ({type(e).__name__}); fix or delete {cfg.state}")
             return self.fail()
+        if cfg.lists:
+            self._wishlist()
+        if cfg.collection:
+            self._collection()
+        return self._finish()
+
+    def _wishlist(self) -> None:
+        """Steps 1-7: the wishlist mirror. Its failures are recorded as issues; it never raises them."""
+        cfg = self.cfg
+        # 1. feed, overrides: both sound before any login (the state is already loaded)
         try:
             items = self._load_feed()
         except FeedError as e:
             self.issue(f"feed rejected, nothing written: {e}")
-            return self.fail()
+            return
         try:
             self.overrides = load_overrides(cfg.overrides)
         except OverridesError as e:
             self.issue(f"overrides rejected, nothing written: {e}")
-            return self.fail()
+            return
         self.say(f"feed: {len(items)} items; overrides: {len(self.overrides)}")
 
         lists = {
@@ -588,7 +634,35 @@ class _Run:
         if not deku.active or not d2d_ok:
             keep.add("d2d-disputed")
         self._report(plan, applied, keep)
-        return self._finish()
+
+    # ---- 8. the Deku collection step
+
+    def _collection(self) -> None:
+        """Runs after the wishlist step finished and saved its state; whatever happens here is an
+        issue of its own (or a quiet stop), never a change to the wishlist step's results."""
+        cfg = self.cfg
+        if self.past_deadline():
+            self.say("collection: step not started, past the write deadline; next run", logging.WARNING)
+            return
+        try:
+            overrides = load_collection_overrides(cfg.overrides)
+        except OverridesError as e:
+            self.issue(f"Deku collection step skipped: collection overrides rejected: {e}")
+            return
+        try:
+            deku = self._clients.get("deku") or self.deps.make_deku(cfg)
+            ta = self.ta_client or self.deps.make_ta(cfg, dict(self.state.ta_game_ids))
+        except Exception as e:  # noqa: BLE001
+            self.issue(f"Deku collection step: client setup failed ({type(e).__name__})")
+            return
+        try:
+            run_collection_step(self, deku, ta, self.state, overrides, self.deps.now())
+        except Exception as e:  # noqa: BLE001 - never let the step take the run down
+            self.issue(f"Deku collection step aborted by an unexpected error: {_err(e)}")
+        try:
+            save_state(cfg.state, self.state)
+        except Exception as e:  # noqa: BLE001
+            self.issue(f"state not saved after the Deku collection step ({type(e).__name__})")
 
     # ---- 1. feed
 

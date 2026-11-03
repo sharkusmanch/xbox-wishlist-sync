@@ -448,3 +448,43 @@ def test_a_flaky_lookup_does_not_change_the_review_body():
                                                       {}, {}, current, {}, {})) is True
     assert plan_review_task(vk_with(fake), build_plan(items, {"A": ambiguous, "B": none, "C": transient("y")},
                                                       {}, {}, current, {}, {})) is False
+
+
+# ---- Deku collection review task --------------------------------------------------------------
+
+
+def test_collection_review_upserts_in_place_and_returns_changed_flag():
+    from wsync.report import COLLECTION_REVIEW_KEY, collection_review_task
+
+    fake = FakeVikunja()
+    assert collection_review_task(vk_with(fake), "## Would add (1)\n- Alpha (`alpha`, digital, xbox_series)") is True
+    assert collection_review_task(vk_with(fake), "## Would add (1)\n- Alpha (`alpha`, digital, xbox_series)") is False
+    assert len(fake.calls("PUT", "/tasks")) == 1 and not fake.calls("POST")
+    task = next(iter(fake.tasks.values()))
+    assert task["title"] == "Review the Deku collection plan"
+    assert f"wsync-key: {COLLECTION_REVIEW_KEY}" in task["description"]
+    assert COLLECTION_REVIEW_KEY == "collection-review:dry-run"
+    assert collection_review_task(vk_with(fake), "## Would add (0)") is True
+    assert len(fake.calls("POST")) == 1 and len(fake.tasks) == 1
+
+
+def test_collection_review_closed_on_a_live_run():
+    from wsync.report import collection_review_task
+
+    fake = FakeVikunja()
+    collection_review_task(vk_with(fake), "plan")
+    assert collection_review_task(vk_with(fake), None, dry_run=False) is False
+    assert all(t["done"] for t in fake.tasks.values())
+
+
+def test_problem_sync_and_wishlist_review_leave_the_collection_review_task_alone():
+    from wsync.report import collection_review_task
+
+    fake = FakeVikunja()
+    collection_review_task(vk_with(fake), "plan")
+    sync_problem_tasks(vk_with(fake), [])
+    sync_problem_tasks(vk_with(fake), [problem()], keep_kinds=())
+    plan_review_task(vk_with(fake), Plan())  # empty wishlist plan: closes only its own task
+    plan_review_task(vk_with(fake), full_plan(), dry_run=False)
+    coll = [t for t in fake.tasks.values() if t["title"] == "Review the Deku collection plan"]
+    assert len(coll) == 1 and not coll[0]["done"]

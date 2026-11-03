@@ -38,6 +38,10 @@ TIMEOUT = 30
 PER_PAGE = 50
 MAX_PAGES = 100
 PLAN_REVIEW_KEY = "plan-review:dry-run"
+COLLECTION_REVIEW_KEY = "collection-review:dry-run"
+COLLECTION_REVIEW_TITLE = "Review the Deku collection plan"
+# Tasks that aren't problem tasks: the problem sync never closes them.
+_REVIEW_KEYS = frozenset({PLAN_REVIEW_KEY, COLLECTION_REVIEW_KEY})
 _MARKER = re.compile(r"^wsync-key:\s*(\S+)\s*$", re.MULTILINE)
 _HINT = ("add an override in the xbox-wishlist-sync overrides ConfigMap (overrides.json): "
          "`\"{pid}\": {{\"{field}\": \"<slug>\"}}`, or `\"skip\"` as the value to stop mirroring it there")
@@ -291,7 +295,7 @@ def sync_problem_tasks(vk: Vikunja, problems: list[Problem], keep_kinds=(), keep
     for key, p in current.items():
         vk.upsert(key, *problem_task(p))
         vk.close_duplicates(key)
-    for key in before - current.keys() - {PLAN_REVIEW_KEY}:
+    for key in before - current.keys() - _REVIEW_KEYS:
         if key.rsplit(":", 1)[-1] in keep_kinds or key in keep_keys:
             continue
         vk.close(key)
@@ -356,6 +360,19 @@ def plan_review_task(vk: Vikunja, plan: Plan, *, dry_run: bool = True) -> bool:
         return False
     changed = vk.upsert(PLAN_REVIEW_KEY, "Review the wishlist sync plan", plan_review_body(plan))
     vk.close_duplicates(PLAN_REVIEW_KEY)
+    return changed
+
+
+def collection_review_task(vk: Vikunja, body: str | None, *, dry_run: bool = True) -> bool:
+    """Keep the Deku collection step's "review the plan" task current (dry run) or close it (live).
+
+    True only when the task's text changed (send the "plan ready" ping then).
+    """
+    if not dry_run:
+        vk.close(COLLECTION_REVIEW_KEY)
+        return False
+    changed = vk.upsert(COLLECTION_REVIEW_KEY, COLLECTION_REVIEW_TITLE, body or "")
+    vk.close_duplicates(COLLECTION_REVIEW_KEY)
     return changed
 
 
