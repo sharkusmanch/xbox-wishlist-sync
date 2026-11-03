@@ -51,3 +51,62 @@ def test_invalid_json_fails(tmp_path):
 def test_bad_shapes_fail(tmp_path, data):
     with pytest.raises(OverridesError):
         load_overrides(write(tmp_path, data))
+
+
+def test_load_overrides_ignores_collection_key(tmp_path):
+    path = write(tmp_path, {
+        "9NB0ZZ452WF1": {"deku": "fable"},
+        "collection": {"123": {"deku": "some-game"}},
+    })
+    assert load_overrides(path) == {"9NB0ZZ452WF1": {"deku": "fable"}}
+
+
+def test_collection_overrides_load(tmp_path):
+    from wsync.overrides import load_collection_overrides
+
+    path = write(tmp_path, {
+        "P1": {"deku": "x"},
+        "collection": {"123": {"deku": "some-game"}, "456": {"deku": "skip", "note": "why"}},
+    })
+    assert load_collection_overrides(path) == {123: {"deku": "some-game"}, 456: {"deku": "skip"}}
+
+
+def test_collection_overrides_missing_file_or_key(tmp_path):
+    from wsync.overrides import load_collection_overrides
+
+    assert load_collection_overrides(tmp_path / "nope.json") == {}
+    assert load_collection_overrides(write(tmp_path, {"P1": {"deku": "x"}})) == {}
+
+
+@pytest.mark.parametrize("coll", [
+    [],
+    "x",
+    {"abc": {"deku": "x"}},
+    {"0": {"deku": "x"}},
+    {"-4": {"deku": "x"}},
+    {"1": "skip"},
+    {"1": {}},
+    {"1": {"deku": ""}},
+    {"1": {"deku": 3}},
+    {"1": {"ta": "x"}},
+    {"1": {"note": 4, "deku": "x"}},
+])
+def test_collection_overrides_bad_shapes_fail(tmp_path, coll):
+    from wsync.overrides import load_collection_overrides
+
+    with pytest.raises(OverridesError):
+        load_collection_overrides(write(tmp_path, {"collection": coll}))
+
+
+def test_collection_overrides_invalid_json_fails(tmp_path):
+    from wsync.overrides import load_collection_overrides
+
+    with pytest.raises(OverridesError, match="JSON"):
+        load_collection_overrides(write(tmp_path, "{nope"))
+
+
+def test_collection_override_keys_normalising_to_one_id_fail(tmp_path):
+    from wsync.overrides import load_collection_overrides
+
+    with pytest.raises(OverridesError, match="more than once"):
+        load_collection_overrides(write(tmp_path, {"collection": {"1": {"deku": "a"}, " 01": {"deku": "b"}}}))

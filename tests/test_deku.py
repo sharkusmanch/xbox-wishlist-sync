@@ -647,3 +647,428 @@ def test_network_error_names_the_underlying_reason_but_not_the_url(tmp_path):
         t.request("GET", BASE + "/wishlist/" + WID)
     assert "URLError(TimeoutError)" in str(err.value)
     assert "dekudeals" not in str(err.value) and WID not in str(err.value)
+
+
+# ---------------------------------------------------------------- collection (owned entries)
+
+CID = "collectid9"
+COLLECTION = fixture("deku_collection_page.html")
+OWNED = fixture("deku_item_owned.html")
+OWNED_A = "44444444-4444-4444-8444-444444444444"  # fixture entry: Xbox One, Digital
+OWNED_B = "55555555-5555-4555-8555-555555555555"  # fixture entry: PS4, no format
+NEW_OWNED = "66666666-6666-4666-8666-666666666666"
+_BLOCK = re.compile(r"<div class='summarized-details owned'>.*?</form>\n</div>\n</div>\n</div>\n</div>\n", re.S)
+BLOCKS = _BLOCK.findall(OWNED)
+
+
+def owned_block(pid, platform, fmt):
+    """An owned entry's block as the site renders it, built from the fixture's first entry."""
+    b = BLOCKS[0].replace(OWNED_A, pid)
+    b = b.replace("<input checked class='form-check-input' id='", "<input class='form-check-input' id='")
+    b = re.sub(r"( name='format' id='[^']*' value='\w+')\s+checked>", r"\1 >", b)
+    b = b.replace(f"name='platform' type='radio' value='{platform}'>", f"name='platform' type='radio' value='{platform}' checked>")
+    if fmt:
+        b = re.sub(rf"( name='format' id='[^']*' value='{fmt}')\s*>", r"\1 checked>", b)
+    # the status radio stays at its default
+    return b.replace("completion_status' type='radio' value=''>", "completion_status' type='radio' value='' checked>", 1)
+
+
+def owned_page(*blocks):
+    return NOT_LISTED.replace("<div class='details-area'>\n</div>", "<div class='details-area'>\n" + "".join(blocks) + "</div>", 1)
+
+
+def collection_pages(chunks, total=None):
+    cards = COLLECTION.split("<div class='d-block col'>")
+    head, body = cards[0], cards[1:]
+    total = total or len(body)
+    start, out = 0, []
+    for chunk in chunks:
+        counter = f"{start + 1}-{start + chunk} of {total}"
+        out.append(page(head.replace("8 items", counter) + "".join("<div class='d-block col'>" + c for c in body[start:start + chunk])))
+        start += chunk
+    return out
+
+
+def test_collection_page_parse_reads_platform_and_format_per_row():
+    total, rows = deku.parse_collection_page(COLLECTION)
+    assert total == 8
+    O = deku.OwnedEntry
+    assert rows == [
+        O("test-game-series", "Test Game: Series", "xbox_series", "physical"),
+        O("test-game-one", "Test Game & One", "xbox_one", "digital"),
+        O("test-game-multi", "Test Game Multi", "switch", "digital"),
+        O("test-game-multi", "Test Game Multi", "xbox_one", "digital"),
+        O("test-game-ps5", "Ōkami Test's PS5", "ps5", None),
+        O("test-game-nofmt-noplat", "Test Game Format Only", None, "digital"),
+        O("test-game-bare", "Test Game Bare", None, None),
+        O("test-game-switch2", "Test Game Switch 2", "switch_2", "digital"),
+    ]
+
+
+def test_collection_page_without_a_count_has_no_total():
+    assert deku.parse_collection_page("<html>Just a moment...</html>") == (None, [])
+
+
+def test_collection_reads_every_page_of_the_list_view():
+    p1, p2 = collection_pages([5, 3])
+    fake = Fake({("GET", f"/collection/{WID}?view=list&page=1"): p1, ("GET", f"/collection/{WID}?view=list&page=2"): p2})
+    rows = client(fake).collection()
+    assert len(rows) == 8 and rows[0].slug == "test-game-series" and rows[-1].slug == "test-game-switch2"
+    assert [r[1] for r in fake.requests] == [f"{BASE}/collection/{WID}?view=list&page=1",
+                                             f"{BASE}/collection/{WID}?view=list&page=2"]
+
+
+def test_collection_id_defaults_to_the_wishlist_id_and_can_differ():
+    c = client(Fake())
+    assert c.collection_id == WID
+    other = DekuClient("e", SECRET, WID, None, transport=Fake(), sleep=lambda s: None, collection_id=CID)
+    assert other.collection_id == CID
+
+
+def test_collection_short_read_raises_instead_of_returning_partial():
+    p1, _ = collection_pages([5, 3])
+    empty = page(COLLECTION.split("<div class='d-block col'>")[0].replace("8 items", "6-8 of 8"))
+    fake = Fake({("GET", f"/collection/{WID}?view=list&page=1"): p1, ("GET", f"/collection/{WID}?view=list&page=2"): empty})
+    with pytest.raises(DekuError, match="collection page 2 has no entries"):
+        client(fake).collection()
+
+
+def test_collection_total_mismatch_raises():
+    fake = Fake({("GET", f"/collection/{WID}"): page(COLLECTION.replace("8 items", "3 items"))})
+    with pytest.raises(DekuError, match="read 8 collection entries, the page says 3"):
+        client(fake).collection()
+
+
+def test_collection_without_a_count_raises():
+    fake = Fake({("GET", f"/collection/{WID}"): page("<html>Just a moment...</html>")})
+    with pytest.raises(DekuError, match="no item count"):
+        client(fake).collection()
+
+
+@pytest.mark.parametrize("cid", [None, CID])
+def test_collection_id_never_appears_in_errors(cid):
+    fake = Fake({("GET", f"/collection/{cid or WID}"): Response(404, BASE, "", None)})
+    c = DekuClient("e", SECRET, WID, None, transport=fake, sleep=lambda s: None, collection_id=cid)
+    with pytest.raises(DekuError) as e:
+        c.collection()
+    assert (cid or WID) not in str(e.value) and "<id>" in str(e.value)
+
+
+def test_item_page_lists_its_owned_entries():
+    item = deku.parse_item("celeste", OWNED)
+    assert item.on_wishlist is False and item.uuid == NEW_UUID
+    assert [(o.public_id, o.platform, o.format) for o in item.owned] == [
+        (OWNED_A, "xbox_one", "digital"), (OWNED_B, "ps4", None)]
+    assert item.owned[0].settings["_method"] == "PUT" and item.owned[0].settings["price_paid_currency"] == "USD"
+    assert "price_paid" in item.owned[1].settings
+    assert deku.parse_item("celeste", NOT_LISTED).owned == ()
+    assert deku.parse_item("banishers", LOGGED_IN).owned == ()
+
+
+def test_owned_settings_stay_out_of_reprs():
+    item = deku.parse_item("celeste", OWNED)
+    assert "price_paid" not in repr(item) and "completion_status" not in repr(item)
+
+
+def test_item_page_with_a_repeated_owned_entry_raises():
+    with pytest.raises(DekuError):
+        deku.parse_item("celeste", owned_page(owned_block(OWNED_A, "xbox_one", "digital"),
+                                              owned_block(OWNED_A, "xbox_one", "digital")))
+
+
+# ---- adding to the collection
+
+def own_fake(*pages, extra=None):
+    routes = {
+        ("GET", "/items/celeste"): [page(p) for p in pages],
+        ("POST", f"/owned_items/{NEW_OWNED}"): redirect("/items/celeste"),  # before the shorter prefix
+        ("POST", "/owned_items"): redirect("/items/celeste"),
+    }
+    routes.update(extra or {})
+    return Fake(routes)
+
+
+def test_own_sequence_matches_protocol_doc():
+    # docs/deku-protocol.md: POST /owned_items, re-read the item page, PUT the entry's details form, read back.
+    fake = own_fake(NOT_LISTED,
+                    owned_page(owned_block(NEW_OWNED, "xbox_one", None)),
+                    owned_page(owned_block(NEW_OWNED, "xbox_one", "digital")))
+    c = client(fake)
+    item = c.item("celeste")
+    c.own(item, "digital", "xbox_one")
+    assert [(m, u[len(BASE):]) for m, u, _, _ in fake.requests] == [
+        ("GET", "/items/celeste"),
+        ("POST", "/owned_items"),
+        ("GET", "/items/celeste"),
+        ("POST", f"/owned_items/{NEW_OWNED}"),
+        ("GET", "/items/celeste"),
+    ]
+    first, second = fake.posts()
+    assert first[2] == [("item_id", NEW_UUID), ("to", "true")] and first[3]["render"] == "true"
+    assert second[2] == [("_method", "PUT"), ("completion_status", ""), ("format", "digital"), ("platform", "xbox_one"),
+                         ("price_paid_currency", "USD"), ("price_paid", ""), ("note_private", "false"),
+                         ("hide_from_public_view", "false"), ("note", "")]
+    assert second[3]["render"] == "true"
+
+
+def test_own_leaves_other_platform_entries_alone():
+    ps4 = owned_block(OWNED_B, "ps4", None)
+    fake = own_fake(owned_page(ps4),
+                    owned_page(owned_block(NEW_OWNED, "xbox_one", None), ps4),
+                    owned_page(owned_block(NEW_OWNED, "xbox_one", "physical"), ps4))
+    c = client(fake)
+    c.own(c.item("celeste"), "physical", "xbox_one")
+    assert [p[0] for p in fake.posts()] == ["/owned_items", f"/owned_items/{NEW_OWNED}"]
+    assert all(m != "DELETE" for m, *_ in fake.requests)
+
+
+def test_own_refuses_a_platform_already_owned():
+    fake = own_fake(OWNED)
+    c = client(fake)
+    with pytest.raises(DekuError, match="already in the collection"):
+        c.own(c.item("celeste"), "digital", "xbox_one")
+    assert not fake.posts()
+
+
+def test_own_refuses_an_xbox_platform_the_item_does_not_offer():
+    fake = own_fake(NOT_LISTED)
+    c = client(fake)
+    with pytest.raises(DekuError, match="not offered"):
+        c.own(c.item("celeste"), "digital", "xbox_series")
+    assert not fake.posts()
+
+
+def test_own_rejects_unknown_platform_or_format_before_any_request():
+    fake = own_fake(NOT_LISTED)
+    c = client(fake)
+    item = c.item("celeste")
+    with pytest.raises(ValueError):
+        c.own(item, "either", "xbox_one")
+    with pytest.raises(ValueError):
+        c.own(item, "digital", "dreamcast")
+    assert not fake.posts()
+
+
+def test_own_without_a_format_leaves_it_unset_and_sends_none():
+    fake = own_fake(NOT_LISTED,
+                    owned_page(owned_block(NEW_OWNED, "xbox_one", None)),
+                    owned_page(owned_block(NEW_OWNED, "xbox_one", None)))
+    c = client(fake)
+    c.own(c.item("celeste"), None, "xbox_one")
+    save = fake.posts()[1]
+    assert "format" not in save[1] and save[1]["platform"] == "xbox_one"
+
+
+def test_own_fails_when_the_entry_does_not_appear():
+    fake = own_fake(NOT_LISTED, NOT_LISTED)
+    c = client(fake)
+    with pytest.raises(DekuError, match="exactly one new collection entry"):
+        c.own(c.item("celeste"), "digital", "xbox_one")
+    assert [p[0] for p in fake.posts()] == ["/owned_items"]
+
+
+def test_own_fails_when_two_entries_appear():
+    fake = own_fake(NOT_LISTED, owned_page(owned_block(NEW_OWNED, "xbox_one", None), owned_block(OWNED_B, "ps4", None)))
+    c = client(fake)
+    with pytest.raises(DekuError, match="exactly one new collection entry"):
+        c.own(c.item("celeste"), "digital", "xbox_one")
+    assert [p[0] for p in fake.posts()] == ["/owned_items"]
+
+
+@pytest.mark.parametrize("final, fields", [
+    (owned_block(NEW_OWNED, "xbox_one", "physical"), "['format']"),
+    (owned_block(NEW_OWNED, "ps4", "digital"), "['platform']"),
+    (owned_block(NEW_OWNED, "xbox_one", None), "['format']"),
+])
+def test_own_read_back_mismatch_raises_naming_fields_only(final, fields):
+    fake = own_fake(NOT_LISTED, owned_page(owned_block(NEW_OWNED, "xbox_one", None)), owned_page(final))
+    c = client(fake)
+    with pytest.raises(DekuError) as e:
+        c.own(c.item("celeste"), "digital", "xbox_one")
+    assert f"read back differs from what was saved in fields {fields}" in str(e.value)
+    assert isinstance(e.value, deku.DekuPartialOwn) and "an entry may exist" in str(e.value)
+    assert SECRET not in str(e.value) and NEW_OWNED not in str(e.value)
+
+
+def test_own_read_back_catches_a_changed_note_without_leaking_it():
+    final = owned_block(NEW_OWNED, "xbox_one", "digital").replace("name='note' rows='3'></textarea>", "name='note' rows='3'>secret note</textarea>")
+    fake = own_fake(NOT_LISTED, owned_page(owned_block(NEW_OWNED, "xbox_one", None)), owned_page(final))
+    c = client(fake)
+    with pytest.raises(DekuError) as e:
+        c.own(c.item("celeste"), "digital", "xbox_one")
+    assert "['note']" in str(e.value) and "secret note" not in str(e.value)
+
+
+def test_own_preserves_the_entry_s_other_settings_when_saving():
+    new = owned_block(NEW_OWNED, "xbox_one", None).replace("name='note' rows='3'></textarea>", "name='note' rows='3'>keep me</textarea>")
+    final = owned_block(NEW_OWNED, "xbox_one", "digital").replace("name='note' rows='3'></textarea>", "name='note' rows='3'>keep me</textarea>")
+    fake = own_fake(NOT_LISTED, owned_page(new), owned_page(final))
+    c = client(fake)
+    c.own(c.item("celeste"), "digital", "xbox_one")
+    assert fake.posts()[1][1]["note"] == "keep me"
+
+
+def test_own_detects_other_entries_changing_during_the_add():
+    ps4 = owned_block(OWNED_B, "ps4", None)
+    changed = owned_block(OWNED_B, "ps4", "physical")
+    fake = own_fake(owned_page(ps4),
+                    owned_page(owned_block(NEW_OWNED, "xbox_one", None), ps4),
+                    owned_page(owned_block(NEW_OWNED, "xbox_one", "digital"), changed))
+    c = client(fake)
+    with pytest.raises(DekuError, match="existing collection entries changed"):
+        c.own(c.item("celeste"), "digital", "xbox_one")
+
+
+def partial_types(exc):
+    assert isinstance(exc, deku.DekuPartialOwn)
+    assert not isinstance(exc, (deku.DekuRateLimited, deku.DekuNetworkError, AuthError))
+
+
+def test_own_429_on_the_create_is_a_partial_own_and_not_retried():
+    fake = own_fake(NOT_LISTED, extra={("POST", "/owned_items"): Response(429, BASE, "", None)})
+    c = client(fake)
+    with pytest.raises(DekuError, match="429") as e:
+        c.own(c.item("celeste"), "digital", "xbox_one")
+    partial_types(e.value)
+    assert len(fake.posts()) == 1
+
+
+def test_own_429_on_the_re_read_after_the_create_is_a_partial_own():
+    fake = own_fake(NOT_LISTED)
+    fake.routes[("GET", "/items/celeste")] = [page(NOT_LISTED), Response(429, BASE, "", None)]
+    c = client(fake)
+    with pytest.raises(DekuError, match="429|DekuRateLimited") as e:
+        c.own(c.item("celeste"), "digital", "xbox_one")
+    partial_types(e.value)
+    assert "DekuRateLimited" in str(e.value) and len(fake.posts()) == 1
+
+
+def test_own_network_error_on_the_create_is_a_partial_own():
+    fake = own_fake(NOT_LISTED, extra={("POST", "/owned_items"): deku.DekuNetworkError("network error: timeout")})
+    c = client(fake)
+    with pytest.raises(DekuError) as e:
+        c.own(c.item("celeste"), "digital", "xbox_one")
+    partial_types(e.value)
+    assert "DekuNetworkError" in str(e.value)
+
+
+def test_own_login_redirect_on_the_create_is_not_repeated():
+    fake = own_fake(NOT_LISTED, extra={("POST", "/owned_items"): redirect(BASE + "/login?return_to=%2F"), **login_ok()})
+    c = client(fake)
+    with pytest.raises(DekuError) as e:
+        c.own(c.item("celeste"), "digital", "xbox_one")
+    partial_types(e.value)
+    assert [p[0] for p in fake.posts()] == ["/owned_items"]
+
+
+def test_own_failure_on_the_save_is_a_partial_own_without_ids():
+    fake = own_fake(NOT_LISTED, owned_page(owned_block(NEW_OWNED, "xbox_one", None)),
+                    extra={("POST", f"/owned_items/{NEW_OWNED}"): deku.DekuNetworkError("network error: reset")})
+    c = client(fake)
+    with pytest.raises(DekuError) as e:
+        c.own(c.item("celeste"), "digital", "xbox_one")
+    partial_types(e.value)
+    assert NEW_OWNED not in str(e.value) and NEW_UUID not in str(e.value)
+
+
+def test_own_accepts_only_xbox_platforms():
+    fake = own_fake(NOT_LISTED)
+    c = client(fake)
+    item = c.item("celeste")
+    for plat in ("switch", "ps4", "steam", "dreamcast", "xbox_360"):
+        with pytest.raises(ValueError):
+            c.own(item, "digital", plat)
+    assert not fake.posts()
+
+
+def test_own_on_a_form_without_a_format_choice_skips_the_format():
+    def formatless_block(platform):
+        b = owned_block(NEW_OWNED, platform, None)
+        return re.sub(r"<div class='form-group'>\n<label>Format</label>.*?</div>\n\n</div>\n", "", b, flags=re.S)
+
+    new, final = formatless_block("xbox_one"), formatless_block("xbox_one")
+    assert "name='format'" not in new
+    fake = own_fake(NOT_LISTED, owned_page(new), owned_page(final))
+    c = client(fake)
+    c.own(c.item("celeste"), "digital", "xbox_one")
+    save = fake.posts()[1]
+    assert "format" not in save[1] and save[1]["platform"] == "xbox_one"
+
+
+def test_own_requires_a_platform_choice_on_the_form():
+    new = owned_block(NEW_OWNED, "xbox_one", None)
+    new = re.sub(r"<input[^>]*name='platform'[^>]*>", "", new)
+    fake = own_fake(NOT_LISTED, owned_page(new))
+    c = client(fake)
+    with pytest.raises(deku.DekuPartialOwn, match="no platform choice"):
+        c.own(c.item("celeste"), "digital", "xbox_one")
+
+
+def test_persistent_429_on_a_read_is_a_rate_limited_error():
+    fake = Fake({("GET", "/search?q="): Response(429, BASE + "/x", "slow down", None)})
+    c = DekuClient("e", SECRET, WID, None, transport=fake, sleep=lambda s: None)
+    with pytest.raises(deku.DekuRateLimited):
+        c.search("Hades")
+
+
+def test_own_write_errors_do_not_name_the_entry_id():
+    fake = own_fake(NOT_LISTED, owned_page(owned_block(NEW_OWNED, "xbox_one", None)),
+                    extra={("POST", f"/owned_items/{NEW_OWNED}"): Response(500, BASE, "", None)})
+    c = client(fake)
+    with pytest.raises(DekuError) as e:
+        c.own(c.item("celeste"), "digital", "xbox_one")
+    assert NEW_OWNED not in str(e.value) and "/owned_items/<id>" in str(e.value)
+
+
+def test_own_paces_every_request_it_sends():
+    waits = []
+    fake = own_fake(NOT_LISTED, owned_page(owned_block(NEW_OWNED, "xbox_one", None)),
+                    owned_page(owned_block(NEW_OWNED, "xbox_one", "digital")))
+    c = DekuClient("e", SECRET, WID, None, transport=fake, sleep=waits.append).paced(4.0)
+    item = c.item("celeste")
+    waits.clear()
+    c.own(item, "digital", "xbox_one")
+    assert waits == [4.0] * 4  # add, re-read, save, read back
+
+
+def test_paced_shares_the_session_and_changes_only_the_pause():
+    waits = []
+    p1, p2 = collection_pages([5, 3])
+    fake = Fake({("GET", f"/collection/{WID}?view=list&page=1"): p1, ("GET", f"/collection/{WID}?view=list&page=2"): p2})
+    c = DekuClient("e", SECRET, WID, None, transport=fake, sleep=waits.append)
+    slow = c.paced(4.0)
+    assert slow is not c and slow._http is c._http and slow.collection_id == c.collection_id
+    assert len(slow.collection()) == 8
+    assert waits == [4.0]
+    assert c._pause == deku.PAGE_PAUSE
+    assert repr(slow) == "DekuClient(<credentials hidden>)"
+
+
+# ---- removal (live verification only)
+
+def test_disown_deletes_the_entry_and_verifies():
+    fake = Fake({("GET", "/items/celeste"): [page(owned_page(owned_block(NEW_OWNED, "xbox_one", "digital"))), page(NOT_LISTED)],
+                 ("DELETE", f"/owned_items/{NEW_OWNED}"): redirect("/items/celeste")})
+    c = client(fake)
+    c.disown(c.item("celeste"))
+    method, url, data, headers = fake.requests[1]
+    assert (method, url, data) == ("DELETE", f"{BASE}/owned_items/{NEW_OWNED}", None) and headers["render"] == "true"
+
+
+def test_disown_raises_if_the_entry_is_still_there():
+    shown = page(owned_page(owned_block(NEW_OWNED, "xbox_one", "digital")))
+    fake = Fake({("GET", "/items/celeste"): [shown, shown], ("DELETE", f"/owned_items/{NEW_OWNED}"): redirect("/items/celeste")})
+    c = client(fake)
+    with pytest.raises(DekuError, match="still there"):
+        c.disown(c.item("celeste"))
+
+
+def test_disown_with_several_entries_needs_the_id():
+    fake = Fake({("GET", "/items/celeste"): page(OWNED)})
+    c = client(fake)
+    item = c.item("celeste")
+    with pytest.raises(DekuError, match="name the one to remove"):
+        c.disown(item)
+    with pytest.raises(DekuError, match="no such owned entry"):
+        c.disown(item, NEW_OWNED)
+    assert all(m == "GET" for m, *_ in fake.requests)

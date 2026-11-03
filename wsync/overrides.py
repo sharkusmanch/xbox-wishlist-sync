@@ -14,6 +14,13 @@
 "skip" means the item isn't mirrored to that list at all: no lookup, no problem task, and an
 entry for it already on that list is removed like any other entry that isn't on the Xbox list.
 
+The same file may carry a top-level "collection" object for the Deku collection step, keyed by
+TrueAchievements game id (a positive integer, as a string):
+
+    "collection": {"12345": {"deku": "some-slug"}, "67890": {"deku": "skip"}}
+
+`load_overrides` ignores that key; `load_collection_overrides` reads it.
+
 A missing file means no overrides. A file that isn't valid is an error: the run must not guess.
 """
 
@@ -24,6 +31,8 @@ from pathlib import Path
 
 SKIP = "skip"
 _KEYS = {"deku", "ta", "ta_dlc", "note"}
+COLLECTION_KEY = "collection"
+_COLLECTION_KEYS = {"deku", "note"}
 
 
 class OverridesError(Exception):
@@ -36,7 +45,7 @@ def _slug(pid: str, key: str, value) -> str:
     return value.strip()
 
 
-def load_overrides(path: Path) -> dict[str, dict]:
+def _read(path: Path) -> dict:
     path = Path(path)
     try:
         raw = path.read_text(encoding="utf-8")
@@ -50,8 +59,15 @@ def load_overrides(path: Path) -> dict[str, dict]:
         raise OverridesError(f"overrides file is not valid JSON: {e}") from None
     if not isinstance(data, dict):
         raise OverridesError("overrides file must be a JSON object keyed by productId")
+    return data
+
+
+def load_overrides(path: Path) -> dict[str, dict]:
+    data = _read(path)
     out: dict[str, dict] = {}
     for pid, entry in data.items():
+        if pid == COLLECTION_KEY:
+            continue
         if not pid.strip():
             raise OverridesError("override with an empty productId")
         if not isinstance(entry, dict):
@@ -73,4 +89,31 @@ def load_overrides(path: Path) -> dict[str, dict]:
         if "note" in entry and not isinstance(entry["note"], str):
             raise OverridesError(f"override {pid}: note must be text")
         out[pid.strip()] = clean
+    return out
+
+
+def load_collection_overrides(path: Path) -> dict[int, dict]:
+    """The "collection" object: TrueAchievements game id -> {"deku": slug | "skip"}."""
+    section = _read(path).get(COLLECTION_KEY)
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise OverridesError("collection overrides must be an object keyed by TrueAchievements game id")
+    out: dict[int, dict] = {}
+    for key, entry in section.items():
+        if not isinstance(key, str) or not key.strip().isascii() or not key.strip().isdigit() or int(key) < 1:
+            raise OverridesError(f"collection override {key!r}: key must be a positive TrueAchievements game id")
+        label = f"collection override {int(key)}"
+        if not isinstance(entry, dict):
+            raise OverridesError(f"{label}: must be an object")
+        unknown = set(entry) - _COLLECTION_KEYS
+        if unknown:
+            raise OverridesError(f"{label}: unknown keys {sorted(unknown)}")
+        if "deku" not in entry:
+            raise OverridesError(f"{label}: deku is required")
+        if "note" in entry and not isinstance(entry["note"], str):
+            raise OverridesError(f"{label}: note must be text")
+        if int(key) in out:
+            raise OverridesError(f"{label}: given more than once")
+        out[int(key)] = {"deku": _slug(label, "deku", entry["deku"])}
     return out

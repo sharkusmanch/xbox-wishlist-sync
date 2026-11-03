@@ -86,6 +86,62 @@ fetch (with `GamerToken`, `HashKey`, ...) sent through it would put those values
 - The gamer page's sidebar (`/gamer/<tag>`) also lists the wishlist, with DLC links as
   `/dlc.aspx?dlcid=<id>`; it is not used.
 
+## Game Collection (read)
+
+Verified live 2026-11-02; code in `wsync/ta_coll.py` and `TAClient.collection()`. Ported from the
+`xbox` plugin's `ta_collection.py`, with the transport replaced (curl_cffi session, never
+FlareSolverr).
+
+- `GET /gamer/<tag>/gamecollection`, logged in (login-only for every gamer). The page's list
+  filters are form controls inside `.ajaxlistfilter` containers (a search/filter `<div>`, the
+  "View and Filter" `<ul>` and a `<span>` of hidden `oGameCollection_*` / `txtGamerID` inputs),
+  read the way the page's `AJAXList.GetListFilters` does: a text/hidden input with a value, a
+  *checked* radio/checkbox, a select's selected option (else its first option).
+- **`multiple` selects must be left out.** Ownership (`sddOwnerShipStatusIDs`), play status
+  (`sddPlayStatusIDs`) and platform (`ddlPlatformIDs`) are `multiple` selects with nothing chosen
+  (= any), and the ownership and play-status ones have no blank first option, so "first option"
+  sends `1` (Owned) and `1` (Playing now): the list then shrinks to a fraction of the collection
+  with a matching footer total, i.e. a plausible-looking partial read. Sending none of the three
+  gives the whole collection, every ownership status included.
+- The list is an AjaxList fragment: **GET**
+  `/gamer/<tag>/gamecollection?executeformfunction&function=AjaxList&params=<params>`. A POST to the
+  same URL answers "no matching titles". `params` is `oGameCollection|` followed by `&name=value`
+  for every filter, URL-quoted, after two escapes of the page script: the first `&` of each value
+  becomes `*amp*` (`AJAXList.ReplaceCharacters`) and every `|` becomes `/\pipe\/` (`ff.SafeParam`).
+- **Pinned filters.** The page restores the gamer's saved view, and a narrowed one (a search term, "Started", a media or Mythic
+  filter, apps only, ...) gives a short list whose footer total still agrees, so the client pins every
+  narrowing filter instead of trusting the page: drop `txtSearchString`; `ddlStartedStatus=0`,
+  `ddlDifficulty=0`; `ddlCompletionStatus`, `sddGameMediaID`, `ddlGameNotes`, `ddlMythicStatus`,
+  `asdGamePropertyID` = ` ` (each control's `data-default`, checked live 2026-11-02);
+  `ddlTitleType=Game` (games only; its `data-default` is blank = apps too); `ddlSortBy` and
+  `oGameCollection_Order` = `TitleName` (stable paging; the live sort accepts it, rows came back in title order).
+  Any other filter name the page sends that is not a view, column, `oGameCollection_*`, id or
+  DLC-inclusion control makes `collection()` raise `IncompleteRead` naming it, and the page must carry
+  `txtGamerID` and `oGameCollection_Order`.
+- Overrides: drop `chkExcludeNotOwned`; `oGameCollection_ItemsPerPage=100` (TA caps a page at 100),
+  `oGameCollection_Page=<n>`, `oGameCollection_ShowAll=False`; `chkColPlatform`,
+  `chkColOwnershipstatus` and `chkColMedia` switch the three columns the sync needs on, on top of
+  the gamer's saved columns.
+- The fragment is a pagination block, then `<table class="maintable">`: a header row of `<th>`
+  (`Title`, `Platform`, `Ownership`, `Media`, ...; the client reads cells by header name), one
+  `<tr class="odd|even">` per title, and a footer `<tr class="total">` whose first cell reads
+  ` N Titles` (thousands separated by commas). A page past the last returns a near-empty fragment
+  with no total.
+- A row: title in `<td class="smallgame"><a href="/game/<slug>/achievements">` (entities are mostly
+  escaped, but a bare `&` occurs: "Fast & Furious"); platform as an icon only,
+  `<img ... title="xbox-series-x-s">` (slugs seen: `xbox-series-x-s`, `xbox-one`, `xbox-360`,
+  `windows`, `ios`, `android`, `nintendo-switch`); ownership and media as text; the TA game id in the
+  edit button, `GameCollection.EditDetails(<id>, false, true)`, and `chkMultiEdit_<id>`.
+- Ownership values seen: `Owned`, `Xbox Game Pass (deprecated)`, `PC Game Pass`, `EA Play`,
+  `No longer have`, `Ubisoft+`, `Games with Gold`, `Xbox Game Pass Premium`. Media values seen:
+  `Digital`, `Disc`, `Disc & Digital`, `Disc-to-Digital`, and blank.
+- **The AjaxList fragment carries no logged-in marker** (no `g-li`, no header), so `collection()`
+  reads it with `need_login=False` and relies on the collection page having just been read logged
+  in; a logged-out answer is the "Please log in" page, which the shared `_get` retries after a login.
+- Completeness: `collection()` raises `IncompleteRead` unless the rows read equal the footer total
+  of every page, the total is present and unchanged between pages, no game id repeats, and the
+  total is plausible (at most 20,000). Pages are fetched until the rows reach the total.
+
 ## Writes (AJAX)
 
 - `POST https://www.trueachievements.com/ajaxfunctions.aspx/AddToWishlist` or `.../RemoveFromWishlist`

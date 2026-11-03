@@ -5,6 +5,9 @@ Protocol notes (verified live, 2026-11-01) are in docs/deku-protocol.md. In shor
   - update = POST the *whole* details form with current values re-sent, changing only
              `desired_format` and the Xbox `platform_*` boxes;
   - remove = POST `to=false`.
+The collection ("owned") side is a different set of requests: `POST /owned_items` adds an entry,
+`POST /owned_items/<public id>` with `_method=PUT` saves its details, `DELETE /owned_items/<public id>`
+removes it; a game can have several owned entries (one per platform, even two on one platform).
 Every write is read back from the item page, so a silently rejected write is an error.
 
 Credentials stay in memory: they are never logged, put in an exception or put in argv.
@@ -12,6 +15,7 @@ Credentials stay in memory: they are never logged, put in an exception or put in
 
 from __future__ import annotations
 
+import copy
 import html
 import http.cookiejar
 import os
@@ -23,6 +27,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Protocol
 
 from wsync.plan import XBOX_PLATFORMS, Entry
@@ -39,6 +44,13 @@ MAX_REDIRECTS = 5
 RATE_LIMIT_WAITS = (20, 60)  # seconds to wait before retrying a GET answered HTTP 429
 NETWORK_RETRY_WAITS = (5, 15)  # seconds to wait before retrying a GET that got no answer at all
 FORMATS = ("", "either", "physical", "digital")
+OWNED_FORMATS = ("physical", "digital")
+OWNED_PLATFORMS = ("switch_2", "switch", "ps5", "ps4", "xbox_series", "xbox_one", "steam")
+# The share page's Platform / Format detail text -> the keys the details form uses.
+_OWNED_PLATFORM_NAMES = {
+    "xbox x|s": "xbox_series", "xbox one": "xbox_one", "switch": "switch", "switch 2": "switch_2",
+    "ps5": "ps5", "ps4": "ps4", "steam": "steam",
+}
 # What the share page's "Desired format" detail says, as our format keys.
 _SHARED_FORMAT = {"physical": "physical", "digital": "digital", "physical or digital": "either"}
 # Platform names on the item page's "Platforms:" line -> the keys used by `platform_<key>`.
@@ -47,6 +59,16 @@ _PLATFORM_NAMES = {"xbox series x|s": "xbox_series", "xbox one": "xbox_one"}
 
 class DekuError(Exception):
     """Deku Deals answered with something we can't treat as success."""
+
+
+class DekuRateLimited(DekuError):
+    """Deku Deals answered HTTP 429 (after any read backoff). Callers doing optional work stop."""
+
+
+class DekuPartialOwn(DekuError):
+    """A collection add failed from the moment the create request was sent: an entry may exist
+    (bare, or on the wrong platform). Deliberately not a rate-limit or network error, so callers
+    can't treat it as a quiet stop."""
 
 
 class AuthError(DekuError):
@@ -75,6 +97,29 @@ class Transport(Protocol):
     ) -> Response: ...
 
 
+@dataclass(frozen=True)
+class OwnedEntry:
+    """One collection row on the public share page. `platform` is Deku's key (`xbox_series`,
+    `xbox_one`, `switch`, `ps5`, ...) and `format` is `digital` / `physical`; None when not set."""
+
+    slug: str
+    title: str
+    platform: str | None
+    format: str | None
+
+
+@dataclass(frozen=True)
+class OwnedDetail:
+    """One owned entry as the logged-in item page shows it (its own details form)."""
+
+    public_id: str
+    platform: str | None
+    format: str | None
+    # The details form as a browser would submit it (`_method`, completion_status, format, platform,
+    # price_paid_currency, price_paid, note, note_private, hide_from_public_view).
+    settings: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
+
+
 @dataclass
 class DekuItem:
     slug: str
@@ -87,6 +132,8 @@ class DekuItem:
     offered: frozenset[str]
     # The wishlist entry's current details-form values (empty when not on the wishlist).
     settings: dict[str, str] = field(default_factory=dict, repr=False)
+    # The owned (collection) entries on the item page, newest first as the site lists them.
+    owned: tuple[OwnedDetail, ...] = ()
 
 
 # --------------------------------------------------------------------------- transport
@@ -235,6 +282,55 @@ def _settings(parser: _ItemParser) -> dict[str, str]:
     return merged
 
 
+class _OwnedParser(HTMLParser):
+    """Collects each owned entry's details form (`/owned_items/<public id>`, class watch-details-form)."""
+
+    _FORM = re.compile(r"^(?:https://www\.dekudeals\.com)?/owned_items/([0-9a-f-]{36})$")
+
+    def __init__(self):
+        super().__init__()
+        self.forms: list[tuple[str, SimpleNamespace]] = []
+        self._current: SimpleNamespace | None = None
+        self._in_note = False
+        self._note: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "form":
+            m = self._FORM.match(a.get("action") or "")
+            if m and "watch-details-form" in (a.get("class") or "").split():
+                self._current = SimpleNamespace(fields=[], note=None)
+                self.forms.append((m.group(1), self._current))
+        elif self._current is not None and tag == "input" and a.get("name"):
+            self._current.fields.append((a["name"], a.get("type") or "text", a.get("value") or "", "checked" in a))
+        elif self._current is not None and tag == "textarea" and a.get("name") == "note":
+            self._in_note = True
+            self._note = []
+
+    def handle_data(self, data):
+        if self._in_note:
+            self._note.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "textarea" and self._in_note:
+            self._in_note = False
+            self._current.note = "".join(self._note)
+        elif tag == "form":
+            self._current = None
+
+
+def _owned_details(page: str) -> tuple[OwnedDetail, ...]:
+    parser = _OwnedParser()
+    parser.feed(page)
+    out = []
+    for public_id, form in parser.forms:
+        settings = _settings(form)
+        out.append(OwnedDetail(public_id, settings.get("platform") or None, settings.get("format") or None, settings))
+    if len({o.public_id for o in out}) != len(out):
+        raise DekuError("item page lists the same owned entry twice")
+    return tuple(out)
+
+
 def _offered(page: str) -> frozenset[str]:
     m = re.search(r"<strong>Platforms:</strong>\s*(?:<a[^>]*>)?(.*?)(?:</a>|</li>)", page, re.S)
     if not m:
@@ -265,6 +361,7 @@ def parse_item(slug: str, page: str) -> DekuItem:
         platforms=ticked,
         offered=_offered(page),
         settings=settings,
+        owned=_owned_details(page),
     )
 
 
@@ -300,6 +397,37 @@ def parse_wishlist_page(page: str) -> tuple[int | None, list[Entry]]:
     return total, entries
 
 
+_DETAIL = re.compile(r"<small class='text-muted'>(.*?)</small>\s*<br>\s*(.*?)\s*</div>", re.S)
+
+
+def _key(label: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+
+
+def parse_collection_page(page: str) -> tuple[int | None, list[OwnedEntry]]:
+    """One page of the public collection share page (`?view=list`): the page's own total and one
+    entry per row. A game owned on several platforms has several rows."""
+    m = _COUNT.search(page)
+    total = int(m.group(1).replace(",", "")) if m else None
+    entries = []
+    for card in page.split(_CARD)[1:]:
+        link = _LINK.search(card)
+        if not link:
+            continue
+        slug, title = link.group(1), _text(link.group(2))
+        platform = fmt = None
+        for label, value in _DETAIL.findall(card):
+            label, value = _text(label).lower(), _text(value)
+            if not value:
+                continue
+            if label == "platform":
+                platform = _OWNED_PLATFORM_NAMES.get(value.lower()) or _key(value)
+            elif label == "format":
+                fmt = _key(value)
+        entries.append(OwnedEntry(slug, title, platform, fmt))
+    return total, entries
+
+
 # --------------------------------------------------------------------------- client
 
 
@@ -314,10 +442,13 @@ class DekuClient:
         transport: Transport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         pause: float = PAGE_PAUSE,
+        collection_id: str | None = None,
     ):
         self._email = email
         self._password = password
         self._wishlist_id = wishlist_id
+        # The collection and the wishlist share one public id.
+        self.collection_id = collection_id or wishlist_id
         self._http = transport or UrllibTransport(session_path)
         self._sleep = sleep
         self._pause = pause
@@ -327,6 +458,13 @@ class DekuClient:
 
     def __repr__(self) -> str:
         return "DekuClient(<credentials hidden>)"
+
+    def paced(self, seconds: float) -> "DekuClient":
+        """The same client (session, transport, credentials) with `seconds` between requests."""
+        other = copy.copy(self)
+        other._pause = seconds
+        other.last_items = {}
+        return other
 
     # ---- plumbing
 
@@ -364,7 +502,7 @@ class DekuClient:
 
     def _get_response(self, path: str, *, need_login: bool) -> Response:
         """The final response for a page (after redirects); see `_get_page`."""
-        where = path.split("?")[0].replace(self._wishlist_id, "<id>")
+        where = path.split("?")[0].replace(self._wishlist_id, "<id>").replace(self.collection_id, "<id>")
         resp = self._get(BASE + path)
         self._require_ok(resp, f"GET {where}")
         if need_login and not _logged_in(resp.text):
@@ -377,6 +515,8 @@ class DekuClient:
 
     @staticmethod
     def _require_ok(resp: Response, what: str) -> None:
+        if resp.status == 429:
+            raise DekuRateLimited(f"{what} answered HTTP 429")
         if resp.status >= 400:
             raise DekuError(f"{what} answered HTTP {resp.status}")
 
@@ -386,15 +526,20 @@ class DekuClient:
             return True
         return 300 <= resp.status < 400 and "/login" in (resp.location or "")
 
-    def _post(self, path: str, fields: list[tuple[str, str]]) -> None:
+    def _post(self, path: str, fields: list[tuple[str, str]] | None, method: str = "POST",
+              *, retry_login: bool = True) -> None:
+        what = method + " " + re.sub(r"/owned_items/[0-9a-f-]{36}", "/owned_items/<id>",
+                                     re.sub(r"/items/[0-9a-f-]{36}/", "/items/<uuid>/", path))
         for attempt in (1, 2):
-            resp = self._http.request("POST", BASE + path, fields, {"render": "true", "Origin": BASE})
+            resp = self._http.request(method, BASE + path, fields, {"render": "true", "Origin": BASE})
             if self._needs_login(resp):
+                if not retry_login:
+                    raise AuthError(f"{what} was sent to the login page (not repeated: it is not idempotent)")
                 if attempt == 2:
                     raise AuthError("Deku Deals rejected the session again after logging in")
                 self.login()
                 continue
-            self._require_ok(resp, "POST " + re.sub(r"/items/[0-9a-f-]{36}/", "/items/<uuid>/", path))
+            self._require_ok(resp, what)
             return
 
     # ---- session
@@ -420,24 +565,9 @@ class DekuClient:
         `with_platforms` reads every entry's item page (one GET each, paced) for the platforms
         and the entry's real format.
         """
-        entries: list[Entry] = []
-        total = None
-        for number in range(1, MAX_PAGES + 1):
-            page = self._get_page(f"/wishlist/{self._wishlist_id}?page={number}", need_login=False)
-            count, got = parse_wishlist_page(page)
-            if count is None:
-                raise DekuError("wishlist page has no item count (not the page we expected)")
-            total = count if total is None else total
-            if not got and len(entries) < total:
-                raise DekuError(f"wishlist page {number} has no entries ({len(entries)} of {total} read)")
-            entries += got
-            if len(entries) >= total:
-                break
-            self._sleep(self._pause)
-        else:
-            raise DekuError("wishlist has too many pages")
-        if len(entries) != total:
-            raise DekuError(f"read {len(entries)} wishlist entries, the page says {total}")
+        entries, total = self._read_list(
+            "wishlist", lambda n: f"/wishlist/{self._wishlist_id}?page={n}", parse_wishlist_page
+        )
         out = {e.target: e for e in entries}
         if len(out) != len(entries):
             raise DekuError("duplicate slugs on the wishlist pages")
@@ -452,6 +582,36 @@ class DekuClient:
                 # Digital-only items (DLC) have no Desired format field: None means "format doesn't apply".
                 out[slug] = Entry(slug, entry.title, item.settings.get("desired_format"), item.platforms)
         return out
+
+    def _read_list(self, what: str, path, parse) -> tuple[list, int]:
+        """Every page of a public share list; raises unless the rows read equal the page's own total."""
+        entries: list = []
+        total = None
+        for number in range(1, MAX_PAGES + 1):
+            page = self._get_page(path(number), need_login=False)
+            count, got = parse(page)
+            if count is None:
+                raise DekuError(f"{what} page has no item count (not the page we expected)")
+            total = count if total is None else total
+            if not got and len(entries) < total:
+                raise DekuError(f"{what} page {number} has no entries ({len(entries)} of {total} read)")
+            entries += got
+            if len(entries) >= total:
+                break
+            self._sleep(self._pause)
+        else:
+            raise DekuError(f"{what} has too many pages")
+        if len(entries) != total:
+            raise DekuError(f"read {len(entries)} {what} entries, the page says {total}")
+        return entries, total
+
+    def collection(self) -> list[OwnedEntry]:
+        """The public collection share page, one entry per row (a game owned on two platforms has
+        two). Raises unless every row the page counts was read."""
+        entries, _ = self._read_list(
+            "collection", lambda n: f"/collection/{self.collection_id}?view=list&page={n}", parse_collection_page
+        )
+        return entries
 
     def search(self, title: str) -> list[tuple[str, str]]:
         self._sleep(self._pause)  # searches come in bursts during matching; stay polite
@@ -534,6 +694,94 @@ class DekuClient:
         self._post(f"/items/{item.uuid}/watch", [("to", "false")])
         if self.item(item.slug).on_wishlist:
             raise DekuError(f"{item.slug!r} is still on the wishlist after removing")
+
+    # ---- collection writes (add-only for real use; `disown` exists for live verification)
+
+    def own(self, item: DekuItem, fmt: str | None, platform: str) -> None:
+        """Add the game to the collection on an Xbox `platform`, then set that entry's platform and format.
+
+        `item` must be freshly read (`item.owned` is the baseline for spotting the new entry). Existing
+        owned entries are never written; afterwards they are only checked for unchanged platform and
+        format (and the rest of their form). Entries with an unset platform are NOT counted as being
+        on `platform` here: the caller decides what an unset-platform entry means. A new entry starts
+        with a default platform and no format, so the follow-up save sets both and is read back.
+        `fmt` None leaves the format unset; an entry whose form has no format choice (digital-only
+        items) skips the format.
+
+        Once the create request is sent, any failure raises `DekuPartialOwn` (an entry may exist);
+        the create is never repeated, not even after a login redirect, and nothing is removed.
+        """
+        if fmt is not None and fmt not in OWNED_FORMATS:
+            raise ValueError(f"unknown Deku owned format {fmt!r}")
+        if platform not in XBOX_PLATFORMS:
+            raise ValueError(f"own() only adds Xbox platforms, not {platform!r}")
+        if platform not in item.offered:
+            raise DekuError(f"{item.slug!r} is not offered on {platform}")
+        if any(o.platform == platform for o in item.owned):
+            raise DekuError(f"{item.slug!r} is already in the collection on {platform}")
+        known = {o.public_id: o for o in item.owned}
+        self._sleep(self._pause)
+        try:
+            self._post("/owned_items", [("item_id", item.uuid), ("to", "true")], retry_login=False)
+            self._sleep(self._pause)
+            fresh = self.item(item.slug)
+            now = {o.public_id: o for o in fresh.owned}
+            new = [o for pid, o in now.items() if pid not in known]
+            if len(new) != 1 or any(pid not in now for pid in known):
+                raise DekuError(f"expected exactly one new collection entry after adding, found {len(new)}")
+            again = self._save_owned(fresh.slug, new[0], fmt, platform)
+            changed = sorted(pid for pid, o in known.items() if again.get(pid) != o)
+            if changed:
+                raise DekuError("existing collection entries changed while adding")
+        except DekuError as e:
+            raise DekuPartialOwn(
+                f"{item.slug!r}: collection add failed after the create was sent ({type(e).__name__}: {e}); "
+                "an entry may exist with the wrong or no platform/format"
+            ) from None
+
+    def _save_owned(self, slug: str, entry: OwnedDetail, fmt: str | None, platform: str) -> dict[str, OwnedDetail]:
+        """Save the entry's details and read the item page back; returns the page's owned entries."""
+        settings = entry.settings
+        if "platform" not in settings:
+            raise DekuError(f"{slug!r}: the owned entry has no platform choice")
+        expected = dict(settings)
+        expected["platform"] = platform
+        if fmt is not None and "format" in settings:  # digital-only items have no format choice
+            expected["format"] = fmt
+        fields: list[tuple[str, str]] = []
+        for name, value in expected.items():
+            if name == "format" and not value:
+                continue  # no format chosen: a browser sends no radio at all
+            if name in ("note_private", "hide_from_public_view"):
+                fields.append((name, "false"))
+                if value == "true":
+                    fields.append((name, "true"))
+                continue
+            fields.append((name, value))
+        self._sleep(self._pause)
+        self._post(f"/owned_items/{entry.public_id}", fields)
+        self._sleep(self._pause)
+        owned = {o.public_id: o for o in self.item(slug).owned}
+        after = owned.get(entry.public_id)
+        if after is None:
+            raise DekuError(f"{slug!r}: the owned entry is gone after saving its details")
+        differing = sorted(k for k in expected.keys() | after.settings.keys() if expected.get(k) != after.settings.get(k))
+        if differing:
+            raise DekuError(f"{slug!r}: read back differs from what was saved in fields {differing}")
+        return owned
+
+    def disown(self, item: DekuItem, public_id: str | None = None) -> None:
+        """Remove one owned entry (DELETE `/owned_items/<public id>`). Live verification only: the
+        collection step is add-only. Without `public_id` the item must have exactly one entry."""
+        if public_id is None:
+            if len(item.owned) != 1:
+                raise DekuError(f"{item.slug!r} has {len(item.owned)} owned entries; name the one to remove")
+            public_id = item.owned[0].public_id
+        elif public_id not in {o.public_id for o in item.owned}:
+            raise DekuError(f"{item.slug!r} has no such owned entry")
+        self._post(f"/owned_items/{public_id}", None, "DELETE")
+        if public_id in {o.public_id for o in self.item(item.slug).owned}:
+            raise DekuError(f"{item.slug!r}: the owned entry is still there after removing")
 
 
 def _check_format(fmt: str) -> None:
