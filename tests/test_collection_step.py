@@ -916,7 +916,7 @@ def test_ta_read_after_reads_once_a_day_at_the_first_run_past_the_set_time(tmp_p
 def test_ta_read_after_reads_a_cache_from_before_yesterdays_read_time(tmp_path):
     # A cache read before yesterday's 12:30 (e.g. the job was down) is read again at once, before 12:30.
     h = only_collection(tmp_path, GAMES, [row(1, "Alpha Quest")], ta_read_after=dtime(12, 30))
-    st = State(ta_collection={"fetched": (NOW - timedelta(hours=24)).isoformat(),  # yesterday 12:00
+    st = State(ta_collection={"fetched": (NOW - timedelta(hours=23, minutes=40)).isoformat(),  # yesterday 12:20
                               "rows": [row(1, "Alpha Quest").__dict__]})
     save_state(h.cfg.state, st)
     assert h.run() == 0 and h.ta.collection_calls == 1

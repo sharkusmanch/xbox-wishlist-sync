@@ -248,7 +248,7 @@ def _counts_entry(entry: dict | None) -> bool:
 
 
 def _ta_rows(run, ta, state, now: datetime, res: "StepResult") -> list[OwnedRow] | None:
-    """The TA collection, from state when read less than 24 h ago. None when there is none this run:
+    """The TA collection, from state while that read is still current (`_ta_fresh`). None when there is none this run:
     after an issue (a failed read) or quietly (`res.stopped`) during the 6 h back-off after one, or
     when less than 10 minutes remain before the write deadline."""
     cached = state.ta_collection or {}
