@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import timedelta
+from datetime import time as dtime, timedelta
 
 import pytest
 
@@ -894,3 +894,29 @@ def test_hand_check_message_says_whether_an_entry_may_exist(tmp_path):
     assert h2.run() == 1 and not owns(h2)
     msg = " ".join(h2.last_issues())
     assert "left an entry (switch)" in msg and "set it to Xbox by hand" in msg
+
+
+def test_ta_read_after_reads_once_a_day_at_the_first_run_past_the_set_time(tmp_path):
+    # NOW is 12:00 UTC; the daily read is set for 12:30 UTC.
+    h = only_collection(tmp_path, GAMES, [row(1, "Alpha Quest")], ta_read_after=dtime(12, 30))
+    st = State(ta_collection={"fetched": (NOW - timedelta(hours=8)).isoformat(),  # 04:00 today
+                              "rows": [row(1, "Alpha Quest").__dict__]})
+    save_state(h.cfg.state, st)
+    assert h.run() == 0 and h.ta.collection_calls == 0  # 12:00: before today's read time
+    h.now = NOW + timedelta(minutes=37)  # 12:37: the first run past 12:30 reads, though the cache is 8.6 h old
+    assert h.run() == 0 and h.ta.collection_calls == 1
+    h.now = NOW + timedelta(hours=13)  # 01:00 tomorrow: still today's read
+    assert h.run() == 0 and h.ta.collection_calls == 1
+    h.now = NOW + timedelta(hours=24, minutes=29)  # 12:29 tomorrow
+    assert h.run() == 0 and h.ta.collection_calls == 1
+    h.now = NOW + timedelta(hours=24, minutes=37)  # 12:37 tomorrow
+    assert h.run() == 0 and h.ta.collection_calls == 2
+
+
+def test_ta_read_after_reads_a_cache_from_before_yesterdays_read_time(tmp_path):
+    # A cache read before yesterday's 12:30 (e.g. the job was down) is read again at once, before 12:30.
+    h = only_collection(tmp_path, GAMES, [row(1, "Alpha Quest")], ta_read_after=dtime(12, 30))
+    st = State(ta_collection={"fetched": (NOW - timedelta(hours=24)).isoformat(),  # yesterday 12:00
+                              "rows": [row(1, "Alpha Quest").__dict__]})
+    save_state(h.cfg.state, st)
+    assert h.run() == 0 and h.ta.collection_calls == 1

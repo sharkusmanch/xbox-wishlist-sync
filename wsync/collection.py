@@ -39,7 +39,7 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 
 from .deku import DekuError, DekuItem, DekuNetworkError, DekuPartialOwn, DekuRateLimited, OwnedEntry
 from .errors import TAError
@@ -253,7 +253,7 @@ def _ta_rows(run, ta, state, now: datetime, res: "StepResult") -> list[OwnedRow]
     when less than 10 minutes remain before the write deadline."""
     cached = state.ta_collection or {}
     fetched = _parse(cached.get("fetched")) if cached.get("fetched") else None
-    if fetched is not None and timedelta(0) <= now - fetched < TA_MAX_AGE:
+    if fetched is not None and _ta_fresh(fetched, now, run.cfg.ta_read_after):
         try:
             rows = [OwnedRow(**r) for r in cached["rows"]]
         except (KeyError, TypeError):
@@ -286,6 +286,20 @@ def _ta_rows(run, ta, state, now: datetime, res: "StepResult") -> list[OwnedRow]
     state.ta_collection = {"fetched": now.isoformat(), "rows": [asdict(r) for r in rows]}
     run.say(f"collection: read the TrueAchievements collection ({len(rows)} titles)")
     return rows
+
+
+def _ta_fresh(fetched: datetime, now: datetime, read_after: dtime | None) -> bool:
+    """Whether the cached TA collection is still this period's. With a daily read time (UTC) the
+    cache lasts until the first run past that time after it was read; without one, 24 h."""
+    if not timedelta(0) <= now - fetched:
+        return False  # a cache from the future: read again
+    if read_after is None:
+        return now - fetched < TA_MAX_AGE
+    now_utc = now.astimezone(timezone.utc)
+    boundary = now_utc.replace(hour=read_after.hour, minute=read_after.minute, second=0, microsecond=0)
+    if boundary > now_utc:
+        boundary -= timedelta(days=1)  # the most recent read time at or before now
+    return fetched >= boundary
 
 
 def _settle_visible(run, state, entries: list[OwnedEntry], now: datetime) -> None:

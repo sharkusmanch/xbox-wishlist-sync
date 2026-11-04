@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 
 import pytest
 
@@ -10,7 +10,7 @@ from wsync.deku import DekuError, DekuItem, OwnedDetail, OwnedEntry
 from wsync.errors import TAError
 from wsync.match import norm
 from wsync.plan import Entry
-from wsync.run import Config, Deps, config_from, run
+from wsync.run import Config, ConfigError, Deps, config_from, run
 from wsync.state import State, load_state, save_state
 from wsync.ta import AlreadyListed, AuthError as TAAuthError, IncompleteRead, TAGame
 
@@ -1005,3 +1005,13 @@ def test_config_collection_switches():
 def test_only_collection_needs_both_logins_but_no_feed():
     cfg = Config(lists=(), collection=True, flaresolverr_url="http://fs", report=False)
     assert cfg.missing() == ["DEKU_EMAIL", "DEKU_PASSWORD", "DEKU_WISHLIST_ID", "TA_GAMERTAG", "TA_PASSWORD"]
+
+
+def test_config_ta_read_after():
+    env = {"DEKU_EMAIL": "e", "TA_GAMERTAG": "g"}
+    assert config_from([], env).ta_read_after is None
+    assert config_from([], {**env, "WSYNC_TA_READ_AFTER": "12:30"}).ta_read_after == dtime(12, 30)
+    assert config_from([], {**env, "WSYNC_TA_READ_AFTER": " 7:05 "}).ta_read_after == dtime(7, 5)
+    for bad in ("12", "25:00", "12:60", "noon"):
+        with pytest.raises(ConfigError):
+            config_from([], {**env, "WSYNC_TA_READ_AFTER": bad})

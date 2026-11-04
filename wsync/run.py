@@ -33,7 +33,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, quote_plus
@@ -101,6 +101,9 @@ class Config:
     feed_max_age: timedelta = timedelta(hours=6)
     match_budget: float = 35 * 60.0  # seconds of lookups before the rest wait for the next run
     write_deadline: float = WRITE_DEADLINE  # seconds into the run after which no write starts
+    # WSYNC_TA_READ_AFTER (UTC): read the TA collection at the first run past this time each day
+    # (just after TA's own daily purchase import); unset = at most once every 24 h.
+    ta_read_after: dtime | None = None
 
     @property
     def state_dir(self) -> Path:
@@ -168,6 +171,13 @@ def config_from(argv: list[str], env) -> Config:
         max_age = timedelta(hours=float(hours)) if hours else timedelta(hours=6)
     except ValueError:
         raise ConfigError("WSYNC_FEED_MAX_AGE_HOURS must be a number") from None
+    read_after = (env.get("WSYNC_TA_READ_AFTER") or "").strip()
+    ta_read_after = None
+    if read_after:
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", read_after)
+        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            raise ConfigError("WSYNC_TA_READ_AFTER must be HH:MM (UTC)")
+        ta_read_after = dtime(int(m.group(1)), int(m.group(2)))
     return Config(
         feed=Path(env.get("WSYNC_FEED") or "/feed/wishlist.json"),
         state=Path(env.get("WSYNC_STATE") or "/state/state.json"),
@@ -188,6 +198,7 @@ def config_from(argv: list[str], env) -> Config:
         report=not a.no_report,
         accept_feed_count=accept,
         feed_max_age=max_age,
+        ta_read_after=ta_read_after,
     )
 
 

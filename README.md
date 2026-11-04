@@ -51,6 +51,7 @@ report.
 | `WSYNC_STATE` | State file (default `/state/state.json`). The Deku and TA session files (`deku-session`, `ta-session`, mode 600) live next to it. |
 | `WSYNC_OVERRIDES` | Manual match overrides, JSON (default `/config/overrides.json`) |
 | `WSYNC_FEED_MAX_AGE_HOURS` | Oldest feed accepted, by file mtime (default 6) |
+| `WSYNC_TA_READ_AFTER` | `HH:MM` (UTC): read the TA collection once a day, at the first run past this time (set it just after TA's daily purchase import). Unset: at most once every 24 h |
 | `WSYNC_ACCEPT_FEED_COUNT` | Shrink-guard recovery, see below (same as `--accept-feed-count`) |
 | `DEKU_EMAIL`, `DEKU_PASSWORD`, `DEKU_WISHLIST_ID` | Deku Deals account |
 | `TA_GAMERTAG`, `TA_PASSWORD`, `FLARESOLVERR_URL` | TrueAchievements account, and a FlareSolverr v3 `/v1` endpoint used only for Cloudflare clearances (see below) |
@@ -146,7 +147,7 @@ the wishlist step's work. It doesn't use the feed, so it also runs when the wish
 the feed or its overrides (an invalid `collection` overrides object stops only this step). Each
 run:
 
-1. reads the TrueAchievements Game Collection (at most once every 24 h; cached in state) and the
+1. reads the TrueAchievements Game Collection (once a day, at the first run past `WSYNC_TA_READ_AFTER`, or at most once every 24 h without it; cached in state) and the
    public Deku collection share page. A read that is not complete (rows ≠ the page's own total)
    means no adds that run and a failure; a failed TrueAchievements read is retried 6 h later (the
    runs in between repeat the same failure without a new read or ping). A fresh TrueAchievements
