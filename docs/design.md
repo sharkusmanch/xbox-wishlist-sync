@@ -139,8 +139,8 @@ doubles as that checklist.
   `d.success` is true or `d.errors` is empty.
 - **TA game ID:** a game page (`/game/<slug>`) carries it as `data-game="<id>"`.
 - **Reading the TA wishlist:** `https://www.trueachievements.com/gamer/<tag>/wishlist`, logged
-  in. Paging was not seen on any list (see `docs/ta-protocol.md`). If the page can't be read
-  completely in a run, that run makes **no TA writes** and sends an Apprise failure notice.
+  in, 25 rows a page since TA's 2026-11-06 redesign; every page is read and checked against the
+  list's Games + DLC counts (see `docs/ta-protocol.md`). If the list can't be read completely in a run, that run makes **no TA writes** and sends an Apprise failure notice.
 - Page fetches are slow when a clearance is needed. Keep TA page fetches to what changed: cache
   the productId → TA game ID mapping.
 

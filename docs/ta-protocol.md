@@ -64,21 +64,40 @@ fetch (with `GamerToken`, `HashKey`, ...) sent through it would put those values
 ## Wishlist (read)
 
 - `GET /gamer/<tag>/wishlist`, logged in. Also reached from `/wishlist.aspx` (redirects there).
-- The owner's view has `<h1 id="h1PageTitle" class="pagetitle">My Wish List</h1>`, then one
-  `<div class="ach-panel nc">` per entry, then `<div id="divButtons" class="buttons">` (Clear
-  wishlist, Remove played, Subscribe to all).
-- A **game row**: `<a href="https://www.trueachievements.com/game/<slug>/achievements">Title</a>`
-  and `<span class="remove"><a ... href="javascript:Postback('btnRemoveFromWishList', <game id>)">`.
+- The owner's view has `<h1 id="h1PageTitle" class="pagetitle">My Wish List</h1>`, then (since
+  TA's 2026-11-06 redesign, "Site Feature: New Release Calendar & Personal Wishlist Updates") a
+  filter bar, a top pagination block, one `<div class="ach-panel wl-item nc">` per entry, a bottom
+  pagination block, then `<div id="divButtons" class="buttons">` (Clear wishlist, Remove played).
+  Synthetic copies of the layout: `tests/fixtures/ta_wishlist_v2_p1.html` / `_p2.html`.
+- A **game row**: inside `<div class="wl-head">`,
+  `<a href="https://www.trueachievements.com/game/<slug>/achievements">Title</a>` and
+  `<span class="remove"><a ... href="javascript:Postback('btnRemoveFromWishList', <game id>)">`.
+  Below the head, `<details class="wl-listings">` lists the store products (`/products/<id>/...`)
+  with prices; the parser ignores them (it takes the row's first `/game/` link).
 - A **DLC row**: `<a href="/game/<game slug>/dlc/<dlc slug>">Game - DLC title</a>` and
   `Postback('btnRemoveDLCFromWishList', <dlc id>)`. The row has **no game id**, only the game's
   slug, so the client reads `data-game` from `/game/<game slug>` (cached per slug in `game_ids`).
-- **Paging:** none. A short own list and 90 rows (another gamer's public list) both came on one
-  page with no pagination links; rows are sorted by title. The client raises `IncompleteRead` if a
-  pagination block or `?page=N` link ever appears, rather than reading page 1 only.
-- **Count:** the page shows no total. Completeness checks instead: the heading is present and is
-  "My Wish List", the page reaches `</main>`, `divButtons` follows the rows, and every
-  `ach-panel` yields a link and a remove id, and the number of remove buttons on the whole page
-  (`btnRemove(DLC)FromWishList` postbacks) equals the rows read. Any miss is `IncompleteRead`.
+  Seen on the old layout only: the live list had no DLC when the new layout was checked. A DLC row
+  in some other markup fails the row / remove-button checks (`IncompleteRead`), never a short read.
+- **Filter bar:** `<div class="gr-wrap wl-wrap" data-show="" data-region="" data-sale="" data-gp="">`
+  plus a search box `<input type="search" name="q" value="">`. Filters are URL parameters
+  (`?show=games|dlc`, `?sale=1`, `?gp=<pass>`, `?q=`), not stored per gamer; `region` (a cookie or
+  `?region=`) changes prices only. The client raises `IncompleteRead` if `data-show`, `data-sale`,
+  `data-gp` or the search value is non-empty. The **Show** pills carry the whole list's counts:
+  `<a class="gr-pill" ...>Games <span class="n">12</span></a>` and `...>DLC <span class="n">0</span></a>`.
+- **Paging (since 2026-11-06):** 25 rows a page. Page 1 is `/gamer/<tag>/wishlist`, page N is
+  `?page=N`. Each block is `<ul class="pagination">` with `<li class="current"><a ...>N</a></li>`
+  and links to the other pages (`?page=N+1` when there is a next one). The client reads page 1,
+  then each next page while the current page links one (at most 40 pages). It raises
+  `IncompleteRead` if a page's current number isn't the one asked for, the Games + DLC total
+  differs between pages, the rows read don't add up to that total, or a paged page has no total.
+  Before the redesign the list was one page with no counts (a short own list and 90 rows of
+  another gamer's public list both came unpaged); that layout still parses as one page, but
+  paging without counts is `IncompleteRead`.
+- **Per-page checks:** the heading is present and is "My Wish List", the page reaches `</main>`,
+  `divButtons` follows the rows, every `ach-panel` yields a link and a remove id, and the number of
+  remove buttons on the whole page (`btnRemove(DLC)FromWishList` postbacks) equals the rows read.
+  Any miss is `IncompleteRead`.
 - Logged out, the same URL renders a public view: heading `<Tag>'s Wishlist`, body without `g-li`,
   and no remove buttons (so no ids). The client logs in once and re-reads.
 - An empty list was not observed (it would have meant clearing the real list). The client accepts a

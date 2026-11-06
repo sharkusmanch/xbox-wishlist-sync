@@ -23,6 +23,7 @@ from wsync.ta import (
     parse_game,
     parse_search,
     parse_wishlist,
+    parse_wishlist_page,
 )
 
 FIX = Path(__file__).parent / "fixtures"
@@ -42,6 +43,9 @@ def fixture(name):
 
 LOGIN = fixture("ta_login.html")
 WISHLIST = fixture("ta_wishlist.html")
+# The November 2026 layout: 25 rows a page, with Games / DLC counts in the filter bar.
+WISHLIST_P1 = fixture("ta_wishlist_v2_p1.html")
+WISHLIST_P2 = fixture("ta_wishlist_v2_p2.html")
 SEARCH = fixture("ta_search.html")
 SEARCH_V2 = fixture("ta_search_v2.html")
 GAME = fixture("ta_game_page.html")
@@ -543,6 +547,53 @@ def test_wishlist_incomplete_read_raises():
         c.wishlist()
 
 
+PAGED_ROUTES = {
+    ("GET", "=/gamer/Test+Gamer/wishlist"): resp(WISHLIST_P1),
+    ("GET", "=/gamer/Test+Gamer/wishlist?page=2"): resp(WISHLIST_P2),
+}
+PAGED_IDS = {"Alpha-Quest": 9001}
+
+
+def test_wishlist_reads_every_page():
+    c, http = logged_in(dict(PAGED_ROUTES), game_ids=PAGED_IDS)
+    got = c.wishlist()
+    assert list(got) == ["9001", "9002", "9003", "9001:7701", "9004"]
+    assert got["9002"] == Entry("9002", "Beta Tactics & Friends")
+    assert http.urls() == ["/gamer/Test+Gamer/wishlist", "/gamer/Test+Gamer/wishlist?page=2"]
+
+
+def test_wishlist_short_of_the_total_is_incomplete():
+    short = WISHLIST_P2.replace("Postback('btnRemoveFromWishList', 9004)", "")
+    start = short.index('<div class="ach-panel', short.index("Night-Market"))
+    short = short[:start] + short[short.index('<div class="pagination bottomlinks"'):]
+    routes = dict(PAGED_ROUTES); routes[("GET", "=/gamer/Test+Gamer/wishlist?page=2")] = resp(short)
+    c, _ = logged_in(routes, game_ids=PAGED_IDS)
+    with pytest.raises(IncompleteRead, match="4 of the 5"):
+        c.wishlist()
+
+
+def test_wishlist_total_changing_between_pages_is_incomplete():
+    routes = dict(PAGED_ROUTES)
+    routes[("GET", "=/gamer/Test+Gamer/wishlist?page=2")] = resp(WISHLIST_P2.replace('Games <span class="n">4</span>', 'Games <span class="n">5</span>'))
+    c, _ = logged_in(routes, game_ids=PAGED_IDS)
+    with pytest.raises(IncompleteRead, match="changed"):
+        c.wishlist()
+
+
+def test_wishlist_served_the_wrong_page_is_incomplete():
+    routes = dict(PAGED_ROUTES); routes[("GET", "=/gamer/Test+Gamer/wishlist?page=2")] = resp(WISHLIST_P1)
+    c, _ = logged_in(routes, game_ids=PAGED_IDS)
+    with pytest.raises(IncompleteRead, match="page 2"):
+        c.wishlist()
+
+
+def test_wishlist_stops_at_the_page_cap(monkeypatch):
+    monkeypatch.setattr(ta, "MAX_WISHLIST_PAGES", 1)
+    c, _ = logged_in(dict(PAGED_ROUTES), game_ids=PAGED_IDS)
+    with pytest.raises(IncompleteRead, match="more than 1"):
+        c.wishlist()
+
+
 def test_wishlist_still_public_after_relogin_is_auth_error():
     routes = login_routes()
     routes[("GET", "/gamer/Test+Gamer/wishlist")] = resp(PUBLIC_WISHLIST)
@@ -597,10 +648,52 @@ def test_parse_wishlist_truncated_page_is_incomplete():
         parse_wishlist(cut)
 
 
-def test_parse_wishlist_paged_page_is_incomplete():
-    paged = WISHLIST.replace('<div id="divButtons"', '<ul class="pagination"><li><a href="?page=2">2</a></li></ul><div id="divButtons"')
+def test_parse_wishlist_paged_page_without_a_total_is_incomplete():
+    # The old layout had no counts: paging there can't be checked for completeness.
+    paged = WISHLIST.replace('<div id="divButtons"', '<ul class="pagination"><li class="current"><a href="/x">1</a></li><li><a href="?page=2">2</a></li></ul><div id="divButtons"')
     with pytest.raises(IncompleteRead):
         parse_wishlist(paged)
+
+
+def test_parse_wishlist_page_link_without_a_current_page_is_incomplete():
+    paged = WISHLIST_P1.replace('<li class="current">', '<li class="c-x">')
+    with pytest.raises(IncompleteRead):
+        parse_wishlist_page(paged)
+
+
+def test_parse_wishlist_page_reads_the_page_number_next_link_and_total():
+    first = parse_wishlist_page(WISHLIST_P1)
+    assert (first.number, first.has_next, first.total) == (1, True, 5)
+    assert [(r.kind, r.id, r.title, r.game_slug) for r in first.rows] == [
+        ("game", 9001, "Alpha Quest", "Alpha-Quest"),
+        ("game", 9002, "Beta Tactics & Friends", "Beta-Tactics"),
+        ("game", 9003, "Gamma Drift", "Gamma-Drift"),
+    ]
+    last = parse_wishlist_page(WISHLIST_P2)
+    assert (last.number, last.has_next, last.total) == (2, False, 5)
+    assert [(r.kind, r.id, r.game_slug) for r in last.rows] == [("dlc", 7701, "Alpha-Quest"), ("game", 9004, "Delta-Ruins")]
+
+
+def test_parse_wishlist_page_old_layout_is_one_page_without_a_total():
+    page = parse_wishlist_page(WISHLIST)
+    assert (page.number, page.has_next, page.total, len(page.rows)) == (1, False, None, 4)
+
+
+@pytest.mark.parametrize("change", [
+    ('data-show=""', 'data-show="games"'),
+    ('data-sale=""', 'data-sale="1"'),
+    ('data-gp=""', 'data-gp="pc-game-pass"'),
+    ('name="q" value=""', 'name="q" value="alpha"'),
+])
+def test_parse_wishlist_page_filtered_view_is_incomplete(change):
+    with pytest.raises(IncompleteRead, match="filtered"):
+        parse_wishlist_page(WISHLIST_P1.replace(*change))
+
+
+def test_parse_wishlist_page_new_layout_without_counts_is_incomplete():
+    no_dlc_count = WISHLIST_P1.replace('DLC <span class="n">1</span>', 'DLC')
+    with pytest.raises(IncompleteRead, match="count"):
+        parse_wishlist_page(no_dlc_count)
 
 
 def test_parse_wishlist_renamed_panel_class_is_incomplete_not_empty():
