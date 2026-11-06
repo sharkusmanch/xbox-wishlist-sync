@@ -10,8 +10,10 @@ Protocol notes (verified live, 2026-11-01) are in docs/ta-protocol.md. In short:
     request that meets a Cloudflare challenge refreshes the clearance once, then fails;
   - logging in = GET /login, then POST its `#frm` fields with the gamertag and password;
     success means a `GamerToken` cookie;
-  - the wishlist is one unpaged page, `/gamer/<tag>/wishlist`; a DLC row names only the DLC id
-    and its game's slug, so the game id comes from the game page (cached in `game_ids`);
+  - the wishlist is `/gamer/<tag>/wishlist` (25 rows a page since 2026-11-06, `?page=N`); every
+    page is read and the rows must add up to the filter bar's Games + DLC counts. A DLC row names
+    only the DLC id and its game's slug, so the game id comes from the game page (cached in
+    `game_ids`);
   - writes are JSON AJAX calls with the session cookies.
 
 Credentials stay in memory and in the session file (outside the repo, mode 600): they are never
@@ -40,6 +42,7 @@ from wsync.ta_coll import OwnedRow, list_filters, list_url, parse_list, unknown_
 BASE = "https://www.trueachievements.com"
 AJAX = BASE + "/ajaxfunctions.aspx/"
 HTTP_TIMEOUT = 60
+MAX_WISHLIST_PAGES = 40  # 25 rows each; more is a page that keeps linking onwards, not a wishlist
 MAX_COLLECTION = 20_000  # titles; a bigger claimed total is a misread page, not a collection
 CLEARANCE_URL = BASE + "/"  # the public page FlareSolverr fetches, anonymously, for a clearance
 MAX_REDIRECTS = 5
@@ -79,6 +82,20 @@ class WishRow:
     id: int  # the game id, or the DLC id for a DLC row
     title: str
     game_slug: str
+
+
+@dataclass(frozen=True)
+class WishPage:
+    """One wishlist page: its rows, its number, whether it links the next page, and the list's total.
+
+    `total` is the filter bar's Games + DLC count for the whole list; None on the old, unpaged
+    layout, which had no counts.
+    """
+
+    rows: list[WishRow]
+    number: int
+    has_next: bool
+    total: int | None
 
 
 @dataclass(frozen=True)
@@ -214,10 +231,40 @@ _ROW_LINK = re.compile(
 _ROW_REMOVE = re.compile(r"Postback\('btnRemove(DLC)?FromWishList',\s*(\d+)\)")
 
 
-def parse_wishlist(page: str) -> list[WishRow]:
-    """Rows of the logged-in gamer's own wishlist page, in page order.
+_PAGINATION = re.compile(r'<ul class="pagination">(.*?)</ul>', re.S)
+_CURRENT_PAGE = re.compile(r'<li class="current"><a [^>]*>\s*(\d+)\s*</a>')
+_WL_WRAP = re.compile(r'<div class="[^"]*\bwl-wrap\b[^"]*"([^>]*)>')
+_WL_FILTERS = ("data-show", "data-sale", "data-gp")
+_WL_SEARCH = re.compile(r'<input type="search" name="q" value="([^"]*)"')
 
-    Raises IncompleteRead unless every row on the page parsed and the page is whole and unpaged.
+
+def _wishlist_count(body: str, label: str) -> int:
+    m = re.findall(r'<a class="gr-pill"[^>]*>\s*' + label + r'\s*<span class="n">([\d,]+)</span>', body)
+    if len(m) != 1:
+        raise IncompleteRead(f"wishlist page has no single {label} count (layout changed?)")
+    return int(m[0].replace(",", ""))
+
+
+def _wishlist_paging(body: str) -> tuple[int, bool]:
+    """(this page's number, whether it links the next page); (1, False) when unpaged."""
+    blocks = _PAGINATION.findall(body)
+    if not blocks:
+        if re.search(r"[?&](?:amp;)?page=\d", body):
+            raise IncompleteRead("wishlist page links other pages but has no pagination block")
+        return 1, False
+    current = {int(n) for b in blocks for n in _CURRENT_PAGE.findall(b)}
+    if len(current) != 1:
+        raise IncompleteRead("wishlist page's pagination names no single current page")
+    number = current.pop()
+    nxt = re.compile(r'href="[^"]*[?&](?:amp;)?page=%d"' % (number + 1))
+    return number, any(nxt.search(b) for b in blocks)
+
+
+def parse_wishlist_page(page: str) -> WishPage:
+    """One page of the logged-in gamer's own wishlist: its rows in page order, and its paging.
+
+    Raises IncompleteRead unless every row on the page parsed, the page is whole and unfiltered,
+    and (when it is paged) the list's total is readable.
     """
     head = re.search(r'<h1 id="h1PageTitle"[^>]*>(.*?)</h1>', page, re.S)
     if not head:
@@ -228,8 +275,17 @@ def parse_wishlist(page: str) -> list[WishRow]:
     if end < 0:
         raise IncompleteRead("wishlist page is truncated")
     body = page[head.end():end]
-    if re.search(r'class="[^"]*\bpagination\b', body) or re.search(r'[?&]page=\d', body):
-        raise IncompleteRead("wishlist page is paged; paging is not supported")
+    total = None
+    wrap = _WL_WRAP.search(body)
+    if wrap:  # the November 2026 layout: a filter bar with Games / DLC counts
+        attrs = dict(re.findall(r'\s([\w-]+)="([^"]*)"', wrap.group(1)))
+        search = _WL_SEARCH.search(body)
+        if any(attrs.get(a) for a in _WL_FILTERS) or (search and search.group(1).strip()):
+            raise IncompleteRead("wishlist page is filtered (search, show, sale or Game Pass)")
+        total = _wishlist_count(body, "Games") + _wishlist_count(body, "DLC")
+    number, has_next = _wishlist_paging(body)
+    if total is None and (number != 1 or has_next):
+        raise IncompleteRead("wishlist page is paged but shows no total to check the pages against")
     panels = body.split('<div class="ach-panel')[1:]
     if panels and 'id="divButtons"' not in body:
         raise IncompleteRead("wishlist page ends before its buttons (truncated)")
@@ -249,7 +305,12 @@ def parse_wishlist(page: str) -> list[WishRow]:
     buttons = len(_ROW_REMOVE.findall(page))
     if buttons != len(rows):
         raise IncompleteRead(f"read {len(rows)} wishlist rows but the page has {buttons} remove buttons")
-    return rows
+    return WishPage(rows, number, has_next, total)
+
+
+def parse_wishlist(page: str) -> list[WishRow]:
+    """The rows of one wishlist page (see parse_wishlist_page)."""
+    return parse_wishlist_page(page).rows
 
 
 def page_title(page: str) -> str:
@@ -579,14 +640,39 @@ class TAClient:
 
     def wishlist(self) -> dict[str, Entry]:
         """The logged-in gamer's wishlist, keyed by `"<game id>"` or `"<game id>:<dlc id>"`."""
-        p = self._get(BASE + self._gamer + "/wishlist", need_login=True)
+        rows = self._wishlist_rows()
         out: dict[str, Entry] = {}
-        for row in parse_wishlist(p.html):
+        for row in rows:
             key = str(row.id) if row.kind == "game" else f"{self._game_id(row.game_slug)}:{row.id}"
             if key in out:
                 raise IncompleteRead(f"wishlist lists {key} twice")
             out[key] = Entry(key, row.title)
         return out
+
+    def _wishlist_rows(self) -> list[WishRow]:
+        """Every wishlist page's rows. The rows must add up to the list's total, and the total
+        must hold on every page, so a list changing mid-read is never mistaken for the whole list."""
+        base = BASE + self._gamer + "/wishlist"
+        rows: list[WishRow] = []
+        total: int | None = None
+        number = 1
+        while True:
+            page = parse_wishlist_page(self._get(base + (f"?page={number}" if number > 1 else ""), need_login=True).html)
+            if page.number != number:
+                raise IncompleteRead(f"asked for wishlist page {number}, got page {page.number}")
+            if number == 1:
+                total = page.total
+            elif page.total != total:
+                raise IncompleteRead(f"wishlist total changed from {total} to {page.total} between pages")
+            rows += page.rows
+            if not page.has_next:
+                break
+            if number >= MAX_WISHLIST_PAGES:
+                raise IncompleteRead(f"wishlist has more than {MAX_WISHLIST_PAGES} pages")
+            number += 1
+        if total is not None and len(rows) != total:
+            raise IncompleteRead(f"read {len(rows)} of the {total} wishlist entries")
+        return rows
 
     def collection(self) -> list[OwnedRow]:
         """The logged-in gamer's whole Game Collection (every ownership status, all platforms).
