@@ -39,7 +39,7 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 
 from .deku import DekuError, DekuItem, DekuNetworkError, DekuPartialOwn, DekuRateLimited, OwnedEntry
 from .errors import TAError
@@ -56,6 +56,8 @@ TARGET = {"xbox-series-x-s": "xbox_series", "xbox-one": "xbox_one"}
 X360 = "xbox-360"
 OWNED_360 = frozenset({"Owned", "Games with Gold"})
 _ORDER = {"xbox-series-x-s": 0, "xbox-one": 1, X360: 2}  # one game's representative and the lookup order
+XBOX_ONE_LAUNCH = date(2013, 11, 22)  # a Deku Xbox listing dated before this can't be an Xbox One port
+DATE_WINDOW = timedelta(days=31)
 _XBOX = frozenset(TARGET.values())
 _OTHER = {"xbox_series": "xbox_one", "xbox_one": "xbox_series"}
 COOLDOWN = timedelta(days=7)
@@ -75,10 +77,24 @@ UNSETTLED = frozenset({ADDING, PARTIAL})
 def choose_platform(ta_platform: str, offered) -> str | None:
     """The Deku platform for a new entry: TA's, when the Deku item lists it, else the other Xbox
     platform the item lists; None when the item lists no Xbox platform."""
+    if ta_platform == X360:  # Deku lists backward compatible 360 games as Xbox One items
+        return "xbox_one" if "xbox_one" in offered else "xbox_series" if "xbox_series" in offered else None
     want = TARGET[ta_platform]
     if want in offered:
         return want
     return _OTHER[want] if _OTHER[want] in offered else None
+
+
+def confirms_360(ta_released: str | None, deku_released: str | None) -> bool:
+    """The Deku item is the Xbox 360 game: both release dates fall before the Xbox One launch (no later port
+    or remaster can), or they are within DATE_WINDOW of each other. False when either date is unknown."""
+    try:
+        ta, deku = date.fromisoformat(ta_released), date.fromisoformat(deku_released)
+    except (TypeError, ValueError):
+        return False
+    if ta < XBOX_ONE_LAUNCH and deku < XBOX_ONE_LAUNCH:
+        return True
+    return abs(ta - deku) <= DATE_WINDOW
 
 
 def match_title(row: OwnedRow) -> str:
@@ -356,14 +372,14 @@ class _Step:
         self.override: str | None = None  # the override slug of the lookup under way
         self.dups: dict[str, list[OwnedRow]] = {}
         for r in plan.duplicates:
-            self.dups.setdefault(base_title(r.title), []).append(r)
+            self.dups.setdefault(base_title(match_title(r)), []).append(r)
 
     def _item(self, slug: str) -> DekuItem:
         self.run.sleep(PACE)
         return self.deku.item(slug)
 
     def _group(self, row: OwnedRow) -> list[OwnedRow]:
-        return [row, *self.dups.get(base_title(row.title), [])]
+        return [row, *self.dups.get(base_title(match_title(row)), [])]
 
     def _record(self, row: OwnedRow, status: str, slug: str | None, reason: str = "", **extra) -> None:
         entry = {"status": status, "slug": slug, "checked": self.now.isoformat(), "title": row.title, **extra}
@@ -374,7 +390,7 @@ class _Step:
         for r in self._group(row):
             self.state.collection[str(r.ta_id)] = dict(entry)
         self.res.outcomes[status] = self.res.outcomes.get(status, 0) + 1
-        platform = extra.get("platform") or TARGET[row.platform]
+        platform = extra.get("platform") or TARGET.get(row.platform, row.platform)
         text = {MATCHED: "already in the collection", ADDED: "added", FOUND: "would add (dry run)",
                 NONE: "no match"}[status]
         self.run.say(f"collection: {row.title} [{platform}] -> {text}"
@@ -397,21 +413,22 @@ class _Step:
         it = None
         if slug:
             it = self._item(slug)
-            if how == "cached" and pick(row.title, [(it.title, it.slug)]).status != "matched":
+            if how == "cached" and pick(match_title(row), [(it.title, it.slug)]).status != "matched":
                 self.run.say(f"collection: cached match for {row.title} ({slug}) no longer matches; searching again")
                 it = None
         if it is None:
-            results = self.deku.search(_query(row.title))
-            bare = strip_edition_noise(row.title)
-            if not _has_exact(row.title, results) and norm(bare) != norm(row.title):
+            title = match_title(row)
+            results = self.deku.search(_query(title))
+            bare = strip_edition_noise(title)
+            if not _has_exact(title, results) and norm(bare) != norm(title):
                 seen = {s for _, s in results}
                 results += [(t, s) for t, s in self.deku.search(_query(bare)) if s not in seen]
-            m = pick(row.title, results)
+            m = pick(title, results)
             if m.status != "matched":
                 why = (f"{len(m.candidates)} candidates, none confident" if m.candidates else "not found")
                 return self._record(row, NONE, None, why)
             it = self._item(m.target)
-            if pick(row.title, [(it.title, it.slug)]).status != "matched":
+            if pick(title, [(it.title, it.slug)]).status != "matched":
                 return self._record(row, NONE, None, f"item page title {it.title!r} differs")
         if it.slug in self.state.collection_unconfirmed:
             # An earlier add on this very item is unconfirmed (whatever row, override or redirect led
@@ -420,10 +437,13 @@ class _Step:
         target = choose_platform(row.platform, it.offered)
         if target is None:
             return self._record(row, NONE, None, f"{it.slug} is not listed for any Xbox platform")
+        if row.platform == X360 and not confirms_360(row.released, it.released):
+            return self._record(row, NONE, None, f"Deku's Xbox release {it.released or 'unknown'} doesn't match "
+                                                 f"the Xbox 360 game ({row.released})")
         if any(o.platform is None or o.platform in _XBOX for o in it.owned):
             return self._record(row, MATCHED, it.slug)
         fmt = deku_format(row.media)
-        if self.dry:
+        if self.dry or (row.platform == X360 and self.run.collection_360_dry):
             return self._record(row, FOUND, it.slug, format=fmt, platform=target)
         if self.run.past_deadline():
             raise _Stop("write deadline")
@@ -517,14 +537,16 @@ def run_collection_step(run, deku, ta, state, overrides: dict[int, dict], now: d
         run.issue(f"Deku Deals collection read failed, no Deku collection adds this run: {_err(e)}")
         return res
     _settle_visible(run, state, entries, now)
-    plan = plan_collection(rows, entries, overrides, state.collection, now, dry_run=dry)
+    plan = plan_collection(rows, entries, overrides, state.collection, now, dry_run=dry,
+                           dry_360=run.collection_360_dry)
     res.plan = plan
     owned = sum(r.ownership == "Owned" for r in rows)
-    run.say(f"collection: {'DRY RUN' if dry else 'APPLY'}; TrueAchievements {len(rows)} titles, {owned} owned; "
+    mode = "DRY RUN" if dry else "APPLY, Xbox 360 games DRY RUN" if run.collection_360_dry else "APPLY"
+    run.say(f"collection: {mode}; TrueAchievements {len(rows)} titles, {owned} owned; "
             f"Deku collection {len(entries)} entries; already {len(plan.already)}, skipped platform "
             f"{len(plan.skipped_platform)}, skipped by override {len(plan.skipped_override)}, cooling "
-            f"{len(plan.cooling)}, duplicates {len(plan.duplicates)}, lookups {len(plan.lookups)}, "
-            f"backlog {plan.backlog}")
+            f"{len(plan.cooling)}, duplicates {len(plan.duplicates)}, Xbox 360 games without a release date "
+            f"{len(plan.waiting_date)}, lookups {len(plan.lookups)}, backlog {plan.backlog}")
 
     step = _Step(run, paced, state, plan, now, dry, res)
     for n, row in enumerate(plan.lookups):

@@ -920,3 +920,70 @@ def test_ta_read_after_reads_a_cache_from_before_yesterdays_read_time(tmp_path):
                               "rows": [row(1, "Alpha Quest").__dict__]})
     save_state(h.cfg.state, st)
     assert h.run() == 0 and h.ta.collection_calls == 1
+
+
+# --------------------------------------------------------------------------- Xbox 360 games
+
+
+from wsync import collection as coll  # noqa: E402
+
+GAMES_360 = {
+    "example-shooter-ii": ("Example Shooter II", {"xbox_one"}, "2012-02-21"),
+    "old-racer": ("Old Racer", {"xbox_one"}, "2016-09-13"),  # a later remaster of a 2006 game
+    "one-game": ("One Game", {"xbox_one"}, None),
+}
+
+
+def x360(ta_id, title, released, media="Disc", ownership="Owned"):
+    return OwnedRow(ta_id, title, X360, ownership, media, released)
+
+
+@pytest.mark.parametrize("ta, deku, ok", [
+    ("2012-02-07", "2012-02-21", True), ("2008-05-01", "2011-06-01", True),  # both before the launch
+    ("2006-08-08", "2016-09-13", False),  # a later remaster
+    ("2014-03-11", "2014-03-12", True), ("2014-03-11", "2016-05-01", False),
+    (None, "2012-01-01", False), ("2012-01-01", None, False)])
+def test_confirms_360(ta, deku, ok):
+    assert coll.confirms_360(ta, deku) is ok
+
+
+def test_choose_platform_for_a_360_game_prefers_xbox_one():
+    assert coll.choose_platform(X360, {"xbox_one", "xbox_series"}) == "xbox_one"
+    assert coll.choose_platform(X360, {"xbox_series"}) == "xbox_series"
+    assert coll.choose_platform(X360, {"switch"}) is None
+
+
+def test_a_confirmed_360_game_is_added_as_xbox_one(tmp_path):
+    h = live(tmp_path, GAMES_360, [x360(42, "Example Shooter II (Xbox 360)", "2012-02-07")],
+             collection_360_dry_run=False)
+    assert h.run() == 0
+    assert owns(h) == [("own", "example-shooter-ii", "physical", "xbox_one")]
+
+
+def test_a_360_game_whose_deku_release_is_later_is_unmatched(tmp_path):
+    h = live(tmp_path, GAMES_360, [x360(42, "Old Racer", "2006-08-08")], collection_360_dry_run=False)
+    assert h.run() == 0
+    entry = cache(h)["42"]
+    assert owns(h) == [] and entry["status"] == "none" and "doesn't match" in entry["reason"]
+
+
+def test_the_360_dry_run_lists_360_games_while_xbox_one_games_are_added(tmp_path):
+    h = live(tmp_path, GAMES_360, [x360(42, "Example Shooter II", "2012-02-07"), row(7, "One Game", ONE)])
+    assert h.run() == 0  # COLLECTION_360_DRY_RUN is on by default
+    assert cache(h)["42"]["status"] == "found" and [w[1] for w in owns(h)] == ["one-game"]
+
+
+def test_a_360_duplicate_shares_its_xbox_one_games_entry(tmp_path):
+    rows = [row(7, "One Game", ONE), x360(8, "One Game (Xbox 360)", "2010-01-01")]
+    h = live(tmp_path, GAMES_360, rows, collection_360_dry_run=False)
+    assert h.run() == 0
+    assert owns(h) == [("own", "one-game", "digital", "xbox_one")]
+    assert cache(h)["8"]["status"] == cache(h)["7"]["status"] == "added"
+
+
+def test_the_step_log_says_360_games_are_dry_and_counts_undated_ones(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    h = live(tmp_path, GAMES_360, [x360(42, "Example Shooter II", None), row(7, "One Game", ONE)])
+    assert h.run() == 0
+    assert "collection: APPLY, Xbox 360 games DRY RUN;" in caplog.text
+    assert "Xbox 360 games without a release date 1," in caplog.text
