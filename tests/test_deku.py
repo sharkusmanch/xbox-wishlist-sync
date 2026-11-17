@@ -1072,3 +1072,24 @@ def test_disown_with_several_entries_needs_the_id():
     with pytest.raises(DekuError, match="no such owned entry"):
         c.disown(item, NEW_OWNED)
     assert all(m == "GET" for m, *_ in fake.requests)
+
+
+# ---------------------------------------------------------------- release dates
+
+
+def test_parse_release_takes_the_xbox_date_from_a_per_platform_list():
+    assert deku.parse_release(fixture("deku_item_bc360.html")) == "2012-02-21"  # not Steam's 2012-02-09
+
+
+def test_parse_release_reads_a_single_date():
+    assert deku.parse_release("<li><strong>Release date:</strong> March 3, 2008</li>") == "2008-03-03"
+    assert deku.parse_release("<li><strong>Release date:</strong> Mar 3, 2008</li>") == "2008-03-03"
+
+
+def test_parse_release_is_none_for_tba_or_no_block():
+    assert deku.parse_release("<li><strong>Release date:</strong> TBA</li>") is None
+    assert deku.parse_release("<html></html>") is None
+
+
+def test_parse_item_fills_released():
+    assert deku.parse_item("example-shooter-ii", fixture("deku_item_bc360.html")).released == "2012-02-21"
