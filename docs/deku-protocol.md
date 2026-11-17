@@ -29,6 +29,10 @@ public wishlist was the same set of slugs before and after.
   the final URL, which is the one the share page lists.
   - `Platforms:` list item names the platforms the game exists on (`Xbox Series X|S`, `Xbox One`,
     ...). This is the only platform information for a game that is not on the wishlist.
+  - `<strong>Release date:</strong>` is followed by one date (`February 21, 2012`, every platform)
+    or a `<ul>` of `<li><strong>Platforms</strong><br>date</li>` items. A backward compatible Xbox
+    360 game shows its original 360 date for Xbox One. The collection step takes the earliest date
+    whose platforms name Xbox; "TBA" and other text read as no date.
   - The item UUID is in the form actions `/items/<uuid>/watch`.
   - A game on the wishlist has `form.watch-details-form` with `action='/items/<uuid>/watch'`.
     A game that is not has none (only the `to=true` button form). A game in the collection has a

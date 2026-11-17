@@ -139,8 +139,10 @@ FlareSolverr).
   `txtGamerID` and `oGameCollection_Order`.
 - Overrides: drop `chkExcludeNotOwned`; `oGameCollection_ItemsPerPage=100` (TA caps a page at 100),
   `oGameCollection_Page=<n>`, `oGameCollection_ShowAll=False`; `chkColPlatform`,
-  `chkColOwnershipstatus` and `chkColMedia` switch the three columns the sync needs on, on top of
-  the gamer's saved columns.
+  `chkColOwnershipstatus`, `chkColMedia` and `chkColReleasedate` switch the four columns the sync
+  needs on, on top of the gamer's saved columns. The release date column is headed `Released`, in
+  `dd Mon yy` form (`07 Feb 12`); a blank or unparseable date is read as none (added 2026-11-17 for
+  Xbox 360 games in the Deku collection step).
 - The fragment is a pagination block, then `<table class="maintable">`: a header row of `<th>`
   (`Title`, `Platform`, `Ownership`, `Media`, ...; the client reads cells by header name), one
   `<tr class="odd|even">` per title, and a footer `<tr class="total">` whose first cell reads

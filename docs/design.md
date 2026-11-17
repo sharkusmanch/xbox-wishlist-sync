@@ -46,6 +46,8 @@ automatically.
   managed. New entries take the account defaults; existing ones keep whatever the owner set.
 - The Steam wishlist, the Deku/TA *collections* (owned games) and the Switch/PS platforms are
   out of scope. Only the Xbox Series X|S and Xbox One platform boxes of a Deku entry are managed.
+  (The later, add-only Deku collection step, including its Xbox 360 games, is described in the
+  README.)
 - No UI. Reporting is through Vikunja and Apprise only.
 
 ## Anti-goals (failure even if it "works")
