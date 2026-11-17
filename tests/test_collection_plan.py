@@ -315,3 +315,11 @@ def test_found_360_rows_cool_during_the_360_dry_run():
     cache = {"1": {"status": "found", "slug": "old-shooter", "checked": ago(1)}}
     assert plan_collection([r], [], {}, cache, NOW, 25, dry_360=True).cooling == [r]
     assert plan_collection([r], [], {}, cache, NOW, 25).lookups == [r]  # live: a found game is added
+
+
+def test_an_undated_360_row_with_a_deku_override_is_looked_up():
+    r = x360(1, "Undated Oldie", released=None)
+    p = plan([r], overrides={1: {"deku": "undated-oldie"}})
+    assert p.lookups == [r] and not p.waiting_date and p.slugs == {1: "undated-oldie"}
+    p = plan([r], overrides={1: {"deku": "skip"}})
+    assert p.skipped_override == [r] and not p.waiting_date

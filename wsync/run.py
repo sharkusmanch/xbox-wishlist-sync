@@ -244,6 +244,9 @@ class NullReporter:
     def collection_review(self, body, *, dry_run) -> bool:
         return False
 
+    def collection_360_review(self, body) -> bool:
+        return False
+
     def notify(self, title, body) -> None:
         pass
 
@@ -261,6 +264,9 @@ class LiveReporter:
 
     def collection_review(self, body, *, dry_run) -> bool:
         return report.collection_review_task(self._vk, body, dry_run=dry_run)
+
+    def collection_360_review(self, body) -> bool:
+        return report.collection_360_review_task(self._vk, body)
 
     def notify(self, title, body) -> None:
         report.notify(self._apprise, title, body)

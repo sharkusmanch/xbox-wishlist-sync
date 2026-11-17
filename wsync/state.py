@@ -36,6 +36,8 @@ class State:
     # digest of the dry-run collection review's lists (would add, unmatched, check by hand): the
     # "plan ready" ping goes out only when it changes
     collection_review: str | None = None
+    # the same digest for the Xbox 360 review (COLLECTION_360_DRY_RUN): would add and unmatched 360 games
+    collection_360_review: str | None = None
 
 
 def load_state(path: Path) -> State:
@@ -56,6 +58,7 @@ def load_state(path: Path) -> State:
         collection=data.get("collection") or {},
         collection_unconfirmed=data.get("collection_unconfirmed") or {},
         collection_review=data.get("collection_review"),
+        collection_360_review=data.get("collection_360_review"),
     )
 
 

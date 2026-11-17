@@ -58,3 +58,12 @@ def test_collection_unconfirmed_roundtrips_and_old_files_load(tmp_path):
     assert load_state(path) == state
     path.write_text(json.dumps({"mapping": {}, "collection": {"1": {"status": "partial", "slug": "halo"}}}))
     assert load_state(path).collection_unconfirmed == {} and load_state(path).collection_review is None
+
+
+def test_state_round_trips_the_360_review_signature(tmp_path):
+    path = tmp_path / "state.json"
+    state = State(collection_360_review="def456")
+    save_state(path, state)
+    assert load_state(path) == state
+    path.write_text(json.dumps({"mapping": {}, "collection_review": "abc"}))
+    assert load_state(path).collection_360_review is None

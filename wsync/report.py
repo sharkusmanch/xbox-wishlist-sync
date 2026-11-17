@@ -40,8 +40,10 @@ MAX_PAGES = 100
 PLAN_REVIEW_KEY = "plan-review:dry-run"
 COLLECTION_REVIEW_KEY = "collection-review:dry-run"
 COLLECTION_REVIEW_TITLE = "Review the Deku collection plan"
+COLLECTION_360_REVIEW_KEY = "collection-360-review"
+COLLECTION_360_REVIEW_TITLE = "Review the Xbox 360 collection plan"
 # Tasks that aren't problem tasks: the problem sync never closes them.
-_REVIEW_KEYS = frozenset({PLAN_REVIEW_KEY, COLLECTION_REVIEW_KEY})
+_REVIEW_KEYS = frozenset({PLAN_REVIEW_KEY, COLLECTION_REVIEW_KEY, COLLECTION_360_REVIEW_KEY})
 _MARKER = re.compile(r"^wsync-key:\s*(\S+)\s*$", re.MULTILINE)
 _HINT = ("add an override in the xbox-wishlist-sync overrides ConfigMap (overrides.json): "
          "`\"{pid}\": {{\"{field}\": \"<slug>\"}}`, or `\"skip\"` as the value to stop mirroring it there")
@@ -373,6 +375,19 @@ def collection_review_task(vk: Vikunja, body: str | None, *, dry_run: bool = Tru
         return False
     changed = vk.upsert(COLLECTION_REVIEW_KEY, COLLECTION_REVIEW_TITLE, body or "")
     vk.close_duplicates(COLLECTION_REVIEW_KEY)
+    return changed
+
+
+def collection_360_review_task(vk: Vikunja, body: str | None) -> bool:
+    """Keep the Xbox 360 dry run's review task current, or close it (None: 360 games are live).
+
+    True only when the task's text changed.
+    """
+    if body is None:
+        vk.close(COLLECTION_360_REVIEW_KEY)
+        return False
+    changed = vk.upsert(COLLECTION_360_REVIEW_KEY, COLLECTION_360_REVIEW_TITLE, body)
+    vk.close_duplicates(COLLECTION_360_REVIEW_KEY)
     return changed
 
 

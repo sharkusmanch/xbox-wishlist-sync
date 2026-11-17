@@ -199,6 +199,8 @@ class FakeReporter:
         self.notes = []
         self.collection_reviews = []  # (body, dry_run)
         self._collection_body = None
+        self.collection_360_reviews = []  # the task text, or None when closed
+        self._collection_360_body = None
 
     def sync_problems(self, problems, keep_kinds, keep_keys=frozenset()):
         self.problem_syncs.append((list(problems), set(keep_kinds)))
@@ -215,6 +217,12 @@ class FakeReporter:
             return False
         changed = body != self._collection_body
         self._collection_body = body
+        return changed
+
+    def collection_360_review(self, body):
+        self.collection_360_reviews.append(body)
+        changed = body is not None and body != self._collection_360_body
+        self._collection_360_body = body
         return changed
 
     def notify(self, title, body):
