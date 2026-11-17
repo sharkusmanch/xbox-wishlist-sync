@@ -43,7 +43,8 @@ def test_other_platforms_are_skipped():
     rows = [row(1, "A", "xbox-360"), row(2, "B", "windows"), row(3, "C", "nintendo-switch"),
             row(4, "D", "ios"), row(5, "E", "android"), row(6, "F", "xbox-one")]
     p = plan(rows)
-    assert [r.ta_id for r in p.skipped_platform] == [1, 2, 3, 4, 5]
+    assert [r.ta_id for r in p.skipped_platform] == [2, 3, 4, 5]
+    assert [r.ta_id for r in p.waiting_date] == [1]  # an Xbox 360 row without a TA release date waits
     assert [r.ta_id for r in p.lookups] == [6]
 
 
@@ -273,3 +274,44 @@ def test_unsettled_guard_comes_from_any_row_and_an_override_slug_goes_to_the_ste
         assert not p.unsettled and p.slugs == {1: slug} and [r.ta_id for r in p.lookups] == [1]
     p = plan(rows, overrides={1: {"deku": "skip"}}, cache={"2": guard})
     assert not p.lookups and len(p.skipped_override) == 2
+
+
+# ---------------------------------------------------------------- Xbox 360 games
+
+
+def x360(ta_id, title, released="2010-03-01", ownership="Owned", media="Disc"):
+    return OwnedRow(ta_id, title, "xbox-360", ownership, media, released)
+
+
+def test_owned_and_games_with_gold_360_rows_are_candidates_after_series_and_one():
+    rows = [x360(1, "Gold Oldie", ownership="Games with Gold"), x360(2, "Old Shooter", "2008-05-01"),
+            row(3, "New One", "xbox-one"), row(4, "New Series")]
+    assert [r.platform for r in plan(rows).lookups] == ["xbox-series-x-s", "xbox-one", "xbox-360", "xbox-360"]
+
+
+def test_xbox_one_games_with_gold_rows_stay_out():
+    p = plan([row(1, "Free One", "xbox-one", ownership="Games with Gold")])
+    assert not (p.lookups or p.skipped_platform or p.waiting_date)
+
+
+def test_360_rows_without_a_release_date_wait():
+    undated = x360(1, "Undated Oldie", released=None)
+    p = plan([undated])
+    assert p.waiting_date == [undated] and not (p.lookups or p.cooling or p.skipped_platform)
+
+
+def test_a_360_row_and_its_xbox_one_row_are_one_game():
+    p = plan([x360(1, "Example Shooter (Xbox 360)"), row(2, "Example Shooter", "xbox-one")])
+    assert [r.ta_id for r in p.lookups] == [2] and [r.ta_id for r in p.duplicates] == [1]
+
+
+def test_a_360_row_already_on_deku_under_its_bare_title_is_already():
+    r = x360(1, "Example Shooter II (Xbox 360)", "2012-02-07")
+    assert plan([r], [entry("Example Shooter II", "xbox_one")]).already == [r]
+
+
+def test_found_360_rows_cool_during_the_360_dry_run():
+    r = x360(1, "Old Shooter", "2008-05-01")
+    cache = {"1": {"status": "found", "slug": "old-shooter", "checked": ago(1)}}
+    assert plan_collection([r], [], {}, cache, NOW, 25, dry_360=True).cooling == [r]
+    assert plan_collection([r], [], {}, cache, NOW, 25).lookups == [r]  # live: a found game is added

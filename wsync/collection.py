@@ -51,6 +51,11 @@ from .ta_coll import OwnedRow
 # TA's platform is the console the game was played on (an Xbox One game played on a Series X shows
 # Series X|S), so it is a preference: see `choose_platform`.
 TARGET = {"xbox-series-x-s": "xbox_series", "xbox-one": "xbox_one"}
+# Xbox 360 rows: backward compatible games, which Deku lists as Xbox items; a release date proves the
+# match (see `confirms_360`). Their Games with Gold copies were kept for good, so they count as owned.
+X360 = "xbox-360"
+OWNED_360 = frozenset({"Owned", "Games with Gold"})
+_ORDER = {"xbox-series-x-s": 0, "xbox-one": 1, X360: 2}  # one game's representative and the lookup order
 _XBOX = frozenset(TARGET.values())
 _OTHER = {"xbox_series": "xbox_one", "xbox_one": "xbox_series"}
 COOLDOWN = timedelta(days=7)
@@ -74,6 +79,13 @@ def choose_platform(ta_platform: str, offered) -> str | None:
     if want in offered:
         return want
     return _OTHER[want] if _OTHER[want] in offered else None
+
+
+def match_title(row: OwnedRow) -> str:
+    """The title to search and match with: TA's trailing "(Xbox 360)" tag dropped from a 360 row."""
+    if row.platform == X360:
+        return re.sub(r"\s*\(Xbox 360\)\s*$", "", row.title, flags=re.I)
+    return row.title
 
 
 def deku_format(media: str) -> str | None:
@@ -100,6 +112,7 @@ class CollectionPlan:
     # an earlier add may have left an entry, so the step only re-checks it, never adds
     unsettled: dict[int, dict] = field(default_factory=dict)
     backlog: int = 0  # owned rows needing a lookup beyond the budget
+    waiting_date: list[OwnedRow] = field(default_factory=list)  # 360 rows with no TA release date yet
 
 
 def _parse(stamp) -> datetime | None:
@@ -119,6 +132,7 @@ def plan_collection(
     budget: int = DEFAULT_BUDGET,
     *,
     dry_run: bool = False,
+    dry_360: bool = False,
 ) -> CollectionPlan:
     if now.tzinfo is None:
         raise ValueError("plan_collection needs a timezone-aware `now`")
@@ -132,9 +146,16 @@ def plan_collection(
 
     candidates: list[OwnedRow] = []
     for r in rows:
-        if r.ownership != "Owned":
+        if r.platform == X360:
+            if r.ownership not in OWNED_360:
+                continue
+            if not r.released:  # nothing to prove the Deku match with until TA's date is read
+                plan.waiting_date.append(r)
+            else:
+                candidates.append(r)
+        elif r.ownership != "Owned":
             continue
-        if r.platform not in TARGET:
+        elif r.platform not in TARGET:
             plan.skipped_platform.append(r)
         else:
             candidates.append(r)
@@ -143,11 +164,11 @@ def plan_collection(
     # Edition") are grouped, and overrides apply to the group, whichever row they are keyed on.
     groups: dict[str, list[OwnedRow]] = {}
     for r in candidates:
-        groups.setdefault(base_title(r.title), []).append(r)
+        groups.setdefault(base_title(match_title(r)), []).append(r)
 
     pending: list[tuple[OwnedRow, datetime | None]] = []
     for group in groups.values():
-        group.sort(key=lambda r: (r.platform != "xbox-series-x-s", r.ta_id))  # Series row first
+        group.sort(key=lambda r: (_ORDER[r.platform], r.ta_id))  # Series row first, then One, then 360
         rep = group[0]
         if any((overrides.get(r.ta_id) or {}).get("deku") == SKIP for r in group):
             plan.skipped_override.extend(group)
@@ -159,7 +180,7 @@ def plan_collection(
         cached = cache.get(str(rep.ta_id)) or {}
         status = cached.get("status")
         checked = _parse(cached.get("checked")) if cached.get("checked") else None
-        cools = {NONE, MATCHED, ADDED} | ({FOUND} if dry_run else set())
+        cools = {NONE, MATCHED, ADDED} | ({FOUND} if dry_run or (dry_360 and rep.platform == X360) else set())
         # An add that may have left an entry, recorded on any row of the game (the representative can
         # change between runs): re-checked first, every run, never cooled.
         guard = next((e for r in group if (e := cache.get(str(r.ta_id)) or {}).get("status") in UNSETTLED), None)
@@ -175,12 +196,12 @@ def plan_collection(
                 plan.slugs[rep.ta_id] = slug
                 pending.append((rep, checked))
         elif guard is not None:
-            if norm(rep.title) in counted_titles or base_title(rep.title) in counted_titles:
+            if norm(match_title(rep)) in counted_titles or base_title(match_title(rep)) in counted_titles:
                 plan.already.append(rep)  # an Xbox / unset entry with its title is on the share page
             else:
                 plan.unsettled[rep.ta_id] = dict(guard)
                 pending.append((rep, checked))
-        elif norm(rep.title) in counted_titles or base_title(rep.title) in counted_titles:
+        elif norm(match_title(rep)) in counted_titles or base_title(match_title(rep)) in counted_titles:
             plan.already.append(rep)
         elif status in {ADDED, MATCHED, FOUND} and cached.get("slug") in counted_slugs:
             plan.already.append(rep)
@@ -193,7 +214,7 @@ def plan_collection(
     epoch = datetime.min.replace(tzinfo=timezone.utc)
     pending.sort(key=lambda p: (
         p[0].ta_id not in plan.unsettled,  # an add that may have left an entry: checked first, every run
-        p[0].platform != "xbox-series-x-s",  # Series before One
+        _ORDER[p[0].platform],  # Series, then One, then 360
         p[1] is not None,  # never attempted before attempted
         p[1] or epoch,  # then the oldest check first
         p[0].ta_id,
