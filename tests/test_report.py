@@ -488,3 +488,20 @@ def test_problem_sync_and_wishlist_review_leave_the_collection_review_task_alone
     plan_review_task(vk_with(fake), full_plan(), dry_run=False)
     coll = [t for t in fake.tasks.values() if t["title"] == "Review the Deku collection plan"]
     assert len(coll) == 1 and not coll[0]["done"]
+
+
+def test_collection_360_review_task_upserts_closes_and_survives_the_problem_sync():
+    from wsync.report import COLLECTION_360_REVIEW_KEY, collection_360_review_task, collection_review_task
+
+    fake = FakeVikunja()
+    assert COLLECTION_360_REVIEW_KEY == "collection-360-review"
+    assert collection_360_review_task(vk_with(fake), "## Would add (1)") is True
+    assert collection_360_review_task(vk_with(fake), "## Would add (1)") is False
+    task = next(iter(fake.tasks.values()))
+    assert task["title"] == "Review the Xbox 360 collection plan"
+    assert f"wsync-key: {COLLECTION_360_REVIEW_KEY}" in task["description"]
+    sync_problem_tasks(vk_with(fake), [])
+    collection_review_task(vk_with(fake), None, dry_run=False)  # the other review task closes only itself
+    assert len(fake.tasks) == 1 and not any(t["done"] for t in fake.tasks.values())
+    assert collection_360_review_task(vk_with(fake), None) is False
+    assert all(t["done"] for t in fake.tasks.values())

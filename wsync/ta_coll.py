@@ -15,12 +15,13 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from html.parser import HTMLParser
 from urllib.parse import quote
 
 PER_PAGE = 100  # TrueAchievements caps an AjaxList page at 100 rows
 # Columns switched on, on top of the gamer's saved column choices.
-EXTRA_COLS = ("Platform", "Ownershipstatus", "Media")
+EXTRA_COLS = ("Platform", "Ownershipstatus", "Media", "Releasedate")  # Releasedate is headed "Released"
 # Filters set to fixed values whatever view the gamer saved on the site, so a narrowed view can't
 # shorten the read with a footer total that still agrees. Each "all" value is the control's
 # `data-default` in the live markup (2026-11-02). The exceptions are on purpose: the title type is
@@ -52,6 +53,7 @@ class OwnedRow:
     platform: str  # TA's platform icon slug: xbox-series-x-s, xbox-one, xbox-360, windows, ...
     ownership: str  # Owned, Xbox Game Pass (deprecated), EA Play, No longer have, ...
     media: str  # Disc, Digital, Disc & Digital, Disc-to-Digital, or blank
+    released: str | None = None  # ISO date from TA's Released column; None when blank or not shown
 
 
 class _FilterParser(HTMLParser):
@@ -151,6 +153,14 @@ def _cell_text(cell: str) -> str:
 _NEEDED = ("Title", "Platform", "Ownership", "Media")
 
 
+def parse_ta_date(text: str) -> str | None:
+    """TA's short date ("07 Feb 12") as ISO text; None for a blank or anything else."""
+    try:
+        return datetime.strptime((text or "").strip(), "%d %b %y").date().isoformat()
+    except ValueError:
+        return None
+
+
 def parse_list(fragment: str) -> tuple[list[OwnedRow], int | None]:
     """(rows, footer total) from one AjaxList page.
 
@@ -176,5 +186,5 @@ def parse_list(fragment: str) -> tuple[list[OwnedRow], int | None]:
         if not ident or not rec.get("Title"):
             raise ValueError("a collection row has no title or game id")
         rows.append(OwnedRow(int(ident.group(1)), rec["Title"], rec["Platform"],
-                             rec["Ownership"], rec["Media"]))
+                             rec["Ownership"], rec["Media"], parse_ta_date(rec.get("Released", ""))))
     return rows, total

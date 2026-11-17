@@ -20,6 +20,7 @@ import html
 import http.cookiejar
 import os
 import re
+from datetime import datetime
 import time
 import urllib.error
 import urllib.parse
@@ -134,6 +135,8 @@ class DekuItem:
     settings: dict[str, str] = field(default_factory=dict, repr=False)
     # The owned (collection) entries on the item page, newest first as the site lists them.
     owned: tuple[OwnedDetail, ...] = ()
+    # The Xbox release date (ISO) from the page's "Release date:" line; None when absent or unreadable.
+    released: str | None = None
 
 
 # --------------------------------------------------------------------------- transport
@@ -339,6 +342,33 @@ def _offered(page: str) -> frozenset[str]:
     return frozenset(_PLATFORM_NAMES[n] for n in names if n in _PLATFORM_NAMES)
 
 
+_RELEASE = re.compile(r"<strong>Release date:</strong>\s*(<ul>.*?</ul>|[^<]*)", re.S)
+_RELEASE_PART = re.compile(r"<li><strong>(.*?)</strong><br\s*/?>(.*?)</li>", re.S)
+
+
+def _release_date(text: str) -> str | None:
+    t = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", text)).split())
+    for fmt in ("%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(t, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_release(page: str) -> str | None:
+    """The Xbox release date on an item page, as ISO text: in a per-platform list, the earliest date
+    whose platforms name Xbox; a single date (no list) applies to every platform. None otherwise."""
+    m = _RELEASE.search(page or "")
+    if not m:
+        return None
+    parts = _RELEASE_PART.findall(m.group(1))
+    if not parts:
+        return _release_date(m.group(1))
+    xbox = [d for p, raw in parts if "xbox" in html.unescape(p).lower() and (d := _release_date(raw))]
+    return min(xbox) if xbox else None
+
+
 def parse_item(slug: str, page: str) -> DekuItem:
     parser = _ItemParser()
     parser.feed(page)
@@ -362,6 +392,7 @@ def parse_item(slug: str, page: str) -> DekuItem:
         offered=_offered(page),
         settings=settings,
         owned=_owned_details(page),
+        released=parse_release(page),
     )
 
 

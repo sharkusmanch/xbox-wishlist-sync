@@ -23,7 +23,7 @@ SERIES, ONE = "Xbox Series X|S", "Xbox One"
 
 class FakeDeku:
     def __init__(self, games, wishlist, *, journal=None):
-        # games: slug -> (title, offered platforms); wishlist: slug -> (format, ticked platforms)
+        # games: slug -> (title, offered platforms[, Xbox release ISO date]); wishlist: slug -> (format, ticked platforms)
         self.games = dict(games)
         self.list = dict(wishlist)
         self.writes = []
@@ -68,7 +68,7 @@ class FakeDeku:
         self.owned.setdefault(item.slug, []).append(OwnedDetail(f"o-{item.slug}-{n}", platform, fmt))
 
     def _item(self, slug):
-        title, offered = self.games[slug]
+        title, offered, *rest = self.games[slug]
         on = slug in self.list
         fmt, ticked = self.list.get(slug, ("", frozenset()))
         settings = {}
@@ -77,7 +77,8 @@ class FakeDeku:
             for p in ("xbox_series", "xbox_one", "switch"):
                 settings[f"platform_{p}"] = "true" if p in ticked else "false"
         return DekuItem(slug, f"uuid-{slug}", title, on, frozenset(ticked) if on else frozenset(),
-                        frozenset(offered), settings, tuple(self.owned.get(slug, ())))
+                        frozenset(offered), settings, tuple(self.owned.get(slug, ())),
+                        released=rest[0] if rest else None)
 
     def wishlist(self, *, with_platforms=False):
         self.wishlist_calls += 1
@@ -97,7 +98,7 @@ class FakeDeku:
         if q in self.results:
             return list(self.results[q])
         words = set(norm(q).split())  # a loose full-text search, like the real one
-        return [(t, s) for s, (t, _) in self.games.items() if words & set(norm(t).split())]
+        return [(t, s) for s, (t, *_) in self.games.items() if words & set(norm(t).split())]
 
     def item(self, slug):
         self.calls.append(("item", slug))
@@ -198,6 +199,8 @@ class FakeReporter:
         self.notes = []
         self.collection_reviews = []  # (body, dry_run)
         self._collection_body = None
+        self.collection_360_reviews = []  # the task text, or None when closed
+        self._collection_360_body = None
 
     def sync_problems(self, problems, keep_kinds, keep_keys=frozenset()):
         self.problem_syncs.append((list(problems), set(keep_kinds)))
@@ -214,6 +217,12 @@ class FakeReporter:
             return False
         changed = body != self._collection_body
         self._collection_body = body
+        return changed
+
+    def collection_360_review(self, body):
+        self.collection_360_reviews.append(body)
+        changed = body is not None and body != self._collection_360_body
+        self._collection_360_body = body
         return changed
 
     def notify(self, title, body):
@@ -1015,3 +1024,12 @@ def test_config_ta_read_after():
     for bad in ("12", "25:00", "12:60", "noon"):
         with pytest.raises(ConfigError):
             config_from([], {**env, "WSYNC_TA_READ_AFTER": bad})
+
+
+def test_collection_360_dry_run_defaults_on_and_follows_the_other_switches():
+    env = {"DEKU_EMAIL": "e", "TA_GAMERTAG": "g"}
+    assert config_from(["--apply"], env).collection_360_dry_run is True  # on by default
+    live = {**env, "COLLECTION_DRY_RUN": "false", "COLLECTION_360_DRY_RUN": "false"}
+    assert config_from(["--apply"], live).collection_360_dry_run is False
+    assert config_from(["--apply"], {**live, "COLLECTION_DRY_RUN": "true"}).collection_360_dry_run is True
+    assert config_from([], live).collection_360_dry_run is True  # a dry run is dry for 360 games too

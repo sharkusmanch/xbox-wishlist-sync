@@ -39,7 +39,7 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 
 from .deku import DekuError, DekuItem, DekuNetworkError, DekuPartialOwn, DekuRateLimited, OwnedEntry
 from .errors import TAError
@@ -51,6 +51,13 @@ from .ta_coll import OwnedRow
 # TA's platform is the console the game was played on (an Xbox One game played on a Series X shows
 # Series X|S), so it is a preference: see `choose_platform`.
 TARGET = {"xbox-series-x-s": "xbox_series", "xbox-one": "xbox_one"}
+# Xbox 360 rows: backward compatible games, which Deku lists as Xbox items; a release date proves the
+# match (see `confirms_360`). Their Games with Gold copies were kept for good, so they count as owned.
+X360 = "xbox-360"
+OWNED_360 = frozenset({"Owned", "Games with Gold"})
+_ORDER = {"xbox-series-x-s": 0, "xbox-one": 1, X360: 2}  # one game's representative and the lookup order
+XBOX_ONE_LAUNCH = date(2013, 11, 22)  # a Deku Xbox listing dated before this can't be an Xbox One port
+DATE_WINDOW = timedelta(days=31)
 _XBOX = frozenset(TARGET.values())
 _OTHER = {"xbox_series": "xbox_one", "xbox_one": "xbox_series"}
 COOLDOWN = timedelta(days=7)
@@ -70,10 +77,31 @@ UNSETTLED = frozenset({ADDING, PARTIAL})
 def choose_platform(ta_platform: str, offered) -> str | None:
     """The Deku platform for a new entry: TA's, when the Deku item lists it, else the other Xbox
     platform the item lists; None when the item lists no Xbox platform."""
+    if ta_platform == X360:  # Deku lists backward compatible 360 games as Xbox One items
+        return "xbox_one" if "xbox_one" in offered else "xbox_series" if "xbox_series" in offered else None
     want = TARGET[ta_platform]
     if want in offered:
         return want
     return _OTHER[want] if _OTHER[want] in offered else None
+
+
+def confirms_360(ta_released: str | None, deku_released: str | None) -> bool:
+    """The Deku item is the Xbox 360 game: both release dates fall before the Xbox One launch (no later port
+    or remaster can), or they are within DATE_WINDOW of each other. False when either date is unknown."""
+    try:
+        ta, deku = date.fromisoformat(ta_released), date.fromisoformat(deku_released)
+    except (TypeError, ValueError):
+        return False
+    if ta < XBOX_ONE_LAUNCH and deku < XBOX_ONE_LAUNCH:
+        return True
+    return abs(ta - deku) <= DATE_WINDOW
+
+
+def match_title(row: OwnedRow) -> str:
+    """The title to search and match with: TA's trailing "(Xbox 360)" tag dropped from a 360 row."""
+    if row.platform == X360:
+        return re.sub(r"\s*\(Xbox 360\)\s*$", "", row.title, flags=re.I)
+    return row.title
 
 
 def deku_format(media: str) -> str | None:
@@ -100,6 +128,10 @@ class CollectionPlan:
     # an earlier add may have left an entry, so the step only re-checks it, never adds
     unsettled: dict[int, dict] = field(default_factory=dict)
     backlog: int = 0  # owned rows needing a lookup beyond the budget
+    waiting_date: list[OwnedRow] = field(default_factory=list)  # 360 rows with no TA release date yet
+    # TA id of a representative -> the other rows of its game (its duplicates): the step records an
+    # outcome on every row of the game
+    members: dict[int, list[OwnedRow]] = field(default_factory=dict)
 
 
 def _parse(stamp) -> datetime | None:
@@ -108,6 +140,17 @@ def _parse(stamp) -> datetime | None:
     except ValueError:
         return None
     return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _titled(rep: OwnedRow, norms: set[str], bases: set[str]) -> bool:
+    """A Deku collection entry carries the game's title (normalised titles and base titles of the entries).
+    An Xbox 360 game needs its exact title: by base title, "Foo" on Xbox 360 would count as owned through
+    an entry for "Foo Definitive Edition"."""
+    title = match_title(rep)
+    if rep.platform == X360:
+        return norm(title) in norms
+    titles = norms | bases
+    return norm(title) in titles or base_title(title) in titles
 
 
 def plan_collection(
@@ -119,6 +162,7 @@ def plan_collection(
     budget: int = DEFAULT_BUDGET,
     *,
     dry_run: bool = False,
+    dry_360: bool = False,
 ) -> CollectionPlan:
     if now.tzinfo is None:
         raise ValueError("plan_collection needs a timezone-aware `now`")
@@ -128,38 +172,59 @@ def plan_collection(
     # Switch / PlayStation entries never do (Deku allows several entries per item).
     counted = [e for e in deku_entries if e.platform is None or e.platform in _XBOX]
     counted_slugs = {e.slug for e in counted}
-    counted_titles = {norm(e.title) for e in counted} | {base_title(e.title) for e in counted}
+    counted_norms = {norm(e.title) for e in counted}
+    counted_bases = {base_title(e.title) for e in counted}
 
     candidates: list[OwnedRow] = []
     for r in rows:
-        if r.ownership != "Owned":
+        if r.platform == X360:
+            if r.ownership not in OWNED_360:
+                continue
+            if not r.released and not (overrides.get(r.ta_id) or {}).get("deku"):
+                plan.waiting_date.append(r)  # nothing to prove the Deku match with until TA's date is read
+            else:
+                candidates.append(r)
+        elif r.ownership != "Owned":
             continue
-        if r.platform not in TARGET:
+        elif r.platform not in TARGET:
             plan.skipped_platform.append(r)
         else:
             candidates.append(r)
 
     # One game, one decision: rows sharing a base title (Series + One, or "Foo" + "Foo Deluxe
     # Edition") are grouped, and overrides apply to the group, whichever row they are keyed on.
+    # Xbox 360 rows group among themselves the same way but join a Series/One game only on the exact
+    # title ("Foo (Xbox 360)" with "Foo"): "Foo" on Xbox 360 and "Foo Definitive Edition" on Xbox One
+    # are two games and two Deku items.
     groups: dict[str, list[OwnedRow]] = {}
+    groups_360: dict[str, list[OwnedRow]] = {}
     for r in candidates:
-        groups.setdefault(base_title(r.title), []).append(r)
+        if r.platform == X360:
+            groups_360.setdefault(base_title(match_title(r)), []).append(r)
+        else:
+            groups.setdefault(base_title(r.title), []).append(r)
+    joins = {norm(r.title): base_title(r.title) for r in candidates if r.platform != X360}
+    for key, rows_360 in groups_360.items():
+        into = next((joins[n] for r in rows_360 if (n := norm(match_title(r))) in joins), None)
+        groups.setdefault(into if into is not None else f"{X360}:{key}", []).extend(rows_360)
 
     pending: list[tuple[OwnedRow, datetime | None]] = []
     for group in groups.values():
-        group.sort(key=lambda r: (r.platform != "xbox-series-x-s", r.ta_id))  # Series row first
+        group.sort(key=lambda r: (_ORDER[r.platform], r.ta_id))  # Series row first, then One, then 360
         rep = group[0]
         if any((overrides.get(r.ta_id) or {}).get("deku") == SKIP for r in group):
             plan.skipped_override.extend(group)
             continue
         plan.duplicates.extend(group[1:])
+        if len(group) > 1:
+            plan.members[rep.ta_id] = group[1:]
         # The representative's slug wins; otherwise the lowest TA id that has one.
         slug = next((s for r in group
                      if (s := (overrides.get(r.ta_id) or {}).get("deku"))), None)
         cached = cache.get(str(rep.ta_id)) or {}
         status = cached.get("status")
         checked = _parse(cached.get("checked")) if cached.get("checked") else None
-        cools = {NONE, MATCHED, ADDED} | ({FOUND} if dry_run else set())
+        cools = {NONE, MATCHED, ADDED} | ({FOUND} if dry_run or (dry_360 and rep.platform == X360) else set())
         # An add that may have left an entry, recorded on any row of the game (the representative can
         # change between runs): re-checked first, every run, never cooled.
         guard = next((e for r in group if (e := cache.get(str(r.ta_id)) or {}).get("status") in UNSETTLED), None)
@@ -175,12 +240,12 @@ def plan_collection(
                 plan.slugs[rep.ta_id] = slug
                 pending.append((rep, checked))
         elif guard is not None:
-            if norm(rep.title) in counted_titles or base_title(rep.title) in counted_titles:
+            if _titled(rep, counted_norms, counted_bases):
                 plan.already.append(rep)  # an Xbox / unset entry with its title is on the share page
             else:
                 plan.unsettled[rep.ta_id] = dict(guard)
                 pending.append((rep, checked))
-        elif norm(rep.title) in counted_titles or base_title(rep.title) in counted_titles:
+        elif _titled(rep, counted_norms, counted_bases):
             plan.already.append(rep)
         elif status in {ADDED, MATCHED, FOUND} and cached.get("slug") in counted_slugs:
             plan.already.append(rep)
@@ -193,7 +258,7 @@ def plan_collection(
     epoch = datetime.min.replace(tzinfo=timezone.utc)
     pending.sort(key=lambda p: (
         p[0].ta_id not in plan.unsettled,  # an add that may have left an entry: checked first, every run
-        p[0].platform != "xbox-series-x-s",  # Series before One
+        _ORDER[p[0].platform],  # Series, then One, then 360
         p[1] is not None,  # never attempted before attempted
         p[1] or epoch,  # then the oldest check first
         p[0].ta_id,
@@ -333,16 +398,13 @@ class _Step:
         self.run, self.deku, self.state, self.plan = run, deku, state, plan
         self.now, self.dry, self.res = now, dry, res
         self.override: str | None = None  # the override slug of the lookup under way
-        self.dups: dict[str, list[OwnedRow]] = {}
-        for r in plan.duplicates:
-            self.dups.setdefault(base_title(r.title), []).append(r)
 
     def _item(self, slug: str) -> DekuItem:
         self.run.sleep(PACE)
         return self.deku.item(slug)
 
     def _group(self, row: OwnedRow) -> list[OwnedRow]:
-        return [row, *self.dups.get(base_title(row.title), [])]
+        return [row, *self.plan.members.get(row.ta_id, [])]
 
     def _record(self, row: OwnedRow, status: str, slug: str | None, reason: str = "", **extra) -> None:
         entry = {"status": status, "slug": slug, "checked": self.now.isoformat(), "title": row.title, **extra}
@@ -353,7 +415,7 @@ class _Step:
         for r in self._group(row):
             self.state.collection[str(r.ta_id)] = dict(entry)
         self.res.outcomes[status] = self.res.outcomes.get(status, 0) + 1
-        platform = extra.get("platform") or TARGET[row.platform]
+        platform = extra.get("platform") or TARGET.get(row.platform, row.platform)
         text = {MATCHED: "already in the collection", ADDED: "added", FOUND: "would add (dry run)",
                 NONE: "no match"}[status]
         self.run.say(f"collection: {row.title} [{platform}] -> {text}"
@@ -376,21 +438,22 @@ class _Step:
         it = None
         if slug:
             it = self._item(slug)
-            if how == "cached" and pick(row.title, [(it.title, it.slug)]).status != "matched":
+            if how == "cached" and pick(match_title(row), [(it.title, it.slug)]).status != "matched":
                 self.run.say(f"collection: cached match for {row.title} ({slug}) no longer matches; searching again")
                 it = None
         if it is None:
-            results = self.deku.search(_query(row.title))
-            bare = strip_edition_noise(row.title)
-            if not _has_exact(row.title, results) and norm(bare) != norm(row.title):
+            title = match_title(row)
+            results = self.deku.search(_query(title))
+            bare = strip_edition_noise(title)
+            if not _has_exact(title, results) and norm(bare) != norm(title):
                 seen = {s for _, s in results}
                 results += [(t, s) for t, s in self.deku.search(_query(bare)) if s not in seen]
-            m = pick(row.title, results)
+            m = pick(title, results)
             if m.status != "matched":
                 why = (f"{len(m.candidates)} candidates, none confident" if m.candidates else "not found")
                 return self._record(row, NONE, None, why)
             it = self._item(m.target)
-            if pick(row.title, [(it.title, it.slug)]).status != "matched":
+            if pick(title, [(it.title, it.slug)]).status != "matched":
                 return self._record(row, NONE, None, f"item page title {it.title!r} differs")
         if it.slug in self.state.collection_unconfirmed:
             # An earlier add on this very item is unconfirmed (whatever row, override or redirect led
@@ -399,10 +462,13 @@ class _Step:
         target = choose_platform(row.platform, it.offered)
         if target is None:
             return self._record(row, NONE, None, f"{it.slug} is not listed for any Xbox platform")
+        if row.platform == X360 and not self.override and not confirms_360(row.released, it.released):
+            return self._record(row, NONE, None, f"Deku's Xbox release {it.released or 'unknown'} doesn't match "
+                                                 f"the Xbox 360 game ({row.released})")
         if any(o.platform is None or o.platform in _XBOX for o in it.owned):
             return self._record(row, MATCHED, it.slug)
         fmt = deku_format(row.media)
-        if self.dry:
+        if self.dry or (row.platform == X360 and self.run.collection_360_dry):
             return self._record(row, FOUND, it.slug, format=fmt, platform=target)
         if self.run.past_deadline():
             raise _Stop("write deadline")
@@ -496,14 +562,16 @@ def run_collection_step(run, deku, ta, state, overrides: dict[int, dict], now: d
         run.issue(f"Deku Deals collection read failed, no Deku collection adds this run: {_err(e)}")
         return res
     _settle_visible(run, state, entries, now)
-    plan = plan_collection(rows, entries, overrides, state.collection, now, dry_run=dry)
+    plan = plan_collection(rows, entries, overrides, state.collection, now, dry_run=dry,
+                           dry_360=run.collection_360_dry)
     res.plan = plan
     owned = sum(r.ownership == "Owned" for r in rows)
-    run.say(f"collection: {'DRY RUN' if dry else 'APPLY'}; TrueAchievements {len(rows)} titles, {owned} owned; "
+    mode = "DRY RUN" if dry else "APPLY, Xbox 360 games DRY RUN" if run.collection_360_dry else "APPLY"
+    run.say(f"collection: {mode}; TrueAchievements {len(rows)} titles, {owned} owned; "
             f"Deku collection {len(entries)} entries; already {len(plan.already)}, skipped platform "
             f"{len(plan.skipped_platform)}, skipped by override {len(plan.skipped_override)}, cooling "
-            f"{len(plan.cooling)}, duplicates {len(plan.duplicates)}, lookups {len(plan.lookups)}, "
-            f"backlog {plan.backlog}")
+            f"{len(plan.cooling)}, duplicates {len(plan.duplicates)}, Xbox 360 games without a release date "
+            f"{len(plan.waiting_date)}, lookups {len(plan.lookups)}, backlog {plan.backlog}")
 
     step = _Step(run, paced, state, plan, now, dry, res)
     for n, row in enumerate(plan.lookups):
@@ -604,7 +672,7 @@ def review_body(rows: list[OwnedRow], plan: CollectionPlan, cache: dict[str, dic
         "## Counts",
         f"- Owned on TrueAchievements: {sum(r.ownership == 'Owned' for r in rows)}",
         f"- Already in the Deku collection: {already}",
-        f"- Skipped, platform not synced (Xbox 360, Windows, mobile, Switch): {len(plan.skipped_platform)}",
+        f"- Skipped, platform not synced (Windows, mobile, Switch): {len(plan.skipped_platform)}",
         f"- Skipped by override: {len(plan.skipped_override)}",
         f"- Same game as another row (one Deku entry per game): {len(plan.duplicates)}",
         f"- Unmatched, cooling 7 days between tries: {len(unmatched)}",
@@ -613,7 +681,109 @@ def review_body(rows: list[OwnedRow], plan: CollectionPlan, cache: dict[str, dic
     return "\n".join(lines), counts
 
 
+def _review_360_lists(rows: list[OwnedRow], plan: CollectionPlan, cache: dict[str, dict]):
+    """(would add, unmatched, already count, waiting for a lookup, waiting for TA's release date) for the
+    Xbox 360 review. A 360 row grouped under another row (duplicates) or skipped by override isn't listed."""
+    out_ids = {r.ta_id for r in plan.skipped_override} | {r.ta_id for r in plan.duplicates}
+    already_ids = {r.ta_id for r in plan.already}
+    undated = {r.ta_id for r in plan.waiting_date}
+    would, unmatched, already, waiting = [], [], 0, 0
+    for r in rows:
+        if r.platform != X360 or r.ownership not in OWNED_360 or r.ta_id in out_ids or r.ta_id in undated:
+            continue
+        entry = cache.get(str(r.ta_id)) or {}
+        if r.ta_id in already_ids or _counts_entry(entry):
+            already += 1
+        elif entry.get("status") == FOUND:
+            would.append((r.title, entry.get("slug") or "?", entry.get("format") or "format unset",
+                          entry.get("platform") or "xbox_one"))
+        elif entry.get("status") == NONE:
+            unmatched.append((r.title, r.ta_id, entry.get("reason") or "no reason recorded"))
+        elif r.ta_id in plan.unsettled or entry.get("status") in UNSETTLED:
+            continue  # an add that may have left an entry: the step reports it as an issue
+        else:
+            waiting += 1
+    return sorted(would), sorted(unmatched), already, waiting, len(undated)
+
+
+def review_360_signature(rows: list[OwnedRow], plan: CollectionPlan, cache: dict[str, dict]) -> str:
+    """What the Xbox 360 "plan ready" ping tracks: the would-add and unmatched games, not the waiting counts
+    or the reasons."""
+    would, unmatched, _, _, _ = _review_360_lists(rows, plan, cache)
+    blob = json.dumps([would, [(t, i) for t, i, _ in unmatched]], ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def review_360_body(rows: list[OwnedRow], plan: CollectionPlan,
+                    cache: dict[str, dict]) -> tuple[str, dict[str, int]]:
+    """The Xbox 360 dry run's review text (deterministic) and its counts."""
+    would, unmatched, already, waiting, undated = _review_360_lists(rows, plan, cache)
+    counts = {"would_add": len(would), "unmatched": len(unmatched), "waiting": waiting + undated}
+    is_360 = [r for r in rows if r.platform == X360]
+    lines = [
+        "Xbox 360 dry run (COLLECTION_360_DRY_RUN): no Xbox 360 game has been added to the Deku Deals "
+        "collection. Source: TrueAchievements Xbox 360 games marked Owned or Games with Gold. Deku Deals lists "
+        "backward compatible 360 games as Xbox One items; a match needs the exact title and a Deku Xbox release "
+        f"date that shows it is the 360 game (both before the Xbox One launch, {XBOX_ONE_LAUNCH.isoformat()}, "
+        f"or within {DATE_WINDOW.days} days of each other).",
+        f"Summary: would add {len(would)}; already in the collection {already}; unmatched {len(unmatched)}; "
+        f"waiting {waiting + undated}",
+        f"## Would add ({len(would)})",
+    ]
+    lines += [f"- {t} (`{s}`, {f}, {p})" for t, s, f, p in would]
+    lines.append(f"## Unmatched ({len(unmatched)})")
+    if unmatched:
+        lines.append("Retried 7 days after each try. Fix one with a `collection` override keyed by its "
+                     "TrueAchievements game id (`{\"deku\": \"<slug>\"}`, or `\"skip\"`); an override skips "
+                     "the release-date check.")
+    lines += [f"- {t} (TA {i}): {why}" for t, i, why in unmatched]
+    lines += [
+        "## Counts",
+        f"- Xbox 360 games owned on TrueAchievements (Owned or Games with Gold): "
+        f"{sum(r.ownership in OWNED_360 for r in is_360)}",
+        f"- Already in the Deku collection: {already}",
+        f"- Same game as another row (one Deku entry per game): {sum(r.platform == X360 for r in plan.duplicates)}",
+        f"- Skipped by override: {sum(r.platform == X360 for r in plan.skipped_override)}",
+        f"- Unmatched, cooling 7 days between tries: {len(unmatched)}",
+        f"- Waiting for a lookup: {waiting}",
+        f"- Waiting for TrueAchievements' release date: {undated}",
+        "Set COLLECTION_360_DRY_RUN to \"false\" to add them.",
+    ]
+    return "\n".join(lines), counts
+
+
 def _report(run, res: StepResult, rows: list[OwnedRow], plan: CollectionPlan, state) -> None:
+    _report_plan(run, res, rows, plan, state)
+    _report_360(run, rows, plan, state)
+
+
+def _report_360(run, rows: list[OwnedRow], plan: CollectionPlan, state) -> None:
+    if not run.collection_360_dry:
+        state.collection_360_review = None  # a later 360 dry run pings its first plan again
+        try:
+            run.reporter.collection_360_review(None)
+        except Exception as e:  # noqa: BLE001
+            run.issue(f"Vikunja Xbox 360 collection review task not closed ({type(e).__name__})")
+        return
+    body, counts = review_360_body(rows, plan, state.collection)
+    sig = review_360_signature(rows, plan, state.collection)
+    for line in body.splitlines():
+        run.say(f"collection 360 plan | {line}")
+    try:
+        run.reporter.collection_360_review(body)
+    except Exception as e:  # noqa: BLE001 - reporting must not take the step down
+        run.issue(f"Vikunja Xbox 360 collection review task not updated ({type(e).__name__})")
+        return
+    if sig != state.collection_360_review:  # pinged only when the lists change, not the waiting counts
+        state.collection_360_review = sig
+        if not (counts["would_add"] or counts["unmatched"]):
+            return  # nothing to review yet
+        run.notify("Xbox 360 collection plan ready",
+                   f"Xbox 360 dry run: would add {counts['would_add']} to the Deku collection; unmatched "
+                   f"{counts['unmatched']}; waiting {counts['waiting']}.\nReview the plan in Vikunja (Wishlist Sync).")
+
+
+def _report_plan(run, res: StepResult, rows: list[OwnedRow], plan: CollectionPlan, state) -> None:
     if res.dry_run:
         body, counts = review_body(rows, plan, state.collection, state.collection_unconfirmed)
         sig = review_signature(rows, plan, state.collection, state.collection_unconfirmed)

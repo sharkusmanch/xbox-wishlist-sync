@@ -282,7 +282,7 @@ def test_collection_logs_in_when_the_page_is_gated_and_keeps_credentials_off_fla
 
 
 def test_module_exports_the_dataclass_fields_in_the_documented_order():
-    assert [f for f in OwnedRow.__dataclass_fields__] == ["ta_id", "title", "platform", "ownership", "media"]
+    assert [f for f in OwnedRow.__dataclass_fields__] == ["ta_id", "title", "platform", "ownership", "media", "released"]
     assert ta_coll.PER_PAGE == 100
 
 
@@ -382,3 +382,27 @@ def test_collection_needs_the_gamer_id_and_order_filters(required):
     with pytest.raises(IncompleteRead):
         c.collection()
     assert seen == []
+
+
+# ---------------------------------------------------------------- release dates
+
+
+def test_parse_ta_date_reads_tas_short_dates():
+    assert ta_coll.parse_ta_date("07 Feb 12") == "2012-02-07"
+    assert ta_coll.parse_ta_date("19 Nov 05") == "2005-11-19"
+    assert ta_coll.parse_ta_date("") is None and ta_coll.parse_ta_date("TBA") is None
+
+
+def test_parse_list_reads_the_release_date():
+    rows, _ = parse_list(LIST)
+    assert rows[3].released == "2012-02-07" and rows[6].released == "2013-11-20"
+    assert rows[0].released is None  # a blank cell
+
+
+def test_list_url_switches_on_the_release_date_column():
+    assert params(list_url(COLL, list_filters(PAGE), 1)).count("&chkColReleasedate=True") == 1
+
+
+def test_rows_cached_before_the_release_date_column_still_load():
+    old = {"ta_id": 1, "title": "T", "platform": "xbox-360", "ownership": "Owned", "media": ""}
+    assert OwnedRow(**old).released is None

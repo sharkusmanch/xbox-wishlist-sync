@@ -920,3 +920,142 @@ def test_ta_read_after_reads_a_cache_from_before_yesterdays_read_time(tmp_path):
                               "rows": [row(1, "Alpha Quest").__dict__]})
     save_state(h.cfg.state, st)
     assert h.run() == 0 and h.ta.collection_calls == 1
+
+
+# --------------------------------------------------------------------------- Xbox 360 games
+
+
+from wsync import collection as coll  # noqa: E402
+
+GAMES_360 = {
+    "example-shooter-ii": ("Example Shooter II", {"xbox_one"}, "2012-02-21"),
+    "old-racer": ("Old Racer", {"xbox_one"}, "2016-09-13"),  # a later remaster of a 2006 game
+    "one-game": ("One Game", {"xbox_one"}, None),
+}
+
+
+def x360(ta_id, title, released, media="Disc", ownership="Owned"):
+    return OwnedRow(ta_id, title, X360, ownership, media, released)
+
+
+@pytest.mark.parametrize("ta, deku, ok", [
+    ("2012-02-07", "2012-02-21", True), ("2008-05-01", "2011-06-01", True),  # both before the launch
+    ("2006-08-08", "2016-09-13", False),  # a later remaster
+    ("2014-03-11", "2014-03-12", True), ("2014-03-11", "2016-05-01", False),
+    (None, "2012-01-01", False), ("2012-01-01", None, False)])
+def test_confirms_360(ta, deku, ok):
+    assert coll.confirms_360(ta, deku) is ok
+
+
+def test_choose_platform_for_a_360_game_prefers_xbox_one():
+    assert coll.choose_platform(X360, {"xbox_one", "xbox_series"}) == "xbox_one"
+    assert coll.choose_platform(X360, {"xbox_series"}) == "xbox_series"
+    assert coll.choose_platform(X360, {"switch"}) is None
+
+
+def test_a_confirmed_360_game_is_added_as_xbox_one(tmp_path):
+    h = live(tmp_path, GAMES_360, [x360(42, "Example Shooter II (Xbox 360)", "2012-02-07")],
+             collection_360_dry_run=False)
+    assert h.run() == 0
+    assert owns(h) == [("own", "example-shooter-ii", "physical", "xbox_one")]
+
+
+def test_a_360_game_whose_deku_release_is_later_is_unmatched(tmp_path):
+    h = live(tmp_path, GAMES_360, [x360(42, "Old Racer", "2006-08-08")], collection_360_dry_run=False)
+    assert h.run() == 0
+    entry = cache(h)["42"]
+    assert owns(h) == [] and entry["status"] == "none" and "doesn't match" in entry["reason"]
+
+
+def test_the_360_dry_run_lists_360_games_while_xbox_one_games_are_added(tmp_path):
+    h = live(tmp_path, GAMES_360, [x360(42, "Example Shooter II", "2012-02-07"), row(7, "One Game", ONE)])
+    assert h.run() == 0  # COLLECTION_360_DRY_RUN is on by default
+    assert cache(h)["42"]["status"] == "found" and [w[1] for w in owns(h)] == ["one-game"]
+
+
+def test_a_360_duplicate_shares_its_xbox_one_games_entry(tmp_path):
+    rows = [row(7, "One Game", ONE), x360(8, "One Game (Xbox 360)", "2010-01-01")]
+    h = live(tmp_path, GAMES_360, rows, collection_360_dry_run=False)
+    assert h.run() == 0
+    assert owns(h) == [("own", "one-game", "digital", "xbox_one")]
+    assert cache(h)["8"]["status"] == cache(h)["7"]["status"] == "added"
+
+
+def test_the_step_log_says_360_games_are_dry_and_counts_undated_ones(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    h = live(tmp_path, GAMES_360, [x360(42, "Example Shooter II", None), row(7, "One Game", ONE)])
+    assert h.run() == 0
+    assert "collection: APPLY, Xbox 360 games DRY RUN;" in caplog.text
+    assert "Xbox 360 games without a release date 1," in caplog.text
+
+
+
+def test_a_deku_override_on_a_360_game_skips_the_release_date_proof(tmp_path):
+    h = live(tmp_path, GAMES_360, [x360(43, "Old Racer", "2006-08-08")], collection_360_dry_run=False,
+             overrides={"collection": {"43": {"deku": "old-racer"}}})
+    assert h.run() == 0
+    assert owns(h) == [("own", "old-racer", "physical", "xbox_one")]
+
+
+# --------------------------------------------------------------------------- the Xbox 360 review task
+
+
+def test_360_review_lists_would_add_unmatched_and_waiting():
+    rows = [x360(42, "Example Shooter II (Xbox 360)", "2012-02-07"), x360(43, "Old Racer", "2006-08-08"),
+            x360(44, "Undated Game", None), row(7, "One Game", ONE)]
+    checked = NOW.isoformat()
+    c = {"42": {"status": "found", "slug": "example-shooter-ii", "format": "physical", "platform": "xbox_one",
+                "checked": checked},
+         "43": {"status": "none", "checked": checked,
+                "reason": "Deku's Xbox release 2016-09-13 doesn't match the Xbox 360 game (2006-08-08)"}}
+    plan = coll.plan_collection(rows, [], {}, c, NOW, dry_360=True)
+    body, counts = coll.review_360_body(rows, plan, c)
+    assert counts == {"would_add": 1, "unmatched": 1, "waiting": 1}
+    assert "- Example Shooter II (Xbox 360) (`example-shooter-ii`, physical, xbox_one)" in body
+    assert ("- Old Racer (TA 43): Deku's Xbox release 2016-09-13 doesn't match the Xbox 360 game (2006-08-08)"
+            in body)
+    assert "One Game" not in body
+    main, _ = coll.review_body(rows, plan, c, {})
+    assert "Old Racer" not in main and "platform not synced (Windows, mobile, Switch)" in main
+
+
+def test_360_ping_only_when_the_list_changes(tmp_path):
+    h = live(tmp_path, GAMES_360, [x360(42, "Example Shooter II", "2012-02-07")])  # 360 dry run on by default
+    assert h.run() == 0 and h.run() == 0
+    assert [t for t, _ in h.reporter.notes] == ["Xbox 360 collection plan ready"]
+    reviews = h.reporter.collection_360_reviews
+    assert len(reviews) == 2 and "Example Shooter II (`example-shooter-ii`, physical, xbox_one)" in reviews[-1]
+    assert load_state(h.cfg.state).collection_360_review
+
+
+def test_360_review_task_closes_when_360_goes_live(tmp_path):
+    h = live(tmp_path, GAMES_360, [x360(42, "Example Shooter II", "2012-02-07")])
+    assert h.run() == 0
+    h.cfg.collection_360_dry_run = False
+    assert h.run() == 0
+    assert h.reporter.collection_360_reviews[-1] is None
+    assert owns(h) == [("own", "example-shooter-ii", "physical", "xbox_one")]
+    assert load_state(h.cfg.state).collection_360_review is None
+
+
+def test_a_whole_step_dry_run_reviews_360_games_in_their_own_task(tmp_path):
+    h = only_collection(tmp_path, GAMES_360, [x360(42, "Example Shooter II", "2012-02-07"),
+                                              row(7, "One Game", ONE)])
+    assert h.run() == 0
+    assert owns(h) == []
+    main, dry = h.reporter.collection_reviews[-1]
+    assert dry is True and "One Game" in main and "Example Shooter II" not in main
+    assert "Example Shooter II" in h.reporter.collection_360_reviews[-1]
+    assert sorted(t for t, _ in h.reporter.notes) == ["Deku collection plan ready", "Xbox 360 collection plan ready"]
+
+
+def test_a_360_original_is_added_beside_its_xbox_one_remaster(tmp_path):
+    games = {"example-saga": ("Example Saga", {"xbox_one"}, "2010-05-01"),
+             "example-saga-definitive-edition": ("Example Saga Definitive Edition", {"xbox_one"}, "2020-05-19")}
+    rows = [x360(42, "Example Saga", "2010-05-01"), row(7, "Example Saga Definitive Edition", ONE)]
+    h = live(tmp_path, games, rows, collection_360_dry_run=False)
+    assert h.run() == 0
+    assert sorted(owns(h)) == [("own", "example-saga", "physical", "xbox_one"),
+                               ("own", "example-saga-definitive-edition", "digital", "xbox_one")]
+    assert cache(h)["42"]["slug"] == "example-saga"
+    assert cache(h)["7"]["slug"] == "example-saga-definitive-edition"

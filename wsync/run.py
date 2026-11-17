@@ -96,6 +96,7 @@ class Config:
     lists: tuple[str, ...] = LISTS
     collection: bool = True  # run the Deku collection step (off with --only deku|ta)
     collection_dry_run: bool = True  # COLLECTION_DRY_RUN; a dry run is always dry here too
+    collection_360_dry_run: bool = True  # COLLECTION_360_DRY_RUN; a dry collection step is dry here too
     report: bool = True
     accept_feed_count: int | None = None
     feed_max_age: timedelta = timedelta(hours=6)
@@ -165,6 +166,7 @@ def config_from(argv: list[str], env) -> Config:
     else:
         dry = (env.get("DRY_RUN") or "true").strip().lower() not in _FALSE
     collection_dry = dry or (env.get("COLLECTION_DRY_RUN") or "true").strip().lower() not in _FALSE
+    collection_360_dry = collection_dry or (env.get("COLLECTION_360_DRY_RUN") or "true").strip().lower() not in _FALSE
     accept = a.accept_feed_count if a.accept_feed_count is not None else _int_env(env, "WSYNC_ACCEPT_FEED_COUNT")
     hours = (env.get("WSYNC_FEED_MAX_AGE_HOURS") or "").strip()
     try:
@@ -195,6 +197,7 @@ def config_from(argv: list[str], env) -> Config:
         lists=() if a.only == COLLECTION else (a.only,) if a.only else LISTS,
         collection=a.only in (None, COLLECTION),
         collection_dry_run=collection_dry,
+        collection_360_dry_run=collection_360_dry,
         report=not a.no_report,
         accept_feed_count=accept,
         feed_max_age=max_age,
@@ -241,6 +244,9 @@ class NullReporter:
     def collection_review(self, body, *, dry_run) -> bool:
         return False
 
+    def collection_360_review(self, body) -> bool:
+        return False
+
     def notify(self, title, body) -> None:
         pass
 
@@ -258,6 +264,9 @@ class LiveReporter:
 
     def collection_review(self, body, *, dry_run) -> bool:
         return report.collection_review_task(self._vk, body, dry_run=dry_run)
+
+    def collection_360_review(self, body) -> bool:
+        return report.collection_360_review_task(self._vk, body)
 
     def notify(self, title, body) -> None:
         report.notify(self._apprise, title, body)
@@ -497,6 +506,11 @@ class _Run:
     def collection_dry(self) -> bool:
         return self.cfg.dry_run or self.cfg.collection_dry_run
 
+    @property
+    def collection_360_dry(self) -> bool:
+        """Xbox 360 games are listed, never added (COLLECTION_360_DRY_RUN, or the whole step dry)."""
+        return self.collection_dry or self.cfg.collection_360_dry_run
+
     def _finish(self) -> int:
         """Exit code; the failure ping goes out only when the set of issues changed since last run."""
         digest = failure_digest(self.issues) if self.issues else None
@@ -548,7 +562,8 @@ class _Run:
 
     def _go(self) -> int:
         cfg = self.cfg
-        step = ("off" if not cfg.collection else "DRY RUN" if self.collection_dry else "APPLY")
+        step = ("off" if not cfg.collection else "DRY RUN" if self.collection_dry
+                else "APPLY, Xbox 360 games DRY RUN" if self.collection_360_dry else "APPLY")
         self.say(f"wsync starting: {'DRY RUN (no writes)' if cfg.dry_run else 'APPLY'}, "
                  f"lists: {', '.join(cfg.lists) or 'none'}; Deku collection step: {step}")
         missing = cfg.missing()

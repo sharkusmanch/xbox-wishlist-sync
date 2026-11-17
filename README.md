@@ -59,6 +59,7 @@ report.
 | `APPRISE_URL` | Notifications |
 | `DRY_RUN` | `true` (default) plans only; `false` applies changes |
 | `COLLECTION_DRY_RUN` | The collection step's own switch: `true` (default) plans only; `false` adds to the Deku collection. A dry run (`DRY_RUN` or `--dry-run`) is always dry here too |
+| `COLLECTION_360_DRY_RUN` | Xbox 360 games in the collection step: `true` (default) lists them in their own review task; `false` adds them. A dry collection step is always dry here too |
 
 Credentials come only from the environment. They are never logged, put in a notification or task,
 or passed on a command line; every log line and report is also scrubbed of the configured secret
@@ -153,11 +154,17 @@ run:
    runs in between repeat the same failure without a new read or ping). A fresh TrueAchievements
    read is not started with less than 10 minutes left before the write deadline (the step waits
    for the next run);
-2. keeps the games TA marks **Owned** on Xbox Series X|S or Xbox One. Xbox 360, Windows, mobile
-   and Switch rows are skipped without any Deku request, as are not-owned statuses (Game Pass, EA
-   Play, "No longer have", ...). A game with Series and One rows is one game (the Series row);
-3. skips games already in the Deku collection by title (on an Xbox entry or one with no platform);
-4. looks up at most **25 games a run** (Series first, never-tried first, then the oldest try), with
+2. keeps the games TA marks **Owned** on Xbox Series X|S or Xbox One, and the Xbox 360 games it
+   marks **Owned** or **Games with Gold** (see "Xbox 360 games" below). Windows, mobile and Switch
+   rows are skipped without any Deku request, as are not-owned statuses (Game Pass, EA Play, "No
+   longer have", ...). A game with Series and One rows is one game (the Series row), as are rows
+   whose titles differ only by edition noise ("Foo" and "Foo Deluxe Edition"). An Xbox 360 row
+   joins them only under the identical title (TA's trailing "(Xbox 360)" tag is ignored): a 360
+   original and its Xbox One remaster ("Foo Definitive Edition") are two games;
+3. skips games already in the Deku collection by title (on an Xbox entry or one with no platform;
+   a 360 game by its identical title only);
+4. looks up at most **25 games a run** (Series first, then One, then 360; never-tried first, then
+   the oldest try), with
    at least **4 s between Deku requests** (worst case about 180 Deku requests a run, i.e. about 12
    minutes: per game two searches, an item read and the add, a create and a details save each read
    back, plus the share-page reads): override slug, else a Deku search (the title, then the title
@@ -176,6 +183,26 @@ run:
    public view, or deleted by hand on Deku) is re-checked weekly; a hand-deleted entry is added
    again, since TrueAchievements is the source of truth (remove the game from the TA collection, or
    skip it with a `collection` override, to stop that).
+
+### Xbox 360 games
+
+Deku Deals lists backward compatible Xbox 360 games as Xbox One items (with the original 360
+release date), so an owned 360 game is matched like any other and then has to pass one more check:
+the Deku item's Xbox release date (from its "Release date:" line, the earliest Xbox date when it
+lists one per platform) must show that it is the 360 game and not a later remaster or port. Both
+dates before the Xbox One launch (2013-11-22), or within 31 days of each other, pass; anything else
+(or a missing date) leaves the game unmatched, retried after 7 days. The 360 date is TA's Released
+column, read with the collection (no extra requests); until the first TrueAchievements read that
+has it, 360 games wait. A `collection` override slug on a 360 game skips the date check. Matched
+360 games are added as Xbox One, else Xbox Series X|S, with the format from TA's media as above.
+
+`COLLECTION_360_DRY_RUN` (default `true`) keeps 360 games dry while the rest of the step is live:
+they are looked up and listed in a Vikunja task "Review the Xbox 360 collection plan" (would add,
+unmatched with the reason, waiting counts), updated in place, and Apprise pings "Xbox 360 collection
+plan ready" when its lists change and are not empty. Setting it to `false` closes that task and adds
+the matched games on the next runs (dry-run matches are re-checked, not searched again).
+
+### Dry run, failures and partial adds
 
 Dry run (`COLLECTION_DRY_RUN` not `false`, or the whole run dry): no Deku collection writes. A
 Vikunja task "Review the Deku collection plan" lists every game a live run would add (title, Deku
