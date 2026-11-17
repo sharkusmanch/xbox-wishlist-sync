@@ -1047,3 +1047,15 @@ def test_a_whole_step_dry_run_reviews_360_games_in_their_own_task(tmp_path):
     assert dry is True and "One Game" in main and "Example Shooter II" not in main
     assert "Example Shooter II" in h.reporter.collection_360_reviews[-1]
     assert sorted(t for t, _ in h.reporter.notes) == ["Deku collection plan ready", "Xbox 360 collection plan ready"]
+
+
+def test_a_360_original_is_added_beside_its_xbox_one_remaster(tmp_path):
+    games = {"example-saga": ("Example Saga", {"xbox_one"}, "2010-05-01"),
+             "example-saga-definitive-edition": ("Example Saga Definitive Edition", {"xbox_one"}, "2020-05-19")}
+    rows = [x360(42, "Example Saga", "2010-05-01"), row(7, "Example Saga Definitive Edition", ONE)]
+    h = live(tmp_path, games, rows, collection_360_dry_run=False)
+    assert h.run() == 0
+    assert sorted(owns(h)) == [("own", "example-saga", "physical", "xbox_one"),
+                               ("own", "example-saga-definitive-edition", "digital", "xbox_one")]
+    assert cache(h)["42"]["slug"] == "example-saga"
+    assert cache(h)["7"]["slug"] == "example-saga-definitive-edition"

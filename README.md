@@ -157,9 +157,12 @@ run:
 2. keeps the games TA marks **Owned** on Xbox Series X|S or Xbox One, and the Xbox 360 games it
    marks **Owned** or **Games with Gold** (see "Xbox 360 games" below). Windows, mobile and Switch
    rows are skipped without any Deku request, as are not-owned statuses (Game Pass, EA Play, "No
-   longer have", ...). A game with Series, One and 360 rows is one game (the Series row, else the
-   One row; TA's trailing "(Xbox 360)" tag is ignored when comparing titles);
-3. skips games already in the Deku collection by title (on an Xbox entry or one with no platform);
+   longer have", ...). A game with Series and One rows is one game (the Series row), as are rows
+   whose titles differ only by edition noise ("Foo" and "Foo Deluxe Edition"). An Xbox 360 row
+   joins them only under the identical title (TA's trailing "(Xbox 360)" tag is ignored): a 360
+   original and its Xbox One remaster ("Foo Definitive Edition") are two games;
+3. skips games already in the Deku collection by title (on an Xbox entry or one with no platform;
+   a 360 game by its identical title only);
 4. looks up at most **25 games a run** (Series first, then One, then 360; never-tried first, then
    the oldest try), with
    at least **4 s between Deku requests** (worst case about 180 Deku requests a run, i.e. about 12

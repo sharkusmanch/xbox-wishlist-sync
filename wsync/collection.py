@@ -129,6 +129,9 @@ class CollectionPlan:
     unsettled: dict[int, dict] = field(default_factory=dict)
     backlog: int = 0  # owned rows needing a lookup beyond the budget
     waiting_date: list[OwnedRow] = field(default_factory=list)  # 360 rows with no TA release date yet
+    # TA id of a representative -> the other rows of its game (its duplicates): the step records an
+    # outcome on every row of the game
+    members: dict[int, list[OwnedRow]] = field(default_factory=dict)
 
 
 def _parse(stamp) -> datetime | None:
@@ -137,6 +140,17 @@ def _parse(stamp) -> datetime | None:
     except ValueError:
         return None
     return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _titled(rep: OwnedRow, norms: set[str], bases: set[str]) -> bool:
+    """A Deku collection entry carries the game's title (normalised titles and base titles of the entries).
+    An Xbox 360 game needs its exact title: by base title, "Foo" on Xbox 360 would count as owned through
+    an entry for "Foo Definitive Edition"."""
+    title = match_title(rep)
+    if rep.platform == X360:
+        return norm(title) in norms
+    titles = norms | bases
+    return norm(title) in titles or base_title(title) in titles
 
 
 def plan_collection(
@@ -158,7 +172,8 @@ def plan_collection(
     # Switch / PlayStation entries never do (Deku allows several entries per item).
     counted = [e for e in deku_entries if e.platform is None or e.platform in _XBOX]
     counted_slugs = {e.slug for e in counted}
-    counted_titles = {norm(e.title) for e in counted} | {base_title(e.title) for e in counted}
+    counted_norms = {norm(e.title) for e in counted}
+    counted_bases = {base_title(e.title) for e in counted}
 
     candidates: list[OwnedRow] = []
     for r in rows:
@@ -178,9 +193,20 @@ def plan_collection(
 
     # One game, one decision: rows sharing a base title (Series + One, or "Foo" + "Foo Deluxe
     # Edition") are grouped, and overrides apply to the group, whichever row they are keyed on.
+    # Xbox 360 rows group among themselves the same way but join a Series/One game only on the exact
+    # title ("Foo (Xbox 360)" with "Foo"): "Foo" on Xbox 360 and "Foo Definitive Edition" on Xbox One
+    # are two games and two Deku items.
     groups: dict[str, list[OwnedRow]] = {}
+    groups_360: dict[str, list[OwnedRow]] = {}
     for r in candidates:
-        groups.setdefault(base_title(match_title(r)), []).append(r)
+        if r.platform == X360:
+            groups_360.setdefault(base_title(match_title(r)), []).append(r)
+        else:
+            groups.setdefault(base_title(r.title), []).append(r)
+    joins = {norm(r.title): base_title(r.title) for r in candidates if r.platform != X360}
+    for key, rows_360 in groups_360.items():
+        into = next((joins[n] for r in rows_360 if (n := norm(match_title(r))) in joins), None)
+        groups.setdefault(into if into is not None else f"{X360}:{key}", []).extend(rows_360)
 
     pending: list[tuple[OwnedRow, datetime | None]] = []
     for group in groups.values():
@@ -190,6 +216,8 @@ def plan_collection(
             plan.skipped_override.extend(group)
             continue
         plan.duplicates.extend(group[1:])
+        if len(group) > 1:
+            plan.members[rep.ta_id] = group[1:]
         # The representative's slug wins; otherwise the lowest TA id that has one.
         slug = next((s for r in group
                      if (s := (overrides.get(r.ta_id) or {}).get("deku"))), None)
@@ -212,12 +240,12 @@ def plan_collection(
                 plan.slugs[rep.ta_id] = slug
                 pending.append((rep, checked))
         elif guard is not None:
-            if norm(match_title(rep)) in counted_titles or base_title(match_title(rep)) in counted_titles:
+            if _titled(rep, counted_norms, counted_bases):
                 plan.already.append(rep)  # an Xbox / unset entry with its title is on the share page
             else:
                 plan.unsettled[rep.ta_id] = dict(guard)
                 pending.append((rep, checked))
-        elif norm(match_title(rep)) in counted_titles or base_title(match_title(rep)) in counted_titles:
+        elif _titled(rep, counted_norms, counted_bases):
             plan.already.append(rep)
         elif status in {ADDED, MATCHED, FOUND} and cached.get("slug") in counted_slugs:
             plan.already.append(rep)
@@ -370,16 +398,13 @@ class _Step:
         self.run, self.deku, self.state, self.plan = run, deku, state, plan
         self.now, self.dry, self.res = now, dry, res
         self.override: str | None = None  # the override slug of the lookup under way
-        self.dups: dict[str, list[OwnedRow]] = {}
-        for r in plan.duplicates:
-            self.dups.setdefault(base_title(match_title(r)), []).append(r)
 
     def _item(self, slug: str) -> DekuItem:
         self.run.sleep(PACE)
         return self.deku.item(slug)
 
     def _group(self, row: OwnedRow) -> list[OwnedRow]:
-        return [row, *self.dups.get(base_title(match_title(row)), [])]
+        return [row, *self.plan.members.get(row.ta_id, [])]
 
     def _record(self, row: OwnedRow, status: str, slug: str | None, reason: str = "", **extra) -> None:
         entry = {"status": status, "slug": slug, "checked": self.now.isoformat(), "title": row.title, **extra}

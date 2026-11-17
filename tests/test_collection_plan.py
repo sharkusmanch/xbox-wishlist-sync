@@ -323,3 +323,22 @@ def test_an_undated_360_row_with_a_deku_override_is_looked_up():
     assert p.lookups == [r] and not p.waiting_date and p.slugs == {1: "undated-oldie"}
     p = plan([r], overrides={1: {"deku": "skip"}})
     assert p.skipped_override == [r] and not p.waiting_date
+
+
+def test_a_360_original_and_its_xbox_one_remaster_are_two_games():
+    p = plan([x360(1, "Example Saga"), row(2, "Example Saga Definitive Edition", "xbox-one")])
+    assert sorted(r.ta_id for r in p.lookups) == [1, 2] and not p.duplicates
+
+
+def test_a_360_original_is_not_already_owned_through_its_remasters_deku_entry():
+    p = plan([x360(1, "Example Saga")], [entry("Example Saga Definitive Edition", "xbox_one")])
+    assert [r.ta_id for r in p.lookups] == [1] and not p.already
+    p = plan([x360(1, "Example Saga (Xbox 360)")], [entry("Example Saga", "xbox_one")])
+    assert [r.ta_id for r in p.already] == [1]  # its own Deku item, by its exact title
+
+
+def test_a_360_row_joins_the_series_or_one_game_with_its_exact_title():
+    rows = [x360(1, "Example Saga (Xbox 360)"), row(2, "Example Saga", "xbox-one"),
+            row(3, "Example Saga Definitive Edition", "xbox-one")]
+    p = plan(rows)
+    assert [r.ta_id for r in p.lookups] == [2] and sorted(r.ta_id for r in p.duplicates) == [1, 3]
