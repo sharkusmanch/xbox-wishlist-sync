@@ -269,12 +269,14 @@ more up until the next day's pass, so a TA-wide change is at most 3 issues a day
 ### Writes
 
 Live only (`LIBRARY_DRY_RUN` `false`). At most **25 games a run** (`WSYNC_LIBRARY_BUDGET`), 4 s
-before each TA request, none started past the write deadline. Each write goes into state **before** its first request
-(write-ahead, with what the plan saw), is checkpointed after each request, and removed after its
-last; one left behind by a crash or stop is completed **at most once per pass** and never blocks
-the reads, the plan or other writes. An add whose game TA already lists is never written
-(`AlreadyListed`: a warning; TA's own import added it after the read). An entry changed on TA since
-the read (`ChangedOnTA`) is left as it is (a warning). Any other failure of one game's write is an
+before each TA request, none started past the write deadline. Each write goes into state
+**before** its first request (write-ahead, with what the plan saw), is checkpointed after each
+request, and removed after its last; one left behind by a crash or stop is completed **at most once
+per pass** and never blocks the reads, the plan or other writes. A new add whose game TA already
+lists is never written (`AlreadyListed`: a warning; TA's own import added it after the read); an
+unfinished add that finds its game listed (its post reached TA before a stop could record it) goes
+on to its field sets, compare-and-set against TA's defaults for a new entry. An entry changed on TA
+since the read (`ChangedOnTA`) is left as it is (a warning). Any other failure of one game's write is an
 issue naming that game and its product id (for a `skip` override), and the others go on; after
 **3 consecutive write errors** the pass's writes stop until the next day's pass. Cloudflare or
 network trouble and the write deadline stop the writes quietly. A failed write that reached nothing
@@ -286,7 +288,8 @@ on TA is dropped; a partial one stays for the next pass.
   "Review the library sync plan" lists what a live run would add (title, TA slug, ownership and
   media), would fix, the games to check by hand, and the counts (already right, waiting for a
   lookup). It is updated every run; Apprise pings "Library sync plan ready" **once**, when the
-  plan is complete (no lookup pending) and its lists changed.
+  plan is complete (no lookup pending, a game whose lookup failed today aside) and its lists
+  changed.
 - **Live:** that task closes. The task "Library sync: check by hand" holds the items needing a
   look, with the product id to key a `library` override. It holds **only new items**: at the first
   live run the step records a *seen baseline* (decision A) of every product in the plan's review
@@ -295,6 +298,9 @@ on TA is dropped; a partial one stays for the next pass.
   always does. Apprise pings when its item set changes (titles and a count, never product ids).
   "+N TA library" (the titles) is sent when a run added games.
 - **Sign-in:** the task above, plus one "Library sync: Microsoft sign-in needed" ping per episode.
+- **Product ids** appear only in issues (a write or lookup error names the products to key a
+  `library` override) and in the Vikunja tasks: never in routine log lines or in the step's own
+  pings, which carry titles and counts.
 
 ### Failures and back-offs
 
@@ -302,9 +308,11 @@ A failed Microsoft or TA read (a Microsoft or Store error, an incomplete TA read
 be classified) is an issue (exit 1, with the usual deduplicated failure ping), and is **not
 retried for 6 hours**: the runs in between make no new read and only log a warning (no issue, so
 they don't fail the run or trip the stale-sync alert), as the Deku collection step's back-off does.
-Nothing is planned or written from a partial read. A failed refresh of TA's Games with Gold / EA Play list
-keeps the copy in state for up to a week (a warning). A sign-in that needs a new token is the task
-above, not a failure. Reporting trouble (Vikunja) is an issue of its own and never breaks the step.
+Nothing is planned or written from a partial read: a Microsoft answer that isn't JSON, or a
+Collections or orders page without its items, is a failed read, never the end of the list. A failed
+refresh of TA's Games with Gold / EA Play list keeps the copy in state for up to a week (a warning).
+A sign-in that needs a new token is the task above, not a failure. Reporting trouble (Vikunja) is
+an issue of its own and never breaks the step.
 
 ### TA traffic it adds
 
@@ -323,6 +331,16 @@ after 30-44 days (7-10 for products not seen at go-live, so every product while 
 page after 90-120 days, all under the same daily cap. A steady day reads the collection once plus a
 few re-lookups. TA withheld won/not-won data from this IP after heavy automated traffic
 (2026-11-15), so keep these budgets.
+
+### Rolling back
+
+An image from before the library step rejects a top-level `library` key in `overrides.json` (its
+wishlist step stops: "overrides rejected, nothing written"), and its first state save drops
+`state.library`. So add the `library` overrides section only once an image with the library step
+runs, and take it out before rolling back. Rolling forward again after a rollback starts the step
+from nothing: the first live pass takes the seen baseline again (open check-by-hand items are
+hidden; see [State](#state)), and unfinished writes are lost. The token file is separate and
+survives.
 
 ## Deku collection step
 
@@ -444,15 +462,25 @@ rebuilds them (slower, up to the 35-minute lookup budget; lookups past it wait f
 with removals paused). It also forgets the unconfirmed adds, so check the "Check by hand" items
 on Deku first.
 
-The **library step**'s state lives under `library` in the same file: the day of the last complete
-pass, a failed read (retried after 6 h), a failed sign-in (day and the seed's SHA-256), the current
-pass (day, the TA collection rows its first run read, the TA ids it has written, a write-error
-count), TA's Games with Gold / EA Play lists (7 days), the cached page lookups, the write-ahead
-entries of unfinished writes, the "seen" baseline product ids, and the report signatures that keep
-pings to one per change. Deleting it is safe: the next pass starts from a fresh read (the seen
-baseline is gone, so a live run reports every check-by-hand item again). The Microsoft refresh
-token is a separate file, `WSYNC_XBOX_TOKEN` (`/state/xbox-token.json`, mode 600), beside it;
-deleting it falls back to the `XBOX_REFRESH_TOKEN` seed.
+The **library step**'s state lives under `library` in the same file. Don't delete it whole; by key:
+
+- **Safe cache resets:** `pages` (the cached page lookups: looked up again, within the lookup
+  limits), `lists` (TA's Games with Gold / EA Play lists: read again), `pass` (today's pass: the TA
+  collection rows and owned games its first run read, the TA ids written since, the error streaks
+  and the day's lookup count; the next run reads Microsoft and TA again, its fresh read shows what
+  was written, and the day's failed lookups and writes and its lookup count start again).
+- **Not safe:** `seen` (the decision-A baseline): the next live pass takes the baseline again, which
+  marks every open check-by-hand item seen and closes the task, hiding them. `writing` (the
+  write-ahead entries): an unfinished write's rest is never made, e.g. an add that reached TA keeps
+  no Digital media or Games with Gold ownership (an Owned entry is never changed). `signin_task`:
+  an open "Library sync: Microsoft sign-in needed" task is never closed by the step (close it by
+  hand).
+- The rest only time the step and its pings: `last_pass` (the day's pass runs again), `failed` (a
+  read back-off ends early), `signin_failed` (the sign-in is tried again at the next run, and pings
+  again if it fails), `listed`, `review_sig`, `check_sig` (the report memory: a ping may repeat).
+
+The Microsoft refresh token is a separate file, `WSYNC_XBOX_TOKEN` (`/state/xbox-token.json`, mode
+600), beside it; deleting it falls back to the `XBOX_REFRESH_TOKEN` seed.
 
 ## Development
 
