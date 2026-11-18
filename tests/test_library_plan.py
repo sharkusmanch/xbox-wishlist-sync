@@ -248,6 +248,37 @@ def test_an_orders_only_game_takes_the_360_page_or_the_modern_one_when_only_that
     assert plan([pc], [row(500, "Example Saga", "No longer have", platform="xbox-360")]).lookups == [pc]
 
 
+def test_an_orders_only_game_optimised_for_series_is_never_a_360_game():
+    old = page(500, "Example Saga", X360)
+    gone_360 = [row(500, "Example Saga", "No longer have", platform="xbox-360")]
+    for gen in ((GEN9,), (GEN8, GEN9)):  # Series X|S, Smart Delivery
+        g = owned("Example Saga", source="orders", gen=gen)
+        p = plan([g], gone_360)
+        assert p.actions == [] and p.lookups == [g], gen  # the 360 entry is another game: no fix
+        p = plan([g], gone_360, found(g, old))
+        assert p.actions == [] and kinds(p) == ["generation"], gen  # and its page no add
+    bc = owned("Example Saga", source="orders", gen=(GEN8,))  # a backward compatible 360 purchase
+    assert writes(plan([bc], gone_360)) == [("fix", 500)]
+    assert writes(plan([bc], pages=found(bc, old))) == [("add", 500)]
+
+
+def test_an_orders_only_copy_of_a_collections_game_never_writes_a_360_entry():
+    old = page(500, "Example Saga", X360)
+    series = page(501, "Example Saga", SERIES, slug="Example-Saga-Xbox-Series-XS")
+    gone_360 = [row(500, "Example Saga", "No longer have", platform="xbox-360")]
+    coll = owned("Example Saga", pid=P1)
+    bundle = owned("Example Saga - Deluxe Bundle", pid=P2, source="orders")  # both ConsoleGen9
+    p = plan([coll, bundle], gone_360, {P1: [old, series], P2: [old, series]})
+    assert writes(p) == [("add", 501)] and p.review == []  # the Series add, and nothing written to the 360 entry
+    coll8 = owned("Example Saga", pid=P1, gen=(GEN8,))
+    bundle8 = owned("Example Saga - Deluxe Bundle", pid=P2, source="orders", gen=(GEN8,))
+    p = plan([coll8, bundle8], gone_360)
+    assert p.actions == [] and p.lookups == [coll8] and [(r.pid, r.kind) for r in p.review] == [(P2, "versions")]
+    p = plan([coll8, bundle8], pages={P1: [old], P2: [old]})
+    assert p.actions == [] and [(r.pid, r.kind) for r in p.review] == [(P1, "generation"), (P2, "versions")]
+    assert writes(plan([bundle8], gone_360)) == [("fix", 500)]  # without a Collections copy: a 360 purchase
+
+
 def test_fixes_never_cross_generations():
     coll = owned("Example Saga", gen=(GEN8,))
     orders = owned("Example Saga", source="orders", gen=(GEN8,))
@@ -350,7 +381,7 @@ def test_an_override_whose_page_is_missing_is_an_override_review():
     typo = {P2: {"ta": "Example-Proper-Nmae"}}
     assert plan([g], overrides=typo).lookups == [g]  # not looked up yet
     p = plan([g], pages=found(g), overrides=typo)  # looked up: nothing at that address
-    assert p.actions == [] and p.lookups == [] and [(r.pid, r.kind) for r in p.review] == [(P1, "override")]
+    assert p.actions == [] and p.lookups == [] and [(r.pid, r.kind) for r in p.review] == [(P2, "override")]
     assert p.review[0].reason == "the library override's TA page Example-Proper-Nmae was not found"
     p = plan([g], pages=found(g, page(801, "Example Odd Name")), overrides=typo)  # not the override's page
     assert p.actions == [] and p.lookups == [] and kinds(p) == ["override"]
@@ -373,18 +404,37 @@ def test_candidate_slugs_and_variants_by_source():
         "Example-Quest", "Example-Quest-Xbox-One", "Example-Quest-Xbox-Series-XS"]
     assert candidate_slugs(owned("Example Quest", gen=(), pc_only=True)) == [
         "Example-Quest", "Example-Quest-Xbox-One", "Example-Quest-Xbox-Series-XS", "Example-Quest-Windows"]
-    assert candidate_slugs(owned("Example Quest", source="orders")) == [
+    assert candidate_slugs(owned("Example Quest", source="orders", gen=(GEN8,))) == [
         "Example-Quest", "Example-Quest-Xbox-360", "Example-Quest-Xbox-One"]
+    # an orders-only game optimised for Series X|S, or a PC-only one, is a modern game: no -Xbox-360
+    assert candidate_slugs(owned("Example Quest", source="orders", gen=(GEN9,))) == [
+        "Example-Quest", "Example-Quest-Xbox-One", "Example-Quest-Xbox-Series-XS"]
+    assert candidate_slugs(owned("Example Quest", source="orders", gen=(), pc_only=True)) == [
+        "Example-Quest", "Example-Quest-Xbox-One", "Example-Quest-Xbox-Series-XS", "Example-Quest-Windows"]
     # a purchase tier: the variants go on the base title; a version TA lists as its own game: on the full title
     assert candidate_slugs(owned("Example Quest - Deluxe Edition", pc_only=True)) == [
         "Example-Quest-Deluxe-Edition", "Example-Quest", "Example-Quest-Xbox-One", "Example-Quest-Xbox-Series-XS",
         "Example-Quest-Windows"]
-    assert candidate_slugs(owned("Example Quest: Definitive Edition", source="orders")) == [
+    assert candidate_slugs(owned("Example Quest: Definitive Edition", source="orders", gen=(GEN8,))) == [
         "Example-Quest-Definitive-Edition", "Example-Quest", "Example-Quest-Definitive-Edition-Xbox-360",
         "Example-Quest-Definitive-Edition-Xbox-One"]
-    assert candidate_slugs(owned("Example Quest (Xbox One)")) == [
-        "Example-Quest-Xbox-One", "Example-Quest", "Example-Quest-Xbox-Series-XS"]
     assert candidate_slugs(owned("Example Quest"), "skip") == []
+
+
+def test_candidate_slugs_drop_platform_phrases_and_plain_tiers():
+    bare = ["Example-Quest", "Example-Quest-Xbox-One", "Example-Quest-Xbox-Series-XS"]
+    for title in ("Example Quest for Xbox Series X|S", "Example Quest - Xbox Series X|S", "Example Quest (Xbox One)",
+                  "Example Quest Xbox One & Xbox Series X|S", "Example Quest on Xbox One"):
+        assert candidate_slugs(owned(title)) == bare, title  # never a variant stacked on a platform phrase
+    assert candidate_slugs(owned("Example Quest Deluxe Edition")) == [
+        "Example-Quest-Deluxe-Edition", "Example-Quest", "Example-Quest-Xbox-One", "Example-Quest-Xbox-Series-XS"]
+    assert candidate_slugs(owned("Example Quest Definitive Edition")) == [  # a version TA lists as its own game
+        "Example-Quest-Definitive-Edition", "Example-Quest-Definitive-Edition-Xbox-One",
+        "Example-Quest-Definitive-Edition-Xbox-Series-XS"]
+    longest = owned("Example Quest Gold Edition - Deluxe Edition for Windows", gen=(), pc_only=True)
+    assert candidate_slugs(longest) == [  # most specific first, never more than 6
+        "Example-Quest-Gold-Edition-Deluxe-Edition", "Example-Quest-Gold-Edition", "Example-Quest",
+        "Example-Quest-Xbox-One", "Example-Quest-Xbox-Series-XS", "Example-Quest-Windows"]
 
 
 def test_actions_on_one_ta_game_are_merged_keeping_the_stronger_write():

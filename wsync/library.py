@@ -13,11 +13,15 @@ scripts/ta-library-fix.py (`ta_slug`, `slug_candidates`, `accept_page`, `make_pl
 
 Generations: the TA page's own Platform field decides; the Store catalog's console generation only chooses
 among the pages that fit.
-- A Collections licence never matches an Xbox 360 / original Xbox page or entry. It takes the Xbox Series X|S
-  page for ConsoleGen9, the Xbox One page for ConsoleGen8, both for both (one page listing both is one add);
-  a PC-only licence takes the Windows page.
-- An orders-only game takes the Xbox 360 / Xbox page or entry when only those fit, the modern ones (as above)
-  when only those fit, and is a review when both kinds do.
+- Only an orders-only console game without ConsoleGen9 can be an Xbox 360 / original Xbox game (backward
+  compatible 360 products report ConsoleGen8 only). A Collections licence, a ConsoleGen9 or Smart Delivery
+  purchase and a PC-only one never match an Xbox 360 / Xbox page or entry. They take the Xbox Series X|S page for
+  ConsoleGen9, the Xbox One page for ConsoleGen8, both for both (one page listing both is one add); a PC-only
+  licence takes the Windows page.
+- An orders-only game that can be a 360 game takes the Xbox 360 / Xbox page or entry when only those fit, the
+  modern ones (as above) when only those fit, and is a review when both kinds do. One with the key of a
+  Collections game in the same plan (a bundled copy of a modern game) never writes an Xbox 360 / Xbox entry: a
+  review instead.
 - A console licence never fixes TA's separate "(Windows)" entry (its console page is added instead); a PC-only
   licence fixes only a Windows entry.
 - A `library` override slug is the game's page, without the title and generation checks; "skip" drops it. An
@@ -34,7 +38,8 @@ import re
 from dataclasses import dataclass, field
 
 from .overrides import SKIP
-from .owned import OwnedGame, game_key, hint, match_keys, same_game
+from .owned import (BARE_PLATFORM, PLATFORM_SUFFIX, PLATFORM_TAG, TIER_PLAIN, OwnedGame, game_key, hint, match_keys,
+                    same_game)
 from .ta import ONE, SERIES, TAGame
 from .ta_coll import OwnedRow
 
@@ -48,15 +53,21 @@ LAST_GEN = frozenset({"Xbox 360", "Xbox"})  # TA platform names of Xbox 360 and 
 MODERN = frozenset({SERIES, ONE, WINDOWS})
 ROW_LAST_GEN = frozenset({"xbox-360", "xbox"})  # the same as the collection list's platform icons
 ROW_MODERN = frozenset({"xbox-series-x-s", "xbox-one", "windows"})
-GENS = (("ConsoleGen8", ONE), ("ConsoleGen9", SERIES))  # Store catalog generation -> its TA page's platform
+GEN8, GEN9 = "ConsoleGen8", "ConsoleGen9"
+GENS = ((GEN8, ONE), (GEN9, SERIES))  # Store catalog generation -> its TA page's platform
 MAX_CANDIDATES = 6
-VARIANTS = {"collections": ("Xbox-One", "Xbox-Series-XS"), "orders": ("Xbox-360", "Xbox-One")}
+LAST_GEN_VARIANTS = ("Xbox-360", "Xbox-One")  # for a game that can be a 360 game
+MODERN_VARIANTS = ("Xbox-One", "Xbox-Series-XS")  # for any other, plus -Windows when it's PC-only
 EA_REASON = "pre-2016 licence for an EA Play game: could be an EA Access vault licence rather than a purchase"
+TWIN_REASON = "only Xbox 360 / Xbox {} fit, and a Collections licence has the same game: "
 _X360_TITLE = re.compile(r"\(Xbox 360\)\s*$", re.I)
 _X360_SLUG = re.compile(r"-Xbox-360$", re.I)
 _WINDOWS_TITLE = re.compile(r"\(Windows\)\s*$", re.I)
 _SEP = re.compile(r"\s+[-–—]\s+|\s*:\s*")
 _EDITION_END = re.compile(r"(?i)\b(?:edition|bundle)\s*$")
+# owned.py's title-key patterns (written for lowercased text), case-insensitive for Store titles
+_PLATFORM_TAG, _PLATFORM_SUFFIX, _BARE_PLATFORM, _TIER_PLAIN = (
+    re.compile(rx.pattern, re.I) for rx in (PLATFORM_TAG, PLATFORM_SUFFIX, BARE_PLATFORM, TIER_PLAIN))
 
 
 @dataclass(frozen=True)
@@ -124,20 +135,33 @@ def lookup_key(game: OwnedGame) -> str:
     return min(game.pids)
 
 
+def _no_platform(title: str) -> str:
+    """The title without a platform tag or a trailing platform phrase ("for Xbox Series X|S", "Xbox One & Xbox
+    Series X|S"), as the title keys drop them, its case kept."""
+    t = _PLATFORM_TAG.sub(" ", title.replace("&", " and ")).strip()
+    return _PLATFORM_SUFFIX.sub("", _BARE_PLATFORM.sub("", t)).rstrip(" -–—:")
+
+
 def candidate_slugs(game: OwnedGame, override: str | None = None) -> list[str]:
-    """The TA pages to look up for a game, at most MAX_CANDIDATES: an override's page alone; otherwise the
-    guessed addresses, then platform variants of the one that names the game (the base title for a purchase
-    tier, the full title for a version TA lists as its own game): -Xbox-One and -Xbox-Series-XS for a
-    Collections licence (and -Windows when it's PC-only), -Xbox-360 and -Xbox-One for an orders-only game."""
+    """The TA pages to look up for a game, at most MAX_CANDIDATES, most specific first: an override's page alone;
+    otherwise the guessed addresses of the title without its platform phrase, the root (the plainest form that is
+    still the game: without a purchase tier, even one without a separator, but keeping a version TA lists as its
+    own game), then the root's platform variants: -Xbox-360 and -Xbox-One for a game that can be a 360 game,
+    else -Xbox-One and -Xbox-Series-XS (and -Windows when it's PC-only)."""
     if override:
         return [] if override == SKIP else [override]
-    t, b = _trim(game.title)
-    out = slug_candidates(game.title)
-    root = ta_slug(b) if b != t and ta_slug(b) and game_key(b) == game_key(t) else ta_slug(t)
-    variants = VARIANTS[game.source] + (("Windows",) if game.source == "collections" and game.pc_only else ())
-    for v in variants if root else ():
-        if f"{root}-{v}" not in out:
-            out.append(f"{root}-{v}")
+    title = _no_platform(game.title)
+    t, b = _trim(title)
+    key = game_key(game.title)
+    root = ta_slug(next((x for x in (_TIER_PLAIN.sub("", b), b) if ta_slug(x) and game_key(x) == key), t))
+    if _last_gen_ok(game):
+        variants = LAST_GEN_VARIANTS
+    else:
+        variants = MODERN_VARIANTS + (("Windows",) if game.pc_only else ())
+    out: list[str] = []
+    for s in slug_candidates(title) + [root] + [f"{root}-{v}" for v in variants if root]:
+        if s and s not in out:
+            out.append(s)
     return out[:MAX_CANDIDATES]
 
 
@@ -172,15 +196,21 @@ def override_for(game: OwnedGame, overrides: dict[str, dict]) -> str | None:
     return SKIP if SKIP in slugs else (slugs[0] if slugs else None)
 
 
+def _last_gen_ok(game: OwnedGame) -> bool:
+    """The licence can be an Xbox 360 / original Xbox game: an orders-only console purchase without ConsoleGen9
+    (backward compatible 360 products report ConsoleGen8 only)."""
+    return game.source == "orders" and not game.pc_only and GEN9 not in game.gen
+
+
 def _row_last_gen(row: OwnedRow) -> bool:
     return row.platform in ROW_LAST_GEN or bool(_X360_TITLE.search(row.title))
 
 
 def _row_fits(game: OwnedGame, row: OwnedRow) -> bool:
-    """The TA entry can be this licence's: an Xbox entry of a generation it can be (a Collections licence is
-    never an Xbox 360 / original Xbox game), and TA's separate Windows entry only for a PC-only licence."""
+    """The TA entry can be this licence's: an Xbox entry of a generation it can be (only `_last_gen_ok` licences
+    can be an Xbox 360 / original Xbox game), and TA's separate Windows entry only for a PC-only licence."""
     if _row_last_gen(row):
-        return game.source == "orders" and not game.pc_only
+        return _last_gen_ok(game)
     if row.platform not in ROW_MODERN:
         return False  # not an Xbox entry: mobile, Switch, ...
     windows = bool(_WINDOWS_TITLE.search(row.title))
@@ -237,16 +267,18 @@ def _review(game: OwnedGame, kind: str, reason: str) -> Review:
     return Review(lookup_key(game), game.title, kind, reason)
 
 
-def _choose(game: OwnedGame, accepted: list[TAGame]) -> list[TAGame] | Review:
-    """The pages a missing game takes, by generation; a Review when none fits or the choice is unclear."""
+def _choose(game: OwnedGame, accepted: list[TAGame], twin: bool) -> list[TAGame] | Review:
+    """The pages a missing game takes, by generation; a Review when none fits or the choice is unclear. `twin`:
+    a Collections game in the plan has this orders-only game's key, so it never takes a 360 / Xbox page."""
     last = [p for p in accepted if _last_gen(p)]
-    if game.source == "orders" and last:
+    if _last_gen_ok(game) and last:
         if any(_modern(p) for p in accepted):
             return _review(game, "versions", "TA has Xbox 360 / Xbox and newer pages: " + _pages(accepted))
-        if len(last) > 1 and not game.pc_only:
+        if twin:
+            return _review(game, "versions", TWIN_REASON.format("pages") + _pages(last))
+        if len(last) > 1:
             return _review(game, "versions", "several TA game pages: " + _pages(last))
-        if not game.pc_only:  # a PC-only licence is never an Xbox 360 / Xbox game
-            return last
+        return last
     pool = [p for p in accepted if _modern(p) and not _last_gen(p)]
     wants = [WINDOWS] if game.pc_only else [plat for gen, plat in GENS if gen in game.gen]
     if not wants:
@@ -267,9 +299,10 @@ def _strength(a: Action) -> tuple[bool, bool]:
 
 class _Planner:
     def __init__(self, ta_rows: list[OwnedRow], pages: dict[str, list[TAGame] | None], gwg: set[int],
-                 ea_play: set[int]):
+                 ea_play: set[int], collections: set[str]):
         self.by_id = {r.ta_id: r for r in ta_rows}
         self.pages, self.gwg, self.ea_play = pages, gwg, ea_play
+        self.collections = collections  # the keys of the Collections games in the plan
         self.plan = LibraryPlan()
         self.actions: dict[int, Action] = {}  # TA game id -> its one action
 
@@ -278,9 +311,11 @@ class _Planner:
         if m.status == "ok":
             self.plan.ok += 1
         elif m.status == "wrong":
-            old = [_row_last_gen(r) for r in m.rows]
-            if g.source == "orders" and any(old) and not all(old):
+            old = [_row_last_gen(r) for r in m.rows]  # only a `_last_gen_ok` game matches a 360 / Xbox entry
+            if any(old) and not all(old):
                 self._settle([_review(g, "versions", "TA has Xbox 360 / Xbox and newer entries: " + _rows(m.rows))])
+            elif all(old) and self._twin(g):
+                self._settle([_review(g, "versions", TWIN_REASON.format("entries") + _rows(m.rows))])
             elif len(m.rows) > 1:
                 self._settle([_review(g, "versions", "several TA entries: " + _rows(m.rows))])
             else:
@@ -293,19 +328,24 @@ class _Planner:
                 other = f" (found: {'; '.join(p.title for p in found)})" if found else ""
                 self._settle([_review(g, "no-page", "no TA page with this title" + other)])
             else:
-                chosen = _choose(g, accepted)
+                chosen = _choose(g, accepted, self._twin(g))
                 self._settle([chosen] if isinstance(chosen, Review) else self._land(g, chosen))
 
-    def pinned(self, g: OwnedGame, slug: str) -> None:
+    def pinned(self, g: OwnedGame, slug: str, holder: str) -> None:
+        """A game with a `library` override slug; `holder` is the product whose override gave it."""
         found = self._found(g)
         if found is None:
             return
         page = next((p for p in found if p.slug.lower() == slug.lower()), None)
         if page is None:  # looked up: nothing at the override's address, or not its page
             other = f" (found: {'; '.join(p.title for p in found)})" if found else ""
-            self._settle([_review(g, "override", f"the library override's TA page {slug} was not found" + other)])
+            reason = f"the library override's TA page {slug} was not found" + other
+            self._settle([Review(holder, g.title, "override", reason)])
         else:
             self._settle(self._land(g, [page]))
+
+    def _twin(self, g: OwnedGame) -> bool:
+        return g.source == "orders" and g.key in self.collections
 
     def _found(self, g: OwnedGame) -> list[TAGame] | None:
         """The game's looked-up pages, one per TA id, unreleased placeholders (id < 1) left out; None (and a
@@ -363,12 +403,13 @@ def plan_library(games: list[OwnedGame], ta_rows: list[OwnedRow], pages: dict[st
     them (no key, or None) is not looked up yet and goes to `lookups`, an empty list means no TA page.
     `overrides` is the `library` section; `gwg` and `ea_play` are the TA game ids on TA's Games with Gold and
     EA Play lists."""
-    p = _Planner(ta_rows, pages, gwg, ea_play)
+    games = list(games)
+    p = _Planner(ta_rows, pages, gwg, ea_play, {g.key for g in games if g.source == "collections"})
     todo = [(g, ov) for g in games if (ov := override_for(g, overrides)) != SKIP]
     matches = iter(reconcile([g for g, ov in todo if not ov], ta_rows))
     for g, ov in todo:
         if ov:
-            p.pinned(g, ov)
+            p.pinned(g, ov, next(pid for pid in g.pids if (overrides.get(pid) or {}).get("ta") == ov))
         else:
             p.matched(next(matches))
     p.plan.actions = list(p.actions.values())
