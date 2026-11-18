@@ -294,6 +294,9 @@ class NullReporter:
     def collection_360_review(self, body) -> bool:
         return False
 
+    def library_task(self, key, title, body) -> bool:
+        return False
+
     def notify(self, title, body) -> None:
         pass
 
@@ -314,6 +317,9 @@ class LiveReporter:
 
     def collection_360_review(self, body) -> bool:
         return report.collection_360_review_task(self._vk, body)
+
+    def library_task(self, key, title, body) -> bool:
+        return report.library_task(self._vk, key, title, body)
 
     def notify(self, title, body) -> None:
         report.notify(self._apprise, title, body)

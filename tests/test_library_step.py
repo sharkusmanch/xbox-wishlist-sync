@@ -131,6 +131,11 @@ def library_state(h):
     return load_state(h.cfg.state).library
 
 
+def issue_notes(h):
+    """The failure pings (issues); the step's own pings are asserted in the reporting tests."""
+    return [n for n in h.reporter.notes if n[0] == "Wishlist sync failed"]
+
+
 def assert_paced(calls):
     """Every TA request the step makes comes 4 s after the one before it."""
     for i, c in enumerate(calls):
@@ -199,7 +204,7 @@ def test_dry_run_writes_nothing_and_plans_everything(tmp_path, caplog):
     state = load_state(h.cfg.state)
     assert state.library["last_pass"] == "2026-11-01" and not state.library.get("writing")
     assert state.ta_collection == {}  # the Deku collection step's TA cache is never written here
-    assert h.reporter.notes == []
+    assert not issue_notes(h)
     assert_paced(h.ta.calls)
 
 
@@ -227,7 +232,7 @@ def test_live_adds_and_fixes_within_the_budget(tmp_path):
     assert len(written(h)) == 5 and not [w for w in h.ta.writes if w[0] == "gc-add"]
     assert library_state(h)["last_pass"] == "2026-11-01"
     assert all((r.ownership, r.media) == ("Owned", "Digital") for r in h.ta.owned_rows)
-    assert h.reporter.notes == []
+    assert not issue_notes(h)
     assert_paced(h.ta.calls)
 
 
@@ -319,13 +324,13 @@ def test_an_incomplete_ta_read_writes_nothing(tmp_path):
     assert "90 of 100" in lib["failed"]["issue"] and "last_pass" not in lib
 
 
-def test_a_failed_sign_in_is_not_an_issue_and_waits_for_the_next_days_pass(tmp_path, caplog):
+def test_a_failed_sign_in_is_no_issue_pings_once_and_waits_for_the_next_days_pass(tmp_path, caplog):
     caplog.set_level(logging.INFO)
     h = library_only(tmp_path)
     h.xbox.reject = True
     h.now = NOW.replace(hour=12, minute=7)
     assert h.run() == 0
-    assert h.reporter.notes == [] and h.ta.calls == []
+    assert [t for t, _ in h.reporter.notes] == ["Library sync: Microsoft sign-in needed"] and h.ta.calls == []
     assert any("Microsoft sign-in needed" in m for m in lines(caplog))
     lib = library_state(h)
     assert lib["signin_failed"] == {"day": "2026-11-01", "seed": hashlib.sha256(SEED.encode()).hexdigest()}
@@ -366,7 +371,7 @@ def test_a_failed_list_refresh_keeps_the_copy_in_state_and_waits_6h(tmp_path, ca
         h.xbox.own(pid(n), f"Example Seeking {n:02d}")
     h.ta.fail_list["games-with-gold"] = IncompleteRead("games-with-gold list page 1 has no rows (throttled?)")
     h.ta.list_ids["ea-play"] = [8, 9]
-    assert h.run() == 0 and h.reporter.notes == []
+    assert h.run() == 0 and not issue_notes(h)
     assert any("games-with-gold list refresh failed" in m for m in lines(caplog))
     lists = library_state(h)["lists"]
     assert lists["games-with-gold"]["ids"] == [7] and lists["games-with-gold"]["tried"] == NOW.isoformat()
@@ -464,7 +469,7 @@ def test_lookups_go_on_past_a_missing_page_and_stop_quietly_on_a_failure(tmp_pat
     h.xbox.own(pid(2), "Example Seeking")
     h.ta.pages["Example-Finding-Xbox-Series-XS"] = page(901, "Example Finding", SERIES)
     h.ta.fail_page["Example-Seeking-Xbox-One"] = TAError("GET /game/Example-Seeking-Xbox-One answered HTTP 503")
-    assert h.run() == 0 and h.reporter.notes == []
+    assert h.run() == 0 and not issue_notes(h)
     assert [c[1] for c in h.ta.calls if c[0] == "page"] == [
         "Example-Finding", "Example-Finding-Xbox-One", "Example-Finding-Xbox-Series-XS",  # two missing, one found
         "Example-Seeking", "Example-Seeking-Xbox-One"]  # stopped at the failure
@@ -689,7 +694,7 @@ def test_a_field_changed_by_hand_since_the_read_is_left_as_it_is(tmp_path, caplo
     h.ta.owned_rows[1] = OwnedRow(502, "Example Mending 02", SX, "Owned", "Disc")  # by hand on TA
     h.cfg.library_budget = 25
     h.now = NOW + H
-    assert h.run() == 0 and h.reporter.notes == []
+    assert h.run() == 0 and not issue_notes(h)
     assert not [w for w in h.ta.writes if w[1] == 502]  # nothing posted for 502
     assert h.ta.owned_rows[1].media == "Disc"
     assert any("Example Mending 02 changed on TrueAchievements since the read; left as is" in m
@@ -707,7 +712,7 @@ def test_an_add_whose_game_ta_already_lists_changes_nothing(tmp_path, caplog):
     h.ta.pages["Example-Finding"] = page(901, "Example Finding")
     h.ta.unlisted = {901}
     caplog.set_level(logging.INFO)
-    assert h.run() == 0 and h.reporter.notes == []  # a warning, never an issue
+    assert h.run() == 0 and not issue_notes(h)  # a warning, never an issue
     assert any("already lists Example Finding" in m for m in lines(caplog))
     assert not [w for w in h.ta.writes if 901 in w or "Example-Finding" in w]  # no field set on it
     assert written(h) == [501]  # the other write goes on
@@ -728,7 +733,7 @@ def test_an_add_ta_listed_since_the_pass_read_the_collection_is_left_alone_quiet
     h.ta.owned_rows.append(OwnedRow(902, "Example Finding 2", SX, "Xbox Game Pass Ultimate", ""))  # TA's import
     h.cfg.library_budget = 25
     h.now = NOW + H
-    assert h.run() == 0 and h.reporter.notes == []
+    assert h.run() == 0 and not issue_notes(h)
     assert written(h) == [901, 903]  # Example Finding 2 is left as TA has it; the next write goes on
     assert any("already lists Example Finding 2" in m for m in lines(caplog))
     assert library_state(h)["last_pass"] == "2026-11-01"
@@ -756,7 +761,7 @@ def test_page_not_found_is_no_page_and_any_other_odd_page_caches_nothing(tmp_pat
     client, _ = logged_in({("GET", "/game/Example-Finding"): resp(NOT_FOUND),
                            ("GET", "/game/Example-Seeking"): resp("<html><title>Down for maintenance</title></html>")})
     h.ta.game_page_or_none = client.game_page_or_none
-    assert h.run() == 0 and h.reporter.notes == []
+    assert h.run() == 0 and not issue_notes(h)
     pages = library_state(h)["pages"]
     assert pages[pid(1)]["pages"] == [] and pid(2) not in pages
     assert "last_pass" not in library_state(h)
@@ -768,7 +773,7 @@ def test_cloudflare_or_network_trouble_while_writing_stops_quietly(tmp_path, cap
     h.xbox.own(pid(1), "Example Finding")
     h.ta.pages["Example-Finding"] = page(901, "Example Finding")
     h.ta.fail_add["Example-Finding"] = Unreachable("network error: ConnectionError")
-    assert h.run() == 0 and h.reporter.notes == [] and h.ta.writes == []
+    assert h.run() == 0 and not issue_notes(h) and h.ta.writes == []
     assert list(library_state(h)["writing"]) == ["901"] and "last_pass" not in library_state(h)
     assert any("retried next run" in m for m in lines(caplog))
 
@@ -919,3 +924,155 @@ def test_the_start_line_names_the_library_steps_mode(tmp_path, caplog):
     (tmp_path / "off").mkdir()
     basic(tmp_path / "off").run()
     assert "library step: off" in start()
+
+
+# --------------------------------------------------------------------------- reporting (Task 7)
+
+
+def tasks(h, key):
+    return [b for k, _, b in h.reporter.library_tasks if k == key]
+
+
+def review_pids(n):
+    """n owned games that each need a hand check (a possible match in TA), titles Example Arena 1..n."""
+    return [f"Example Arena {i}" for i in range(1, n + 1)]
+
+
+def own_checks(h, titles, start=1):
+    for i, t in enumerate(titles, start):
+        h.xbox.own(pid(start * 0 + i), t)
+        h.ta.owned_rows.append(OwnedRow(700 + i, f"{t}: Champions Cup", SX, "Owned", "Digital"))
+
+
+def test_dry_run_review_lists_adds_fixes_and_checks(tmp_path):
+    h = library_only(tmp_path, dry=True)
+    h.xbox.own(pid(1), "Example Mending")
+    h.ta.owned_rows.append(wrong(501, "Example Mending", "No longer have", "Disc"))
+    h.xbox.own(pid(2), "Example Finding")
+    h.ta.pages["Example-Finding"] = page(901, "Example Finding")
+    h.xbox.own(pid(3), "Example Lost Game")  # no TA page: still listed in the dry run
+    own_checks(h, ["Example Arena"], start=4)
+    assert h.run() == 0
+    body = tasks(h, "library-review:dry-run")[-1]
+    assert "## Would add (1)" in body and "- Example Finding (`Example-Finding`, Owned, Digital)" in body
+    assert "## Would fix (1)" in body and "- Example Mending: No longer have, Disc -> Owned" in body
+    assert f"(`{pid(4)}`, possible-match)" in body and f"Example Lost Game (`{pid(3)}`, no-page)" in body
+    assert "already right 0" in body
+    assert [t for t, _ in h.reporter.notes] == ["Library sync plan ready"]
+    assert tasks(h, "library-check") == [None]  # the live task stays closed in a dry run
+    assert library_state(h).get("seen") is None
+    h.now = NOW + H
+    h.run()
+    assert [t for t, _ in h.reporter.notes] == ["Library sync plan ready"]  # unchanged lists: no second ping
+
+
+def test_the_first_live_pass_marks_every_review_item_seen(tmp_path):
+    h = library_only(tmp_path, dry=False, library_budget=1, library_lookups=1)
+    own_checks(h, review_pids(3))
+    for n in range(1, 4):  # writes beyond the budget of 1
+        h.xbox.own(pid(50 + n), f"Example Mending {n}")
+        h.ta.owned_rows.append(wrong(500 + n, f"Example Mending {n}"))
+    h.xbox.own(pid(90), "Example Waiting")  # never looked up this run (lookup budget 1 is spent first)
+    h.xbox.own(pid(91), "Example Waiting Too")
+    assert h.run() == 0
+    lib = library_state(h)
+    assert {pid(1), pid(2), pid(3)} <= set(lib["seen"]) and lib["seen"] == sorted(lib["seen"])
+    assert {pid(90), pid(91)} <= set(lib["seen"])  # games still waiting for a lookup are baselined too
+    assert tasks(h, "library-check") == [None]  # all three are seen: nothing to check
+    assert tasks(h, "library-review:dry-run") == [None]
+    before = lib["seen"]
+    h.xbox.own(pid(95), "Example Later")
+    h.now = NOW + H
+    h.run()
+    assert library_state(h)["seen"] == before  # later runs never change it
+
+
+def test_only_unseen_items_reach_the_check_task_and_no_page_games_never_do(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    own_checks(h, ["Example Arena"])
+    assert h.run() == 0
+    assert tasks(h, "library-check") == [None] and h.reporter.notes == []
+    h.xbox.own(pid(20), "Example Newcomer")  # a new purchase with a possible match
+    h.ta.owned_rows.append(OwnedRow(720, "Example Newcomer: Deluxe", SX, "Owned", "Digital"))
+    h.xbox.own(pid(21), "Example Nopage")  # a new purchase with no TA page
+    h.now = NOW + DAY
+    assert h.run() == 0
+    body = tasks(h, "library-check")[-1]
+    assert f"Example Newcomer (`{pid(20)}`)" in body and "Example Nopage" not in body and "Example Arena" not in body
+    assert [t for t, _ in h.reporter.notes] == ["Library sync: 1 to check by hand"]
+    h.now = NOW + 2 * DAY
+    assert h.run() == 0
+    assert [t for t, _ in h.reporter.notes] == ["Library sync: 1 to check by hand"]  # same set: no ping
+
+
+def test_the_check_task_closes_when_empty(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Existing")
+    assert h.run() == 0
+    h.xbox.own(pid(20), "Example Newcomer")
+    h.ta.owned_rows.append(OwnedRow(720, "Example Newcomer: Deluxe", SX, "Owned", "Digital"))
+    h.now = NOW + DAY
+    h.run()
+    assert tasks(h, "library-check")[-1] is not None
+    h.ta.owned_rows[-1] = OwnedRow(720, "Example Newcomer", SX, "Owned", "Digital")  # now it matches: settled
+    h.now = NOW + 2 * DAY
+    h.run()
+    assert tasks(h, "library-check")[-1] is None and "check_sig" not in library_state(h)
+
+
+def test_sign_in_needed_pings_once_opens_a_task_and_exits_0(tmp_path):
+    h = library_only(tmp_path)
+    h.xbox.reject = True
+    h.now = NOW.replace(hour=12, minute=7)
+    assert h.run() == 0
+    body = tasks(h, "library-signin")[-1]
+    assert "scripts/xbox-library.py --token-file <tmp> login" in body and "microsoft.com/link" in body
+    assert "secret/apps/tools/xbox-wishlist-sync" in body and "XBOX_REFRESH_TOKEN" in body
+    assert SEED not in body and h.reporter.problems == []
+    h.now = NOW.replace(hour=13, minute=7)
+    assert h.run() == 0
+    h.now = NOW.replace(hour=12, minute=7) + DAY  # the next day's pass fails again: same episode
+    assert h.run() == 0
+    assert [t for t, _ in h.reporter.notes] == ["Library sync: Microsoft sign-in needed"]
+    assert len(tasks(h, "library-signin")) == 3 and None not in tasks(h, "library-signin")
+
+
+def test_a_working_sign_in_closes_the_sign_in_task(tmp_path):
+    h = library_only(tmp_path)
+    h.xbox.reject = True
+    h.now = NOW.replace(hour=12, minute=7)
+    h.run()
+    h.xbox.reject = False
+    h.now = NOW.replace(hour=12, minute=7) + DAY
+    assert h.run() == 0
+    assert tasks(h, "library-signin")[-1] is None and "signin_failed" not in library_state(h)
+    h.xbox.reject = True  # a later failure is a new episode: pinged again
+    h.xbox.refreshed_with.clear()
+    h.now = NOW.replace(hour=12, minute=7) + 2 * DAY
+    h.run()
+    assert [t for t, _ in h.reporter.notes] == ["Library sync: Microsoft sign-in needed"] * 2
+
+
+def test_the_live_notification_names_what_was_written_and_nothing_changed_is_silent(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(2), "Example Finding")
+    h.ta.pages["Example-Finding"] = page(901, "Example Finding")
+    assert h.run() == 0
+    assert h.reporter.notes == [("Library sync", "+1 TA library\n- Example Finding")]
+    h.now = NOW + DAY
+    h.run()
+    assert len(h.reporter.notes) == 1  # a run that changed nothing: no ping
+
+
+def test_a_failing_reporter_is_an_issue_and_never_breaks_the_step(tmp_path):
+    h = library_only(tmp_path, dry=True)
+    h.xbox.own(pid(2), "Example Finding")
+    h.ta.pages["Example-Finding"] = page(901, "Example Finding")
+
+    def boom(*a):
+        raise RuntimeError("vikunja down")
+    h.reporter.library_task = boom
+    assert h.run() == 1  # an issue of its own, nothing else broken
+    assert library_state(h)["last_pass"] == "2026-11-01"
+    assert [t for t, _ in h.reporter.notes] == ["Wishlist sync failed"]
+    assert "Vikunja library task" in h.reporter.notes[0][1] and "RuntimeError" in h.reporter.notes[0][1]

@@ -265,6 +265,8 @@ class FakeReporter:
         self._collection_body = None
         self.collection_360_reviews = []  # the task text, or None when closed
         self._collection_360_body = None
+        self.library_tasks = []  # (key, title, body)
+        self._library_bodies = {}  # key -> the open task's text
 
     def sync_problems(self, problems, keep_kinds, keep_keys=frozenset()):
         self.problem_syncs.append((list(problems), set(keep_kinds)))
@@ -287,6 +289,12 @@ class FakeReporter:
         self.collection_360_reviews.append(body)
         changed = body is not None and body != self._collection_360_body
         self._collection_360_body = body
+        return changed
+
+    def library_task(self, key, title, body):
+        self.library_tasks.append((key, title, body))
+        changed = body is not None and body != self._library_bodies.get(key)
+        self._library_bodies[key] = body
         return changed
 
     def notify(self, title, body):

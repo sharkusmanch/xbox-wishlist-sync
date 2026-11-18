@@ -44,6 +44,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from .errors import TAError
+from . import library_report
 from .flaresolverr import FlareSolverrError
 from .overrides import SKIP
 from .owned import (BARE_PLATFORM, PLATFORM_SUFFIX, PLATFORM_TAG, TIER_PLAIN, OwnedGame, game_key, hint, match_keys,
@@ -514,20 +515,25 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
         return res
     if _backing_off(run, lib, now, res):
         return res
+    had_signin = "signin_failed" in lib  # one ping per failure episode: only when this run starts it
     seed = hashlib.sha256(run.cfg.xbox_refresh_token.encode()).hexdigest()  # never the value itself
     signin = lib.get("signin_failed") if isinstance(lib.get("signin_failed"), dict) else {}
     if signin.get("day") == today and signin.get("seed") == seed:
         res.stopped = "Microsoft sign-in needed"
         run.say("library: Microsoft sign-in needed (it failed earlier today); next try at tomorrow's pass, or at the "
                 "next run once XBOX_REFRESH_TOKEN changes", logging.WARNING)
+        library_report.signin_failed(run, new=False)
         return res
     try:
         games = _owned(run, http, lib)
+        if had_signin:
+            library_report.signin_ok(run)
         gwg, ea_play = _lists(run, ta, lib, now)
         rows = _pass_rows(run, ta, lib, today)
     except SignInNeeded as e:
         lib["signin_failed"] = {**signin, "day": today, "seed": seed}
         res.stopped = "Microsoft sign-in needed"
+        library_report.signin_failed(run, new=not had_signin)
         run.say(f"library: {e}; next try at tomorrow's pass, or at the next run once XBOX_REFRESH_TOKEN changes",
                 logging.WARNING)
         return res
@@ -546,10 +552,12 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
                                        ea_play))
     res.plan, res.pending = plan, len(plan.lookups)
     _log_plan(run, res, len(games), len(rows), plan)
+    library_report.baseline(lib, plan, dry=res.dry_run)  # decision A: before any write, so a stop can't skip it
     if not res.dry_run:
         _Writer(run, ta, lib, overrides, now, res).write_phase(plan.actions, {r.ta_id: r for r in rows})
     elif lib.get("writing"):
         run.say(f"library: {len(lib['writing'])} unfinished TA writes wait for a live run")
+    library_report.report_plan(run, res, lib, plan, rows)
     return _end(run, res, lib, today)
 
 
