@@ -134,3 +134,109 @@ def test_a_400_without_an_oauth_error_is_a_failed_read(tmp_path):
     with pytest.raises(XboxError) as e:
         xbox.open_session(FakeHttp([(400, {})]), TokenStore(tmp_path / "t.json", "s"), [].append)
     assert not isinstance(e.value, SignInNeeded)
+
+
+# ---- Collections, orders and the Store catalog
+
+SESSION = xbox.Session("U1", "LIVE", "STORE", "2533270000000001", "Example Gamer")
+
+
+class Pages:
+    """Answers each request with the next (status, body); a raised exception is thrown instead."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls = []
+
+    def request(self, method, url, *, form=None, json_body=None, headers=None):
+        self.calls.append((method, url, json_body, headers))
+        a = self.answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+
+def test_collections_follow_continuation_tokens_with_an_xuid_beneficiary():
+    http = Pages((200, {"items": [{"productId": "A"}], "continuationToken": "NEXT"}),
+                 (200, {"items": [{"productId": "B"}]}))
+    items = xbox.fetch_collections(http, SESSION, market="US")
+    assert [i["productId"] for i in items] == ["A", "B"]
+    assert http.calls[0][0:2] == ("POST", xbox.COLLECTIONS_URL)
+    assert "continuationToken" not in http.calls[0][2]
+    body = http.calls[1][2]
+    assert body["continuationToken"] == "NEXT"
+    assert body["maxPageSize"] == 100 and body["excludeDuplicates"] is True
+    assert body["market"] == "US" and body["validityType"] == "All"
+    assert body["beneficiaries"][0]["identityType"] == "xuid"
+    assert body["beneficiaries"][0]["identityValue"] == SESSION.xuid
+    assert body["beneficiaries"][0]["localTicketReference"]
+    assert http.calls[0][3]["Authorization"] == "XBL3.0 x=U1;STORE"
+
+
+def test_orders_follow_next_links():
+    http = Pages((200, {"items": [{"orderId": "1"}], "@nextLink": "https://purchase.example/page2"}),
+                 (200, {"items": [{"orderId": "2"}]}))
+    assert [o["orderId"] for o in xbox.fetch_orders(http, SESSION)] == ["1", "2"]
+    assert http.calls[0][0:2] == ("GET", xbox.ORDERS_URL)
+    assert "?" not in http.calls[0][1]  # no market or language parameters
+    assert http.calls[1][1] == "https://purchase.example/page2"
+    assert http.calls[1][3]["Authorization"] == "XBL3.0 x=U1;STORE"
+
+
+def test_a_failed_page_raises_instead_of_returning_part():
+    failing = Pages((200, {"items": [{"orderId": "1"}], "@nextLink": "https://purchase.example/page2?t=SECRET"}),
+                    (500, {}))
+    with pytest.raises(XboxError) as e:
+        xbox.fetch_orders(failing, SESSION)
+    assert "SECRET" not in str(e.value) and "purchase.example" not in str(e.value)
+    with pytest.raises(XboxError):
+        xbox.fetch_collections(Pages((200, {"items": [{"productId": "A"}], "continuationToken": "N"}),
+                                     XboxError("network error: URLError")), SESSION)
+    with pytest.raises(XboxError):
+        xbox.fetch_collections(Pages((200, {"items": "oops"})), SESSION)
+    with pytest.raises(XboxError):
+        xbox.catalog_lookup(Pages((200, {"Products": []}), (503, {})), [f"P{i}" for i in range(25)])
+
+
+def product(pid, title="Example Quest", gen="absent", platforms=(), title_id=None):
+    p = {"ProductId": pid, "ProductType": "Game", "LocalizedProperties": [{"ProductTitle": title}]}
+    if title_id:
+        p["AlternateIds"] = [{"IdType": "XboxTitleId", "Value": title_id}]
+    if gen != "absent":
+        p["Properties"] = {"XboxConsoleGenOptimized": gen}
+    if platforms:
+        p["DisplaySkuAvailabilities"] = [{"Sku": {"Properties": {"Packages": [
+            {"PlatformDependencies": [{"PlatformName": n}]} for n in platforms]}}}]
+    return p
+
+
+def test_catalog_lookup_batches_twenty_ids_per_request_and_reads_the_title_id():
+    pids = [f"9EXAMPLE{i:04d}" for i in range(45)]
+    pages = [(200, {"Products": [product(p, f"Quest {p}", title_id="123") for p in pids[n * 20:(n + 1) * 20]]})
+             for n in range(3)]
+    http = Pages(*pages)
+    cat = xbox.catalog_lookup(http, pids)
+    assert len(http.calls) == 3
+    assert cat[pids[44]] == xbox.Product(pids[44], f"Quest {pids[44]}", "Game", "123", (), ())
+    first = http.calls[0][1]
+    assert first.startswith(xbox.CATALOG_URL + "?")
+    assert "market=US" in first and "languages=en-US" in first
+    assert ",".join(pids[:20]) in first.replace("%2C", ",") and pids[20] not in first
+    assert http.calls[0][3] is None or "Authorization" not in http.calls[0][3]
+
+
+def test_catalog_lookup_reads_platforms_from_the_sku_packages():
+    http = Pages((200, {"Products": [product("9EXAMPLE0003", platforms=["Windows.Desktop", "Windows.Xbox"])]}))
+    assert xbox.catalog_lookup(http, ["9EXAMPLE0003"])["9EXAMPLE0003"].platforms == ("PC", "Xbox")
+
+
+def test_catalog_reads_the_console_generation():
+    http = Pages((200, {"Products": [
+        product("9EXAMPLE0001", gen=["ConsoleGen8", "ConsoleGen9"]),
+        product("9EXAMPLE0002", gen=None),
+        product("9EXAMPLE0004")]}))
+    products = xbox.catalog_lookup(http, ["9EXAMPLE0001", "9EXAMPLE0002", "9EXAMPLE0004", "9EXAMPLE0005"])
+    assert products["9EXAMPLE0001"].gen == ("ConsoleGen8", "ConsoleGen9")
+    assert products["9EXAMPLE0002"].gen == ()  # null: a PC-only app
+    assert products["9EXAMPLE0004"].gen == ()
+    assert "9EXAMPLE0005" not in products  # not returned by the catalog: absent, not a failure

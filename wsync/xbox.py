@@ -233,3 +233,101 @@ def open_session(http: Http, store: TokenStore, on_secret: Callable[[str], None]
     on_secret(shop)
     return Session(uhs=claims["uhs"], live_token=live, store_token=shop,
                    xuid=str(claims.get("xid") or ""), gamertag=str(claims.get("gtg") or ""))
+
+
+# ---- Reads: Collections licences, Store orders and the public Store catalog
+
+COLLECTIONS_URL = "https://collections.mp.microsoft.com/v7.0/collections/query"
+ORDERS_URL = "https://purchase.mp.microsoft.com/v7.0/users/me/orders"
+CATALOG_URL = "https://displaycatalog.mp.microsoft.com/v7.0/products"
+PLATFORM_NAMES = {"Windows.Desktop": "PC", "Windows.Universal": "PC", "Windows.Xbox": "Xbox"}
+MAX_PAGES = 1000
+CATALOG_BATCH = 20
+
+
+def _page_items(status: int, body: dict, what: str) -> list:
+    """The `items` of a page; any non-200 or malformed page is a failed read (no URL in the message)."""
+    if status != 200:
+        raise XboxError(f"{what} failed: HTTP {status}")
+    items = body.get("items")
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise XboxError(f"{what} failed: unexpected response")
+    return items
+
+
+def fetch_collections(http: Http, s: Session, market: str = "US") -> list[dict]:
+    """Every licence on the account (all validity types). Any failed page raises: nothing partial."""
+    body = {"maxPageSize": 100, "excludeDuplicates": True, "market": market, "validityType": "All",
+            "beneficiaries": [{"identityType": "xuid", "identityValue": s.xuid,
+                               "localTicketReference": "xbox-library"}]}
+    items: list[dict] = []
+    token = None
+    for _ in range(MAX_PAGES):
+        page = dict(body, continuationToken=token) if token else dict(body)
+        status, j = http.request("POST", COLLECTIONS_URL, json_body=page, headers=s.headers("store"))
+        got = _page_items(status, j, "Collections query")
+        items += got
+        token = j.get("continuationToken")
+        if not token or not got:
+            return items
+    raise XboxError("Collections query failed: too many pages")
+
+
+def fetch_orders(http: Http, s: Session) -> list[dict]:
+    """Every Store order, following @nextLink. Any failed page raises: nothing partial."""
+    orders: list[dict] = []
+    url: str | None = ORDERS_URL
+    for _ in range(MAX_PAGES):
+        status, j = http.request("GET", url, headers=s.headers("store"))
+        orders += _page_items(status, j, "orders query")
+        url = j.get("@nextLink")
+        if not url:
+            return orders
+        if not isinstance(url, str):
+            raise XboxError("orders query failed: unexpected response")
+    raise XboxError("orders query failed: too many pages")
+
+
+@dataclass(frozen=True)
+class Product:
+    pid: str
+    title: str
+    kind: str
+    title_id: str | None
+    platforms: tuple[str, ...]  # "PC" / "Xbox" from the SKU packages
+    gen: tuple[str, ...]  # Properties.XboxConsoleGenOptimized, e.g. ("ConsoleGen9",); () for PC-only apps
+
+
+def _product(p: dict) -> Product:
+    lp = (p.get("LocalizedProperties") or [{}])[0]
+    platforms = {PLATFORM_NAMES.get(d.get("PlatformName"), d.get("PlatformName"))
+                 for sku in p.get("DisplaySkuAvailabilities") or []
+                 for pk in ((sku.get("Sku") or {}).get("Properties") or {}).get("Packages") or []
+                 for d in pk.get("PlatformDependencies") or []}
+    gen = (p.get("Properties") or {}).get("XboxConsoleGenOptimized") or ()
+    return Product(
+        pid=p["ProductId"], title=lp.get("ProductTitle", ""), kind=p.get("ProductType", ""),
+        title_id=next((a.get("Value") for a in p.get("AlternateIds") or []
+                       if a.get("IdType") == "XboxTitleId"), None),
+        platforms=tuple(sorted(x for x in platforms if x)), gen=tuple(gen))
+
+
+def catalog_lookup(http: Http, pids: list[str], market: str = "US") -> dict[str, Product]:
+    """Public Store catalog (no auth), 20 ids a request. A product the catalog omits is absent."""
+    out: dict[str, Product] = {}
+    pids = list(dict.fromkeys(pids))
+    for i in range(0, len(pids), CATALOG_BATCH):
+        query = urllib.parse.urlencode({"bigIds": ",".join(pids[i:i + CATALOG_BATCH]),
+                                        "market": market, "languages": "en-US"})
+        status, j = http.request("GET", f"{CATALOG_URL}?{query}")
+        if status != 200:
+            raise XboxError(f"catalog lookup failed: HTTP {status}")
+        try:
+            for p in j.get("Products") or []:
+                prod = _product(p)
+                out[prod.pid] = prod
+        except (KeyError, TypeError, AttributeError, IndexError):
+            raise XboxError("catalog lookup failed: unexpected response") from None
+    return out
