@@ -16,7 +16,7 @@ from wsync.deku import OwnedDetail
 from wsync.errors import TAError
 from wsync.run import Terminated
 from wsync.state import State, load_state, save_state
-from wsync.ta import SERIES, IncompleteRead, TAGame, Unreachable
+from wsync.ta import ONE, SERIES, IncompleteRead, TAGame, Unreachable
 from wsync.ta_coll import OwnedRow
 
 XUID = "2533270000004242"
@@ -695,6 +695,7 @@ def test_a_field_changed_by_hand_since_the_read_is_left_as_it_is(tmp_path, caplo
     h.cfg.library_budget = 25
     h.now = NOW + H
     assert h.run() == 0 and not issue_notes(h)
+    assert h.reporter.notes == [("Library sync", "+1 TA library\n- Example Mending 01")]  # never 502's title
     assert not [w for w in h.ta.writes if w[1] == 502]  # nothing posted for 502
     assert h.ta.owned_rows[1].media == "Disc"
     assert any("Example Mending 02 changed on TrueAchievements since the read; left as is" in m
@@ -713,6 +714,7 @@ def test_an_add_whose_game_ta_already_lists_changes_nothing(tmp_path, caplog):
     h.ta.unlisted = {901}
     caplog.set_level(logging.INFO)
     assert h.run() == 0 and not issue_notes(h)  # a warning, never an issue
+    assert h.reporter.notes == [("Library sync", "+1 TA library\n- Example Mending 01")]  # not the listed game
     assert any("already lists Example Finding" in m for m in lines(caplog))
     assert not [w for w in h.ta.writes if 901 in w or "Example-Finding" in w]  # no field set on it
     assert written(h) == [501]  # the other write goes on
@@ -734,6 +736,8 @@ def test_an_add_ta_listed_since_the_pass_read_the_collection_is_left_alone_quiet
     h.cfg.library_budget = 25
     h.now = NOW + H
     assert h.run() == 0 and not issue_notes(h)
+    assert h.reporter.notes == [("Library sync", "+1 TA library\n- Example Finding 1"),
+                                ("Library sync", "+1 TA library\n- Example Finding 3")]
     assert written(h) == [901, 903]  # Example Finding 2 is left as TA has it; the next write goes on
     assert any("already lists Example Finding 2" in m for m in lines(caplog))
     assert library_state(h)["last_pass"] == "2026-11-01"
@@ -961,8 +965,9 @@ def test_dry_run_review_lists_adds_fixes_and_checks(tmp_path):
     assert [t for t, _ in h.reporter.notes] == ["Library sync plan ready"]
     assert tasks(h, "library-check") == [None]  # the live task stays closed in a dry run
     assert library_state(h).get("seen") is None
-    h.now = NOW + H
+    h.now = NOW + DAY  # a new day's pass over the same plan
     h.run()
+    assert len(tasks(h, "library-review:dry-run")) == 2 and library_state(h)["last_pass"] == "2026-11-02"
     assert [t for t, _ in h.reporter.notes] == ["Library sync plan ready"]  # unchanged lists: no second ping
 
 
@@ -1105,3 +1110,97 @@ def test_a_working_sign_in_without_the_flag_makes_no_close_call(tmp_path):
     h = library_only(tmp_path)
     assert h.run() == 0
     assert tasks(h, "library-signin") == []
+
+
+def test_a_dry_pass_over_several_runs_pings_once_when_the_plan_is_complete(tmp_path):
+    h = library_only(tmp_path, dry=True, library_lookups=10)
+    for n in range(1, 26):  # 25 found pages, 10 lookups a run: three runs
+        h.xbox.own(pid(n), f"Example Finding {n:02d}")
+        h.ta.pages[f"Example-Finding-{n:02d}"] = page(900 + n, f"Example Finding {n:02d}")
+    pings = []
+    for i in range(3):
+        h.now = NOW + i * H
+        assert h.run() == 0
+        pings.append(len(h.reporter.notes))
+    assert pings == [0, 0, 1] and h.reporter.notes[0][0] == "Library sync plan ready"
+    assert "would add 25" in h.reporter.notes[0][1]
+    assert "waiting for a page lookup 5" in tasks(h, "library-review:dry-run")[1]  # the task text still updates
+    assert "Example Finding 01" in tasks(h, "library-review:dry-run")[1]  # earlier runs' items stay listed
+
+
+def test_a_weekly_relookup_cycle_does_not_ping_an_unchanged_plan(tmp_path):
+    h = library_only(tmp_path, dry=True, library_lookups=1)
+    for n in range(1, 4):
+        h.xbox.own(pid(n), f"Example Finding {n}")
+        h.ta.pages[f"Example-Finding-{n}"] = page(900 + n, f"Example Finding {n}")
+    for i in range(3):
+        h.now = NOW + i * H
+        h.run()
+    assert len(h.reporter.notes) == 1 and library_state(h)["last_pass"] == "2026-11-01"
+    first = tasks(h, "library-review:dry-run")[-1]
+    for i in range(3):  # day 9: every page expired, re-looked up one a run
+        h.now = NOW + 8 * DAY + i * H
+        h.run()
+    assert library_state(h)["last_pass"] == "2026-11-09"
+    assert len(h.reporter.notes) == 1  # the plan never changed
+    assert tasks(h, "library-review:dry-run")[-1].count("Example Finding") == first.count("Example Finding")
+
+
+def generation_item(h, n=20):
+    """A purchase whose only TA page is the Xbox One one: a "generation" review item that needs its lookup."""
+    h.xbox.own(pid(n), "Example Saga", gen=("ConsoleGen9",))
+    h.ta.pages["Example-Saga"] = page(950, "Example Saga", ONE)
+
+
+def test_a_blocked_relookup_of_a_listed_item_keeps_the_check_task_and_pings_once(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Existing")
+    assert h.run() == 0
+    generation_item(h)
+    h.now = NOW + DAY
+    assert h.run() == 0
+    assert "Example Saga" in tasks(h, "library-check")[-1]
+    assert [t for t, _ in h.reporter.notes] == ["Library sync: 1 to check by hand"]
+    h.ta.fail_page["Example-Saga"] = Unreachable("network error: ConnectionError")  # its weekly re-lookup is blocked
+    h.now = NOW + 8 * DAY
+    assert h.run() == 0 and not issue_notes(h)
+    assert tasks(h, "library-check")[1:] and None not in tasks(h, "library-check")[1:]
+    assert "Example Saga" in tasks(h, "library-check")[-1]
+    assert [t for t, _ in h.reporter.notes] == ["Library sync: 1 to check by hand"]  # no second ping
+
+
+def test_the_check_ping_has_titles_and_the_count_but_no_product_ids(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Existing")
+    h.run()
+    generation_item(h)
+    h.now = NOW + DAY
+    h.run()
+    title, body = h.reporter.notes[0]
+    assert title == "Library sync: 1 to check by hand" and "Example Saga" in body and pid(20) not in body
+    assert pid(20) in tasks(h, "library-check")[-1]
+
+
+def test_a_mistyped_override_on_a_seen_game_is_listed_and_pinged(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Lost Game")  # no TA page: a seen review item at go-live
+    assert h.run() == 0 and pid(1) in library_state(h)["seen"]
+    assert tasks(h, "library-check") == [None]
+    h.cfg.overrides.write_text(json.dumps({"library": {pid(1): {"ta": "Example-Nowhere"}}}))
+    h.now = NOW + DAY
+    assert h.run() == 0
+    assert f"Example Lost Game (`{pid(1)}`)" in tasks(h, "library-check")[-1]
+    assert [t for t, _ in h.reporter.notes] == ["Library sync: 1 to check by hand"]
+
+
+def test_the_sign_in_task_closes_as_soon_as_the_sign_in_works(tmp_path):
+    h = library_only(tmp_path)
+    h.xbox.reject = True
+    h.now = NOW.replace(hour=12, minute=7)
+    h.run()
+    h.xbox.reject = False
+    h.xbox.fail["collections"] = 500  # the read after the sign-in fails
+    h.now = NOW.replace(hour=12, minute=7) + DAY
+    h.run()
+    assert tasks(h, "library-signin")[-1] is None and "signin_task" not in library_state(h)
+    assert "delete the temp file" in tasks(h, "library-signin")[0]

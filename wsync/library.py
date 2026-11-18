@@ -526,7 +526,6 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
         return res
     try:
         games = _owned(run, http, lib)
-        library_report.signin_ok(run, lib)
         gwg, ea_play = _lists(run, ta, lib, now)
         rows = _pass_rows(run, ta, lib, today)
     except SignInNeeded as e:
@@ -597,6 +596,7 @@ def _owned(run, http, lib: dict) -> list[OwnedGame]:
         s = open_session(http, TokenStore(run.cfg.xbox_token, run.cfg.xbox_refresh_token), run.scrub.add)
         run.scrub.add(s.xuid)
         lib.pop("signin_failed", None)
+        library_report.signin_ok(run, lib)  # the sign-in works: its task closes now, not after the reads
         items = fetch_collections(http, s)
         orders = fetch_orders(http, s)
         catalog = catalog_lookup(http, _product_ids(items, orders))

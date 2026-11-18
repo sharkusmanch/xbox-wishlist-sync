@@ -13,7 +13,8 @@ SIGNIN_BODY = (
     "XBOX_REFRESH_TOKEN did not work either. Nothing is read or written until it is fixed.\n\n"
     "Fix: on the games repo run `scripts/xbox-library.py --token-file <tmp> login`, approve the code at "
     "microsoft.com/link, then put the token from that file into OpenBao `secret/apps/tools/xbox-wishlist-sync` "
-    "as `XBOX_REFRESH_TOKEN`. The step tries again at the next run once the secret changes, else at tomorrow's "
+    "as `XBOX_REFRESH_TOKEN`, then delete the temp file (it holds a live refresh token plus the XUID and gamertag). "
+    "The step tries again at the next run once the secret changes, else at tomorrow's "
     "pass. This task closes itself after the first working sign-in."
 )
 
@@ -22,30 +23,47 @@ def _fmt_sets(a) -> str:
     return ", ".join(label for _, label in a.sets)
 
 
-def _lists(plan, rows):
-    """(would add, would fix, check by hand): sorted tuples of plain text."""
+def _key(game) -> str:
+    return min(game.pids)  # the game's lookup key (`library.lookup_key`)
+
+
+def _lists(lib: dict, plan, rows):
+    """(would add, would fix, check by hand): sorted lists of plain-text entries.
+
+    A game waiting for a (re-)lookup keeps the entries it last had (`lib["listed"]`, by game key), so a pending
+    lookup never drops an item from a report or its signature. Updated here: the plan's games, plus the carried
+    ones; everything else is forgotten."""
     rows = rows or {}
-    adds, fixes = [], []
+    now: dict[str, dict] = {}
+
+    def entry(key):
+        return now.setdefault(key, {"add": [], "fix": [], "check": []})
     for a in plan.actions:
         if a.kind == "add":
-            adds.append((a.title, a.slug, _fmt_sets(a)))
+            entry(_key(a.game))["add"].append([a.title, a.slug, _fmt_sets(a)])
         else:
             row = rows.get(a.ta_id)
             was = f"{row.ownership or 'no ownership'}, {row.media or 'no media'}" if row else "unknown"
-            fixes.append((a.title, was, _fmt_sets(a)))
-    check = [(r.title, r.pid, r.kind, r.reason) for r in plan.review]
-    return sorted(adds), sorted(fixes), sorted(check)
+            entry(_key(a.game))["fix"].append([a.title, was, _fmt_sets(a)])
+    for r in plan.review:
+        entry(r.pid)["check"].append([r.title, r.pid, r.kind, r.reason])
+    stored = lib.get("listed") if isinstance(lib.get("listed"), dict) else {}
+    for g in plan.lookups:
+        if _key(g) not in now and _key(g) in stored:
+            now[_key(g)] = stored[_key(g)]
+    lib["listed"] = now
+    out = tuple(sorted(item for e in now.values() for item in e[kind]) for kind in ("add", "fix", "check"))
+    return out
 
 
-def review_signature(plan, rows=None) -> str:
-    """What the "plan ready" ping tracks: the three lists only; the waiting count moves as lookups drain."""
-    adds, fixes, check = _lists(plan, rows)
-    return hashlib.sha256(json.dumps([adds, fixes, check], ensure_ascii=False).encode("utf-8")).hexdigest()
+def _signature(*parts) -> str:
+    return hashlib.sha256(json.dumps(parts, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def review_body(plan, rows=None) -> tuple[str, dict]:
-    """The dry-run task text (deterministic) and its counts. `rows` maps TA game id -> its collection row."""
-    adds, fixes, check = _lists(plan, rows)
+def review_body(plan, rows=None, lists=None) -> tuple[str, dict]:
+    """The dry-run task text (deterministic) and its counts. `rows` maps TA game id -> its collection row;
+    `lists` the (add, fix, check) entries when carried-forward ones are wanted."""
+    adds, fixes, check = lists if lists is not None else _lists({}, plan, rows)
     counts = {"would_add": len(adds), "would_fix": len(fixes), "check": len(check), "ok": plan.ok,
               "waiting": len(plan.lookups)}
     lines = [
@@ -68,26 +86,20 @@ def review_body(plan, rows=None) -> tuple[str, dict]:
     return "\n".join(lines), counts
 
 
-def _unseen(plan, seen) -> list:
-    return sorted((r for r in plan.review if r.pid not in seen and r.kind != "no-page"),
-                  key=lambda r: (r.title, r.pid, r.kind))
+def _unseen(check, seen) -> list:
+    """Check entries to list live: not seen at go-live and not "no-page"; a mistyped override always shows."""
+    return [c for c in check if c[2] == "override" or (c[1] not in seen and c[2] != "no-page")]
 
 
-def check_body(plan, seen) -> str | None:
-    """The live "check by hand" task text: review items not seen at go-live, no-page games never. None when empty."""
-    items = _unseen(plan, set(seen))
+def check_body(check, seen) -> str | None:
+    """The live "check by hand" task text from the check entries. None when nothing is left to list."""
+    items = _unseen(check, set(seen))
     if not items:
         return None
-    lines = [f"{len(items)} game(s) bought since the library sync went live need a look. Nothing is written for "
-             "them. Fix one with a `library` override keyed by its Store product ID "
-             "(`{\"<productId>\": {\"ta\": \"<slug>\" | \"skip\"}}`)."]
-    lines += [f"- {r.title} (`{r.pid}`): {r.reason}" for r in items]
+    lines = [f"{len(items)} game(s) need a look. Nothing is written for them. Fix one with a `library` override "
+             "keyed by its Store product ID (`{\"<productId>\": {\"ta\": \"<slug>\" | \"skip\"}}`)."]
+    lines += [f"- {t} (`{p}`): {why}" for t, p, k, why in items]
     return "\n".join(lines)
-
-
-def _check_signature(plan, seen) -> str:
-    items = [[r.title, r.pid, r.kind] for r in _unseen(plan, set(seen))]
-    return hashlib.sha256(json.dumps(items, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def baseline(lib: dict, plan, *, dry: bool) -> None:
@@ -112,42 +124,47 @@ def _task(run, key: str, title: str, body: str | None) -> bool | None:
 
 
 def report_plan(run, res, lib: dict, plan, rows: list) -> None:
-    by_id = {r.ta_id: r for r in rows}
+    lists = _lists(lib, plan, {r.ta_id: r for r in rows})
     if res.dry_run:
-        _dry(run, lib, plan, by_id)
+        _dry(run, lib, plan, lists)
     else:
-        _live(run, res, lib, plan)
+        _live(run, res, lib, lists)
 
 
-def _dry(run, lib: dict, plan, rows: dict) -> None:
+def _dry(run, lib: dict, plan, lists) -> None:
     lib.pop("check_sig", None)
     _task(run, LIBRARY_CHECK_KEY, LIBRARY_CHECK_TITLE, None)
-    body, counts = review_body(plan, rows)
-    sig = review_signature(plan, rows)
+    body, counts = review_body(plan, lists=lists)
+    sig = _signature(*lists)
     if _task(run, LIBRARY_REVIEW_KEY, LIBRARY_REVIEW_TITLE, body) is None:
         return
-    if sig != lib.get("review_sig"):  # pinged only when the lists change, not the waiting count
+    if plan.lookups:
+        return  # the pass is still growing the lists: one ping, when the plan is complete
+    if sig != lib.get("review_sig"):
         lib["review_sig"] = sig
         if counts["would_add"] or counts["would_fix"] or counts["check"]:
             run.notify("Library sync plan ready",
                        f"Dry run: would add {counts['would_add']} to the TA library; would fix "
-                       f"{counts['would_fix']}; check by hand {counts['check']}; waiting for a lookup "
-                       f"{counts['waiting']}.\nReview the plan in Vikunja (Wishlist Sync).")
+                       f"{counts['would_fix']}; check by hand {counts['check']}.\n"
+                       "Review the plan in Vikunja (Wishlist Sync).")
 
 
-def _live(run, res, lib: dict, plan) -> None:
+def _live(run, res, lib: dict, lists) -> None:
     lib.pop("review_sig", None)  # a later dry run pings its first plan again
     _task(run, LIBRARY_REVIEW_KEY, LIBRARY_REVIEW_TITLE, None)
-    seen = lib.get("seen") or ()
-    body = check_body(plan, seen)
+    seen = set(lib.get("seen") or ())
+    check = lists[2]
+    body = check_body(check, seen)
     if _task(run, LIBRARY_CHECK_KEY, LIBRARY_CHECK_TITLE, body) is not None:
         if body is None:
             lib.pop("check_sig", None)
         else:
-            sig = _check_signature(plan, seen)
+            items = _unseen(check, seen)
+            sig = _signature([[t, p, k] for t, p, k, _ in items])
             if sig != lib.get("check_sig"):
                 lib["check_sig"] = sig
-                run.notify(f"Library sync: {len(_unseen(plan, set(seen)))} to check by hand", body)
+                run.notify(f"Library sync: {len(items)} to check by hand",
+                           "\n".join(f"- {t}" for t, *_ in items) + "\nSee the task in Vikunja (Wishlist Sync).")
     if res.written:
         run.notify("Library sync", f"+{len(res.written)} TA library\n"
                    + "\n".join(f"- {t}" for t in sorted(res.written)))
