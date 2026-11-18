@@ -117,8 +117,9 @@ class Config:
     library_after: dtime = LIBRARY_AFTER  # WSYNC_LIBRARY_AFTER (UTC): the daily pass starts at the first run past it
     xbox_refresh_token: str = field(default="", repr=False)  # XBOX_REFRESH_TOKEN: the Microsoft sign-in seed
     xbox_token: Path = Path("/state/xbox-token.json")  # WSYNC_XBOX_TOKEN: the rotating refresh token's file
-    library_budget: int = 25  # games written on TrueAchievements per run
-    library_lookups: int = 10  # games whose TrueAchievements pages are looked up per run
+    library_budget: int = 25  # WSYNC_LIBRARY_BUDGET: games written on TrueAchievements per run
+    library_lookups: int = 10  # WSYNC_LIBRARY_LOOKUPS: games whose TrueAchievements pages are looked up per run
+    library_lookups_per_day: int = 40  # WSYNC_LIBRARY_LOOKUPS_PER_DAY: the same per UTC day, across its runs
 
     @property
     def state_dir(self) -> Path:
@@ -171,6 +172,16 @@ def _int_env(env, name: str) -> int | None:
         return int(raw)
     except ValueError:
         raise ConfigError(f"{name} must be a whole number") from None
+
+
+def _count_env(env, name: str, default: int) -> int:
+    """A count (0 or more) from the environment; `default` when unset or empty."""
+    value = _int_env(env, name)
+    if value is None:
+        return default
+    if value < 0:
+        raise ConfigError(f"{name} must be 0 or more")
+    return value
 
 
 def config_from(argv: list[str], env) -> Config:
@@ -232,6 +243,9 @@ def config_from(argv: list[str], env) -> Config:
         library_after=library_after if library_after is not None else LIBRARY_AFTER,
         xbox_refresh_token=(env.get("XBOX_REFRESH_TOKEN") or "").strip(),
         xbox_token=Path(env.get("WSYNC_XBOX_TOKEN") or "/state/xbox-token.json"),
+        library_budget=_count_env(env, "WSYNC_LIBRARY_BUDGET", Config.library_budget),
+        library_lookups=_count_env(env, "WSYNC_LIBRARY_LOOKUPS", Config.library_lookups),
+        library_lookups_per_day=_count_env(env, "WSYNC_LIBRARY_LOOKUPS_PER_DAY", Config.library_lookups_per_day),
     )
 
 

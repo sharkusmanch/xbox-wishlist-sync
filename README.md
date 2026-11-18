@@ -65,6 +65,9 @@ report.
 | `WSYNC_LIBRARY_AFTER` | `HH:MM` (UTC, default `11:30`): the library step's daily pass starts at the first run past this time (before TA's own purchase import and the collection step's read) |
 | `XBOX_REFRESH_TOKEN` | The Microsoft sign-in's **seed**: a refresh token used only when the token file has none that works, or when it is new (see "Microsoft sign-in") |
 | `WSYNC_XBOX_TOKEN` | The rotating Microsoft refresh token's file (default `/state/xbox-token.json`, mode 600) |
+| `WSYNC_LIBRARY_LOOKUPS` | The library step's TA page lookups per run, in games (default 10) |
+| `WSYNC_LIBRARY_LOOKUPS_PER_DAY` | The same per UTC day, across the day's runs (default 40) |
+| `WSYNC_LIBRARY_BUDGET` | The library step's TA writes per run, in games (default 25) |
 | `COLLECTION_360_DRY_RUN` | Xbox 360 games in the collection step: `true` (default) lists them in their own review task; `false` adds them. A dry collection step is always dry here too |
 
 Credentials come only from the environment. They are never logged, put in a notification or task,
@@ -242,10 +245,14 @@ title key equals that of a Collections game (a bundled copy of a modern game) ne
 
 A missing game's TA page is found by guessing addresses from the title (platform phrases and
 trailing tiers stripped; at most **6 candidates** per game; Windows too for a PC-only game), or the
-`library` override's slug alone. At most **10 games a run** are looked up, **4 s** before every TA
-request, none past the 45-minute write deadline. Results are cached per game: 7 days, 30 days for a
-game with no page or a product already seen at go-live (a changed address set or override is looked
-up again). **No page** means HTTP 404 or TA's page-not-found page (marker `PageNotFound404`).
+`library` override's slug alone. At most **10 games a run** (`WSYNC_LIBRARY_LOOKUPS`) and **40 a
+UTC day** across the day's runs (`WSYNC_LIBRARY_LOOKUPS_PER_DAY`) are looked up: games never looked
+up first, then the expired re-lookups, the oldest first; **4 s** before every TA request, none past
+the 45-minute write deadline. Results are cached per game, each lifetime with a stable offset per
+product (from a hash of its first product id) so that games looked up together don't expire
+together: found pages **30-44 days** for a product seen at go-live and **7-10 days** otherwise (every
+product while the step is dry), no page **90-120 days**; a changed address set or override is looked
+up again. **No page** means HTTP 404 or TA's page-not-found page (marker `PageNotFound404`).
 What every address would meet stops the lookups quietly for the run, nothing cached, so a throttled
 day never turns into months of "no page": network or Cloudflare trouble, TA unavailable or
 throttling (HTTP 429, 502-504 or Cloudflare's 52x, a page with no game id such as a maintenance
@@ -257,8 +264,8 @@ more up until the next day's pass, so a TA-wide change is at most 3 issues a day
 
 ### Writes
 
-Live only (`LIBRARY_DRY_RUN` `false`). At most **25 games a run**, 4 s before each TA request, none
-started past the write deadline. Each write goes into state **before** its first request
+Live only (`LIBRARY_DRY_RUN` `false`). At most **25 games a run** (`WSYNC_LIBRARY_BUDGET`), 4 s
+before each TA request, none started past the write deadline. Each write goes into state **before** its first request
 (write-ahead, with what the plan saw), is checkpointed after each request, and removed after its
 last; one left behind by a crash or stop is completed **at most once per pass** and never blocks
 the reads, the plan or other writes. An add whose game TA already lists is never written
@@ -297,11 +304,21 @@ above, not a failure. Reporting trouble (Vikunja) is an issue of its own and nev
 
 ### TA traffic it adds
 
-A first run of a day: the Microsoft calls (not TA), the weekly two property-list reads (about
-1-2 pages each), one Game Collection read (about 16 pages), then at most 10 games x 6 candidates
-page lookups and 25 games' writes (a page read, then a post or two each), all paced at 4 s. A
-catch-up spreads over several runs; a steady day reads about 16 pages once. TA has withheld
-won/not-won data from this IP after heavy automated traffic, so keep these budgets.
+Every TA request is paced 4 s after the one before. A day's pass reads the Game Collection once
+(about 17 pages) and, at most weekly, TA's Games with Gold (about 5 pages) and EA Play lists. Page
+lookups: at most `WSYNC_LIBRARY_LOOKUPS` games a run (default 10) and `WSYNC_LIBRARY_LOOKUPS_PER_DAY`
+a UTC day (default 40), at most 6 addresses each. Writes: at most `WSYNC_LIBRARY_BUDGET` games a run
+(default 25), about **5 requests** each (an add: the game page, its postback, then per field an
+EditOptions read and, when the field changes, an UpdateGame; a fix: the same per field). All three
+take a whole number, 0 or more.
+
+The first pass over the current library has about 200 games to look up (about 800 addresses): at 40
+games a day it fills in over about 5 days, about 160 page requests a day (at most 240, and at most
+60 in one run). The results then expire spread out by product rather than together: found pages
+after 30-44 days (7-10 for products not seen at go-live, so every product while the step is dry), no
+page after 90-120 days, all under the same daily cap. A steady day reads the collection once plus a
+few re-lookups. TA withheld won/not-won data from this IP after heavy automated traffic
+(2026-11-15), so keep these budgets.
 
 ## Deku collection step
 

@@ -44,11 +44,13 @@ class State:
     #   "signin_failed": {"day": "YYYY-MM-DD", "seed": SHA-256 of XBOX_REFRESH_TOKEN}  a sign-in that needed a new
     #              token: not tried again that day with the same seed; removed by a working sign-in;
     #   "pass": {"day": "YYYY-MM-DD", "rows": [OwnedRow as dict], "done": [TA game id], "errors": n,
-    #            "lookup_failed": [lookup key], "lookup_errors": n}  the TA collection the day's pass read in its
-    #              first run, the TA ids it has written since, the write-error streak, the games whose page lookup
-    #              failed in the pass and the lookup-error streak; dropped when it completes;
+    #            "lookups": n, "lookup_failed": [lookup key], "lookup_errors": n}  the TA collection the day's pass
+    #              read in its first run, the TA ids it has written since, the write-error streak, the page lookups
+    #              started that day (the daily cap), the games whose lookup failed in the pass and the lookup-error
+    #              streak; dropped when it completes;
     #   "lists": {"games-with-gold" | "ea-play": {"fetched": iso, "ids": [TA game id], "tried": iso}};
-    #   "pages": {lookup key: {"checked": iso, "slugs": [addresses tried], "pages": [TAGame as dict]}};
+    #   "pages": {lookup key: {"checked": iso, "slugs": [addresses tried], "pages": [TAGame as dict]}}, each
+    #              reused for its `library.lookup_lifetime`, dropped after 180 days;
     #   "writing": {TA game id: {"kind", "slug", "ta_id", "title", "sets", "expect" (the labels the plan saw per
     #              field), "pids", "since", "added", "sets_done", "tried" (the pass day a write error kept it)}}
     #              write-ahead: saved before a write's first request and after each, removed after its last;

@@ -1144,6 +1144,20 @@ def test_config_library_switches():
             config_from([], {**env, "WSYNC_LIBRARY_AFTER": bad})
 
 
+def test_config_library_budgets_from_the_environment():
+    env = {"DEKU_EMAIL": "e", "TA_GAMERTAG": "g"}
+    cfg = config_from([], env)
+    assert (cfg.library_lookups, cfg.library_lookups_per_day, cfg.library_budget) == (10, 40, 25)
+    cfg = config_from([], {**env, "WSYNC_LIBRARY_LOOKUPS": " 4 ", "WSYNC_LIBRARY_LOOKUPS_PER_DAY": "60",
+                           "WSYNC_LIBRARY_BUDGET": "0"})
+    assert (cfg.library_lookups, cfg.library_lookups_per_day, cfg.library_budget) == (4, 60, 0)
+    assert config_from([], {**env, "WSYNC_LIBRARY_BUDGET": ""}).library_budget == 25  # empty: the default
+    for name in ("WSYNC_LIBRARY_LOOKUPS", "WSYNC_LIBRARY_LOOKUPS_PER_DAY", "WSYNC_LIBRARY_BUDGET"):
+        for bad in ("-1", "ten", "2.5"):
+            with pytest.raises(ConfigError, match=name):
+                config_from([], {**env, name: bad})
+
+
 def test_the_xbox_seed_is_a_secret_but_never_required():
     cfg = Config(**SECRETS, xbox_refresh_token="rt seed/+value")
     assert {"rt seed/+value", "rt+seed%2F%2Bvalue", "rt%20seed%2F%2Bvalue", "rt+seed/+value"} <= set(cfg.secrets())

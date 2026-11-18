@@ -145,6 +145,15 @@ def lookup_key(game: OwnedGame) -> str:
     return min(game.pids)
 
 
+def lookup_lifetime(key: str, kind: str) -> timedelta:
+    """How long a lookup result of `kind` ("found", "seen", "no-page") for the lookup key `key` is reused: its base
+    days plus an offset of 0..spread days from a SHA-256 of the key, the same in every run (never Python's
+    per-process hash())."""
+    base, spread = LIFETIMES[kind]
+    offset = int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8], "big") % (spread + 1)
+    return timedelta(days=base + offset)
+
+
 def _no_platform(title: str) -> str:
     """The title without a platform tag or a trailing platform phrase ("for Xbox Series X|S", "Xbox One & Xbox
     Series X|S"), as the title keys drop them, its case kept."""
@@ -434,8 +443,12 @@ def plan_library(games: list[OwnedGame], ta_rows: list[OwnedRow], pages: dict[st
 
 PACE = 4.0  # seconds before each TrueAchievements request the step makes
 READ_RETRY = timedelta(hours=6)  # after a failed Microsoft or TA read, no new read for this long
-PAGES_FRESH = timedelta(days=7)  # a game's looked-up pages are reused this long,
-PAGES_FRESH_LONG = timedelta(days=30)  # or this long for a game with no page or a seen product
+# How long a game's looked-up pages are reused, in days: a base plus a stable per-product offset of 0..spread days
+# (`lookup_lifetime`), so that results looked up together don't all expire together.
+LIFETIMES = {"found": (7, 3),  # pages found for a product not seen at go-live (every product, in a dry run)
+             "seen": (30, 14),  # pages found for a product seen at go-live (decision A)
+             "no-page": (90, 30)}  # no TA page at any address
+PAGES_KEEP = timedelta(days=180)  # a cached lookup older than this is dropped (its game is gone, or its key changed)
 LISTS_FRESH = timedelta(days=7)  # TA's Games with Gold and EA Play lists are read at most weekly
 MAX_WRITE_ERRORS = 3  # TA write errors without a successful write between them: the pass's writes stop
 MAX_LOOKUP_ERRORS = 3  # failed page lookups without a successful one between them: the pass's lookups stop
@@ -711,12 +724,13 @@ def _without(done: set[int], plan: LibraryPlan) -> LibraryPlan:
 
 def _cached_pages(lib: dict, games: list[OwnedGame], overrides: dict[str, dict],
                   now: datetime) -> dict[str, list[TAGame]]:
-    """The cached lookups that still hold for the games as they are now, by lookup key: fresh (PAGES_FRESH, or
-    PAGES_FRESH_LONG with no page or a seen product) and made at the addresses the game has now, so a new or
-    changed override is looked up again. Entries too old to be used again are dropped."""
+    """The cached lookups that still hold for the games as they are now, by lookup key: within their lifetime
+    (`lookup_lifetime`: "no-page" without a page, "seen" for a product seen at go-live, else "found") and made at
+    the addresses the game has now, so a new or changed override is looked up again. Entries older than PAGES_KEEP
+    are dropped."""
     cache = lib.setdefault("pages", {})
     for key in [k for k, e in cache.items()
-                if not (isinstance(e, dict) and _within(e.get("checked"), now, PAGES_FRESH_LONG))]:
+                if not (isinstance(e, dict) and _within(e.get("checked"), now, PAGES_KEEP))]:
         del cache[key]
     seen = set(lib.get("seen") or ())
     out: dict[str, list[TAGame]] = {}
@@ -729,9 +743,23 @@ def _cached_pages(lib: dict, games: list[OwnedGame], overrides: dict[str, dict],
             pages = [TAGame(**{**p, "platforms": tuple(p.get("platforms") or ())}) for p in entry.get("pages") or ()]
         except (TypeError, AttributeError):
             continue  # unreadable: looked up again
-        if _within(entry.get("checked"), now, PAGES_FRESH_LONG if not pages or seen & set(g.pids) else PAGES_FRESH):
+        kind = "no-page" if not pages else "seen" if seen & set(g.pids) else "found"
+        if _within(entry.get("checked"), now, lookup_lifetime(key, kind)):
             out[key] = pages
     return out
+
+
+def _queue(lib: dict, lookups: list[OwnedGame], overrides: dict[str, dict], skip) -> list[OwnedGame]:
+    """The games to look up, in order: those never looked up at the addresses they have now first (in title order),
+    then the expired re-lookups, the oldest first; none whose key is in `skip`."""
+    cache = lib.get("pages") or {}
+
+    def order(g: OwnedGame) -> tuple[int, float]:
+        entry = cache.get(lookup_key(g))
+        same = isinstance(entry, dict) and entry.get("slugs") == candidate_slugs(g, override_for(g, overrides))
+        when = _when(entry.get("checked")) if same else None
+        return (0, 0.0) if when is None else (1, when.timestamp())
+    return sorted((g for g in lookups if lookup_key(g) not in skip), key=order)
 
 
 def _look_up(run, ta, lib: dict, plan: LibraryPlan, overrides: dict[str, dict], now: datetime,
@@ -745,19 +773,30 @@ def _look_up(run, ta, lib: dict, plan: LibraryPlan, overrides: dict[str, dict], 
     address, a page that doesn't parse, any other exception) fails that game's lookup for the pass: an issue naming
     it and its product ids, the game out of the pass's lookups (`pass["lookup_failed"]`, tried again in the next
     day's pass), and the next game goes on, until MAX_LOOKUP_ERRORS failures come without a successful lookup between
-    them (`pass["lookup_errors"]`): then the pass looks nothing more up."""
+    them (`pass["lookup_errors"]`): then the pass looks nothing more up.
+
+    Order and limits: games never looked up first, then the expired re-lookups, the oldest first (`_queue`); at
+    most cfg.library_lookups games a run and cfg.library_lookups_per_day a UTC day across its runs (every lookup
+    started counts, kept in the pass's "lookups")."""
     stored = lib["pass"]  # today's pass: read or made by _pass_rows before any lookup
     failed = stored.setdefault("lookup_failed", [])
     if stored.get("lookup_errors", 0) >= MAX_LOOKUP_ERRORS:
         _lookups_stopped(run, res)
         return
     cache = lib.setdefault("pages", {})
-    queue = [g for g in plan.lookups if lookup_key(g) not in failed]
+    queue = _queue(lib, plan.lookups, overrides, set(failed))
+    per_day = max(run.cfg.library_lookups_per_day, 0)
     for g in queue[:max(run.cfg.library_lookups, 0)]:
+        if stored.get("lookups", 0) >= per_day:
+            waiting = len(queue) - res.looked_up - len(res.lookup_failed)
+            run.say(f"library: today's lookup limit ({per_day} games) is reached; {waiting} games wait for the next "
+                    "day's pass")
+            return
         if run.past_deadline():
             res.stopped = "write deadline"
             run.say("library: lookups stopped at the write deadline; the rest next run", logging.WARNING)
             return
+        stored["lookups"] = stored.get("lookups", 0) + 1
         found: list[TAGame] = []
         try:
             slugs = candidate_slugs(g, override_for(g, overrides))

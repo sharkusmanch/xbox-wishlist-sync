@@ -458,15 +458,18 @@ def test_page_lookups_are_budgeted_and_cached(tmp_path):
     h.ta.calls.clear()
     h.now = NOW + DAY
     assert h.run() == 0 and looked_up(h.ta.calls) == []  # every result is cached
-    h.now = NOW + 8 * DAY
-    assert h.run() == 0 and looked_up(h.ta.calls) == ["Example-Finding"]  # a found page: 7 days
+    h.now = NOW + 11 * DAY
+    assert h.run() == 0 and looked_up(h.ta.calls) == ["Example-Finding"]  # a found page: 7-10 days
     h.ta.calls.clear()
-    h.now = NOW + 31 * DAY
+    h.now = NOW + 89 * DAY
+    assert h.run() == 0 and looked_up(h.ta.calls) == ["Example-Finding"]  # no page: still cached (90-120 days)
+    h.ta.calls.clear()
+    h.now = NOW + 121 * DAY
     assert h.run() == 0
-    assert looked_up(h.ta.calls) == ["Example-Finding"] + seeking[:9]  # no page: 30 days
+    assert looked_up(h.ta.calls) == seeking[:10]  # every no-page result expired: the oldest first
 
 
-def test_a_seen_product_keeps_its_pages_for_30_days(tmp_path):
+def test_a_seen_product_keeps_its_pages_for_30_to_44_days(tmp_path):
     h = library_only(tmp_path, dry=True)
     h.xbox.own(pid(1), "Example Finding")
     h.xbox.own(pid(2), "Example Keeping")
@@ -477,8 +480,11 @@ def test_a_seen_product_keeps_its_pages_for_30_days(tmp_path):
     st.library["seen"] = [pid(2)]
     save_state(h.cfg.state, st)
     h.ta.calls.clear()
-    h.now = NOW + 8 * DAY
+    h.now = NOW + 11 * DAY
     assert h.run() == 0 and looked_up(h.ta.calls) == ["Example-Finding"]
+    h.ta.calls.clear()
+    h.now = NOW + 45 * DAY
+    assert h.run() == 0 and "Example-Keeping" in looked_up(h.ta.calls)
 
 
 def test_a_new_override_is_looked_up_although_the_game_has_a_cached_result(tmp_path, caplog):
@@ -494,6 +500,66 @@ def test_a_new_override_is_looked_up_although_the_game_has_a_cached_result(tmp_p
     assert h.run() == 0
     assert [c[1] for c in h.ta.calls if c[0] == "page"] == ["Example-Finding-Reforged"]
     assert "library: would add Example Finding Reforged (Owned, Digital)" in lines(caplog)
+
+
+def test_lookup_results_expire_by_kind_with_a_stable_per_product_offset():
+    import subprocess
+    import sys
+
+    from wsync.library import lookup_lifetime
+
+    for kind, base, spread in (("no-page", 90, 30), ("seen", 30, 14), ("found", 7, 3)):
+        days = [lookup_lifetime(pid(n), kind).days for n in range(300)]
+        assert set(days) <= set(range(base, base + spread + 1)), kind  # within base + 0..spread days
+        assert len(set(days)) == spread + 1, kind  # spread over the whole range: not expiring together
+    # the same in every run: a hash of the lookup key that doesn't change between processes (not Python's hash())
+    code = ("from wsync.library import lookup_lifetime\n"
+            "print([lookup_lifetime(k, 'no-page').days for k in ('9ZZLIB000001', '9ZZLIB000002', '9ZZLIB000003')])")
+    here = str([lookup_lifetime(k, "no-page").days for k in ("9ZZLIB000001", "9ZZLIB000002", "9ZZLIB000003")])
+    for seed in ("1", "2"):
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
+                             env={**os.environ, "PYTHONHASHSEED": seed})
+        assert out.stdout.strip() == here
+
+
+def test_the_daily_lookup_cap_holds_across_the_days_runs_and_starts_again_the_next_day(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=True, library_lookups=2, library_lookups_per_day=3)
+    seeking = [f"Example-Seeking-{n:02d}" for n in range(1, 7)]
+    for n in range(1, 7):
+        h.xbox.own(pid(n), f"Example Seeking {n:02d}")
+    got = []
+    for hour in (12, 13, 14):
+        h.ta.calls.clear()
+        h.now = NOW.replace(hour=hour, minute=7)
+        assert h.run() == 0
+        got.append(looked_up(h.ta.calls))
+    assert got == [seeking[:2], seeking[2:3], []]  # 3 games a UTC day, whatever the runs
+    assert any("today's lookup limit" in m for m in lines(caplog))
+    assert "last_pass" not in library_state(h)  # 3 games still wait: the pass goes on
+    h.ta.calls.clear()
+    h.now = NOW.replace(hour=12, minute=7) + DAY
+    assert h.run() == 0 and looked_up(h.ta.calls) == seeking[3:5]  # a new UTC day: the cap starts again
+
+
+def test_games_never_looked_up_come_before_expired_re_lookups_and_the_oldest_first(tmp_path):
+    h = library_only(tmp_path, dry=True, library_lookups=1)
+    h.xbox.own(pid(1), "Example Zed")
+    h.ta.pages["Example-Zed"] = page(901, "Example Zed")
+    assert h.run() == 0 and looked_up(h.ta.calls) == ["Example-Zed"]
+    h.xbox.own(pid(2), "Example Aged")  # first in title order
+    h.ta.pages["Example-Aged"] = page(902, "Example Aged")
+    h.ta.calls.clear()
+    h.now = NOW + 2 * DAY
+    assert h.run() == 0 and looked_up(h.ta.calls) == ["Example-Aged"]
+    h.xbox.own(pid(3), "Example Newcomer")
+    got = []
+    for i in range(3):  # day 14: both found pages expired (7-10 days)
+        h.ta.calls.clear()
+        h.now = NOW + 13 * DAY + i * H
+        assert h.run() == 0
+        got += looked_up(h.ta.calls)
+    assert got == ["Example-Newcomer", "Example-Zed", "Example-Aged"]  # new, then the oldest re-lookup first
 
 
 @pytest.mark.parametrize("error", [
@@ -1255,10 +1321,10 @@ def test_a_weekly_relookup_cycle_does_not_ping_an_unchanged_plan(tmp_path):
         h.run()
     assert len(h.reporter.notes) == 1 and library_state(h)["last_pass"] == "2026-11-01"
     first = tasks(h, "library-review:dry-run")[-1]
-    for i in range(3):  # day 9: every page expired, re-looked up one a run
-        h.now = NOW + 8 * DAY + i * H
+    for i in range(3):  # day 12: every page expired (7-10 days), re-looked up one a run
+        h.now = NOW + 11 * DAY + i * H
         h.run()
-    assert library_state(h)["last_pass"] == "2026-11-09"
+    assert library_state(h)["last_pass"] == "2026-11-12"
     assert len(h.reporter.notes) == 1  # the plan never changed
     assert tasks(h, "library-review:dry-run")[-1].count("Example Finding") == first.count("Example Finding")
 
@@ -1278,8 +1344,8 @@ def test_a_blocked_relookup_of_a_listed_item_keeps_the_check_task_and_pings_once
     assert h.run() == 0
     assert "Example Saga" in tasks(h, "library-check")[-1]
     assert [t for t, _ in h.reporter.notes] == ["Library sync: 1 to check by hand"]
-    h.ta.fail_page["Example-Saga"] = Unreachable("network error: ConnectionError")  # its weekly re-lookup is blocked
-    h.now = NOW + 8 * DAY
+    h.ta.fail_page["Example-Saga"] = Unreachable("network error: ConnectionError")  # its re-lookup is blocked
+    h.now = NOW + 12 * DAY  # its found page expired (7-10 days after its lookup)
     assert h.run() == 0 and not issue_notes(h)
     assert tasks(h, "library-check")[1:] and None not in tasks(h, "library-check")[1:]
     assert "Example Saga" in tasks(h, "library-check")[-1]
