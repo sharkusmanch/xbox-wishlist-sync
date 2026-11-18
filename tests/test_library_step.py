@@ -8,6 +8,7 @@ import logging
 import os
 import stat
 from datetime import time as dtime, timedelta
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -583,9 +584,11 @@ def test_lookup_results_expire_by_kind_with_a_stable_per_product_offset():
     code = ("from wsync.library import lookup_lifetime\n"
             "print([lookup_lifetime(k, 'no-page').days for k in ('9ZZLIB000001', '9ZZLIB000002', '9ZZLIB000003')])")
     here = str([lookup_lifetime(k, "no-page").days for k in ("9ZZLIB000001", "9ZZLIB000002", "9ZZLIB000003")])
+    root = str(Path(__file__).resolve().parents[1])  # this checkout's wsync, installed or not
+    path = os.pathsep.join(p for p in (root, os.environ.get("PYTHONPATH")) if p)
     for seed in ("1", "2"):
         out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
-                             env={**os.environ, "PYTHONHASHSEED": seed})
+                             env={**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": path})
         assert out.stdout.strip() == here
 
 
@@ -794,6 +797,21 @@ def test_an_add_interrupted_during_its_post_has_its_fields_set_next_run(tmp_path
     assert h.run() == 0
     assert h.ta.writes == [("gc-add", "Example-Finding"), ("gc-set", 901, "media", "Digital")]
     assert library_state(h)["writing"] == {} and library_state(h)["last_pass"] == "2026-11-01"
+
+
+def test_an_unfinished_add_without_its_expectations_never_overwrites_what_ta_shows(tmp_path):
+    """Completing an add that TA already lists compares with TA's defaults for a new entry, even for a write-ahead
+    entry that lacks its "expect": a status set on TA since (here TA's own import) is left as it is."""
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Finding")
+    h.ta.pages["Example-Finding"] = page(901, "Example Finding")
+    h.ta.owned_rows = [OwnedRow(901, "Example Finding", SX, "Xbox Game Pass Ultimate", "")]
+    save_state(h.cfg.state, State(library={"writing": {"901": {
+        "kind": "add", "slug": "Example-Finding", "ta_id": 901, "title": "Example Finding",
+        "sets": [["ownership", "Owned"], ["media", "Digital"]], "pids": [pid(1)]}}}))
+    assert h.run() == 0
+    assert h.ta.writes == [] and h.ta.owned_rows[0].ownership == "Xbox Game Pass Ultimate"
+    assert library_state(h)["writing"] == {}
 
 
 def test_a_write_that_keeps_failing_never_holds_up_the_step(tmp_path):

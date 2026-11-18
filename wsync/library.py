@@ -465,6 +465,7 @@ PAGES_KEEP = timedelta(days=180)  # a cached lookup older than this is dropped (
 LISTS_FRESH = timedelta(days=7)  # TA's Games with Gold and EA Play lists are read at most weekly
 MAX_WRITE_ERRORS = 3  # TA write errors without a successful write between them: the pass's writes stop
 MAX_LOOKUP_ERRORS = 3  # failed page lookups without a successful one between them: the pass's lookups stop
+NEW_ENTRY = {"ownership": [OWNED], "media": [""]}  # what TA shows for an entry just added (compare-and-set)
 GWG_LIST, EA_LIST = "games-with-gold", "ea-play"
 
 
@@ -987,7 +988,7 @@ class _Writer:
         """The write-ahead of an action, with what the plan saw of each field it sets: TA's defaults for a new
         entry (Owned, no media), else the entry as the collection read showed it."""
         if a.kind == "add":
-            expect = {"ownership": [OWNED], "media": [""]}
+            expect = {k: list(v) for k, v in NEW_ENTRY.items()}  # its own copy: it goes into state
         else:
             row = rows[a.ta_id]  # a fix is always of an entry the read listed
             expect = {"ownership": [row.ownership], "media": [row.media]}
@@ -1025,7 +1026,8 @@ class _Writer:
         game_id = entry.get("ta_id")
         try:
             game_id = int(game_id)
-            expect = entry.get("expect") or {}
+            # an add's fields compare with TA's defaults for a new entry, even when its write-ahead lacks them
+            expect = entry.get("expect") or (NEW_ENTRY if entry["kind"] == "add" else {})
             if entry["kind"] == "add" and not entry.get("added"):
                 run.sleep(PACE)
                 # a fresh add refuses a game TA already lists (AlreadyListed); an unfinished one may have reached TA
