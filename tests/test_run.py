@@ -147,6 +147,7 @@ class FakeTA:
         # the library step: every request in order (with the run's sleeps, when a test routes them here)
         self.calls = []
         self.list_ids = {}  # TA property list slug -> game ids
+        self.list_pages = {}  # TA property list slug -> its number of pages (default 1)
         self.fail_list = {}  # slug -> exception from property_list()
         self.fail_page = {}  # slug -> exception from game_page_or_none()
         self.fail_add = {}  # slug -> exception from collection_add()
@@ -162,10 +163,14 @@ class FakeTA:
             raise self.fail_collection
         return list(self.owned_rows)
 
-    def property_list(self, slug):
-        self.calls.append(("list", slug))
-        if slug in self.fail_list:
-            raise self.fail_list[slug]
+    def property_list(self, slug, *, pause=None):
+        """One ("list", slug) request a page, each after `pause()` (as the client calls it)."""
+        for _ in range(self.list_pages.get(slug, 1)):
+            if pause:
+                pause()
+            self.calls.append(("list", slug))
+            if slug in self.fail_list:
+                raise self.fail_list[slug]
         return list(self.list_ids.get(slug, []))
 
     def game_page_or_none(self, slug):

@@ -1217,6 +1217,15 @@ def test_property_list_reads_every_page_and_refuses_an_empty_or_home_page():
         c.property_list("nope")
 
 
+def test_property_list_pauses_before_each_page():
+    p1, p2 = list(range(1, 101)), list(range(101, 131))
+    c, http = logged_in({("GET", "/example-list/games?page=1"): resp(list_page(p1, "example-list", 2)),
+                         ("GET", "/example-list/games?page=2"): resp(list_page(p2, "example-list", 2))})
+    before = []
+    assert c.property_list("example-list", pause=lambda: before.append(len(http.calls))) == p1 + p2
+    assert before == [0, 1]  # before the first page's request and before the second's
+
+
 def test_property_list_never_reads_beyond_max_pages():
     c, http = logged_in({("GET", "/example-list/games"): resp(list_page(range(1, 101), "example-list", 9))})
     with pytest.raises(IncompleteRead, match="max_pages"):

@@ -266,6 +266,55 @@ def test_a_pass_spanning_three_runs_reads_the_ta_collection_once(tmp_path):
     assert lib["last_pass"] == "2026-11-01" and "pass" not in lib  # dropped once the pass is complete
 
 
+def test_a_pass_spanning_three_runs_signs_in_and_reads_microsoft_once(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    for n in range(1, 56):  # 55 writes, 25 a run: three runs
+        h.xbox.own(pid(n), f"Example Mending {n:02d}")
+        h.ta.owned_rows.append(wrong(500 + n, f"Example Mending {n:02d}"))
+    assert h.run() == 0
+    first = list(h.xbox.calls)
+    reads = [u for _, u in first if u.startswith((xbox.COLLECTIONS_URL, xbox.ORDERS_URL, xbox.CATALOG_URL))]
+    assert len(reads) == 1 + 6 + 3  # one Collections page, six orders pages, three catalog batches
+    for i in (1, 2):
+        h.now = NOW + i * H
+        assert h.run() == 0
+    assert h.xbox.calls == first  # the later runs reuse the pass's owned games: no sign-in, no Microsoft read
+    assert h.xbox.refreshed_with == [SEED]
+    assert len(written(h)) == 55 and library_state(h)["last_pass"] == "2026-11-01"
+    h.now = NOW + DAY  # the next day's pass reads Microsoft again
+    assert h.run() == 0 and h.xbox.refreshed_with == [SEED, "rt-rotated-1-Zp"]
+
+
+def test_a_later_run_of_a_pass_retries_closing_the_sign_in_task_without_signing_in(tmp_path):
+    h = library_only(tmp_path, dry=True, library_lookups=1)
+    h.xbox.own(pid(1), "Example Seeking 1")
+    h.xbox.own(pid(2), "Example Seeking 2")  # two lookups, one a run: the pass takes two runs
+    save_state(h.cfg.state, State(library={"signin_task": True}))
+    real = h.reporter.library_task
+
+    def signin_task_down(key, title, body):
+        if key == "library-signin":
+            raise RuntimeError("vikunja down")
+        return real(key, title, body)
+
+    h.reporter.library_task = signin_task_down
+    assert h.run() == 1 and library_state(h)["signin_task"] is True
+    h.reporter.library_task = real
+    microsoft = len(h.xbox.calls)
+    h.now = NOW + H
+    h.run()
+    assert len(h.xbox.calls) == microsoft  # no sign-in: the pass's owned games
+    assert tasks(h, "library-signin") == [None] and "signin_task" not in library_state(h)
+
+
+def test_property_list_pages_are_paced(tmp_path):
+    h = library_only(tmp_path, dry=True)
+    h.ta.list_pages = {"games-with-gold": 5, "ea-play": 2}
+    assert h.run() == 0
+    assert [c for c in h.ta.calls if c[0] == "list"] == [("list", "games-with-gold")] * 5 + [("list", "ea-play")] * 2
+    assert_paced(h.ta.calls)
+
+
 def test_a_new_days_pass_reads_the_ta_collection_again(tmp_path):
     h = library_only(tmp_path, dry=True)
     for n in range(1, 12):  # 11 lookups: the pass doesn't finish on its last run of the day
@@ -688,7 +737,8 @@ def test_a_successful_lookup_resets_the_lookup_error_streak(tmp_path):
 # --------------------------------------------------------------------------- write-ahead, write failures
 
 
-def test_an_add_interrupted_before_its_field_sets_is_completed_next_run(tmp_path):
+def test_an_add_interrupted_before_its_field_sets_is_completed_next_run(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
     h = library_only(tmp_path, dry=False)
     h.xbox.own(pid(1), "Example Finding")
     h.ta.pages["Example-Finding"] = page(901, "Example Finding")
@@ -708,12 +758,15 @@ def test_an_add_interrupted_before_its_field_sets_is_completed_next_run(tmp_path
     assert h.ta.writes == [("gc-add", "Example-Finding")]
     h.ta.on_set = None
     h.ta.calls.clear()
-    h.xbox.journal = h.ta.calls
+    caplog.clear()
+    microsoft = list(h.xbox.calls)
     h.now = NOW + H
     assert h.run() == 0
-    first_write = next(i for i, c in enumerate(h.ta.calls) if c[0] == "gc-set")
-    assert ("collection",) not in h.ta.calls  # the pass's stored read
-    assert any(c[0] == "microsoft" for c in h.ta.calls[:first_write])  # completed in the write phase, after the reads
+    assert ("collection",) not in h.ta.calls and h.xbox.calls == microsoft  # the pass's stored reads
+    said = lines(caplog)
+    plan_line = next(i for i, m in enumerate(said) if m.startswith("library: APPLY;"))
+    # completed in the write phase, after the reads and the plan
+    assert plan_line < said.index("library: completing the unfinished TA write of Example Finding")
     assert not [c for c in h.ta.calls if c[0] == "gc-add"]  # already added: not asked again, nor planned again
     assert h.ta.writes == [("gc-add", "Example-Finding"), ("gc-set", 901, "media", "Digital")]
     assert library_state(h)["writing"] == {} and library_state(h)["last_pass"] == "2026-11-01"
@@ -759,8 +812,8 @@ def test_a_write_that_keeps_failing_never_holds_up_the_step(tmp_path):
     microsoft = len(h.xbox.calls)
     h.ta.calls.clear()
     h.now = NOW + H
-    assert h.run() == 0  # the pass goes on: read, planned, 501 not tried again today
-    assert len(h.xbox.calls) > microsoft and not [c for c in h.ta.calls if c[0] == "gc-set"]
+    assert h.run() == 0  # the pass goes on: planned from its stored reads, 501 not tried again today
+    assert len(h.xbox.calls) == microsoft and not [c for c in h.ta.calls if c[0] == "gc-set"]
     assert library_state(h)["last_pass"] == "2026-11-01"
     h.xbox.own(pid(3), "Example Mending 03")  # a new purchase
     h.ta.owned_rows.append(wrong(503, "Example Mending 03"))

@@ -182,7 +182,9 @@ do than one run allows (page lookups, writes) goes on over the following hourly 
 is left, and then it is complete for the day. A pass reads the TA collection **once**, in its first
 run (it needs its own read; the Deku collection step's cache is not used), keeps the rows in state
 for its later runs, and remembers which TA games it has already written so that re-planning never
-repeats a write. TA's Games with Gold and EA Play lists are read at most weekly.
+repeats a write. Microsoft is read once a pass too: the first run signs in and reads the licences,
+orders and catalog, and the later runs reuse the owned games it found (no sign-in). TA's Games with
+Gold and EA Play lists are read at most weekly.
 
 ### Microsoft sign-in
 

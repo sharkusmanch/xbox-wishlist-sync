@@ -564,7 +564,7 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
         library_report.signin_failed(run, lib, new=False)
         return res
     try:
-        games = _owned(run, http, lib)
+        games = _owned(run, http, lib, today)
         gwg, ea_play = _lists(run, ta, lib, now)
         rows = _pass_rows(run, ta, lib, today)
     except SignInNeeded as e:
@@ -581,6 +581,7 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
         run.issue(text)
         return res
     lib.pop("failed", None)
+    lib["pass"]["owned"] = [asdict(g) for g in games]  # the pass's later runs reuse them: no sign-in, no read
     done = set(lib["pass"].get("done") or ())
     plan = _without(done, plan_library(games, rows, _cached_pages(lib, games, overrides, now), overrides, gwg,
                                        ea_play))
@@ -631,11 +632,20 @@ def _end(run, res: LibraryResult, lib: dict, today: str) -> LibraryResult:
     return res
 
 
-def _owned(run, http, lib: dict) -> list[OwnedGame]:
-    """Microsoft sign-in, licences, orders and the Store catalog -> the owned games. Every token, the XUID and the
-    gamertag go to the scrubber the moment they exist; a working sign-in clears a recorded failed one. SignInNeeded passes
-    through; any other failure is a _ReadFailed: nothing is planned from a partial read. Data that can't be
-    classified is one too, named by its exception type only: the message could quote a price or an order."""
+def _owned(run, http, lib: dict, today: str) -> list[OwnedGame]:
+    """The owned games: those today's pass read in its first run (kept in state.library["pass"]["owned"]), else
+    from a Microsoft sign-in, the licences, orders and the Store catalog. Every token, the XUID and the gamertag go
+    to the scrubber the moment they exist; a working sign-in clears a recorded failed one, and closes the sign-in
+    task (a later run of the pass retries a close that failed, without signing in). SignInNeeded passes through;
+    any other failure is a _ReadFailed: nothing is planned from a partial read. Data that can't be classified is one
+    too, named by its exception type only: the message could quote a price or an order."""
+    stored = lib.get("pass")
+    if isinstance(stored, dict) and stored.get("day") == today:
+        games = _stored_games(stored.get("owned"))
+        if games is not None:
+            library_report.signin_ok(run, lib)
+            run.say(f"library: the owned games as this pass read them from Microsoft ({len(games)} games)")
+            return games
     try:
         s = open_session(http, TokenStore(run.cfg.xbox_token, run.cfg.xbox_refresh_token), run.scrub.add)
         run.scrub.add(s.xuid, s.gamertag)
@@ -657,6 +667,16 @@ def _owned(run, http, lib: dict) -> list[OwnedGame]:
     run.say(f"library: Microsoft: {len(items)} licences, {len(orders)} orders, {len(catalog)} catalog products; "
             f"{len(games)} games owned")
     return games
+
+
+def _stored_games(raw) -> list[OwnedGame] | None:
+    """The owned games kept in the pass state; None when there are none or they can't be read (read again)."""
+    if not isinstance(raw, list):
+        return None
+    try:
+        return [OwnedGame(**{**g, "pids": tuple(g["pids"]), "gen": tuple(g["gen"])}) for g in raw]
+    except (KeyError, TypeError):
+        return None
 
 
 def _product_ids(items: list, orders: list) -> list[str]:
@@ -682,8 +702,7 @@ def _lists(run, ta, lib: dict, now: datetime) -> tuple[set[int], set[int]]:
             out.append(set(ids))
             continue
         try:
-            run.sleep(PACE)
-            got = ta.property_list(slug)
+            got = ta.property_list(slug, pause=lambda: run.sleep(PACE))  # PACE before each of its pages
         except TAError as e:
             if ids is None:
                 raise _ReadFailed(f"library step: TrueAchievements {slug} list read failed, nothing planned or "

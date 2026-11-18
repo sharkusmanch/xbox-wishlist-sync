@@ -879,14 +879,17 @@ class TAClient:
             slug = quote(str(game), safe="")
         return parse_dlc(self._get(f"{BASE}/game/{slug}/dlc", need_login=True).html)
 
-    def property_list(self, slug: str, max_pages: int = 20) -> list[int]:
+    def property_list(self, slug: str, max_pages: int = 20, *, pause=None) -> list[int]:
         """TA game ids of the public `/<slug>/games` list. Never a partial list: IncompleteRead on a
         page with no rows (TA's throttle answer), a page that isn't that list (a wrong slug serves the
-        home page), or a list longer than `max_pages`. The list's end is the highest page its own pagination links."""
+        home page), or a list longer than `max_pages`. The list's end is the highest page its own pagination links.
+        `pause`, when given, is called before each page's request (the caller's pacing)."""
         path = f"/{slug}/games"
         ids: list[int] = []
         last = 1
         for number in range(1, max_pages + 1):
+            if pause is not None:
+                pause()
             body = self._get(f"{BASE}{path}?page={number}", need_login=False).html
             canon = _CANONICAL.search(body)
             if not canon or canon.group(1).split("?")[0].rstrip("/") != BASE + path:
