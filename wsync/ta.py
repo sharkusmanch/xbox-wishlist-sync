@@ -53,6 +53,9 @@ ONE = "Xbox One"
 _LOGGED_OUT = "the gamer must be specified"
 _ALREADY_LISTED = "already on your wishlist"
 _SKIP_INPUT_TYPES = {"checkbox", "radio", "password"}
+_POSTBACK_SKIP_TYPES = _SKIP_INPUT_TYPES | {"submit", "button", "image"}
+COLLECTION_FIELDS = {"ownership": "ddlOwnershipStatusID", "media": "ddlGameMediaID"}
+LIST_PAGE_ROWS = 100  # rows on a full /<slug>/games page
 
 
 class AuthError(TAError):
@@ -206,8 +209,8 @@ def gated(page: str, need_login: bool) -> bool:
     return "Please log in" in page or (need_login and not logged_in(page))
 
 
-def login_form(page: str) -> dict[str, str]:
-    """The `#frm` fields a browser would post, minus checkboxes, radios and the password box."""
+def login_form(page: str, skip: set[str] = _SKIP_INPUT_TYPES) -> dict[str, str]:
+    """The `#frm` fields a browser would post, minus the input types in `skip` (default: checkboxes, radios and the password box)."""
     m = re.search(r'<form[^>]*\bid="frm"[^>]*>(.*?)</form>', page, re.S)
     if not m:
         raise TAError("login page has no form (layout changed?)")
@@ -215,13 +218,51 @@ def login_form(page: str) -> dict[str, str]:
     for tag in re.findall(r"<input\b[^>]*>", m.group(1)):
         name = re.search(r'\bname="([^"]+)"', tag)
         kind = re.search(r'\btype="([^"]+)"', tag)
-        if not name or (kind and kind.group(1).lower() in _SKIP_INPUT_TYPES):
+        if not name or (kind and kind.group(1).lower() in skip):
             continue
         value = re.search(r'\bvalue="([^"]*)"', tag)
         data[html.unescape(name.group(1))] = html.unescape(value.group(1)) if value else ""
     if "__VIEWSTATE" not in data:
         raise TAError("login form has no __VIEWSTATE (layout changed?)")
     return data
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+_GC_BUTTON = re.compile(r"Postback\('btnGC_(Add|Remove)','(\d+)'\)")
+_LIST_ROW = re.compile(r'<tr\b[^>]*\bid="tr(\d+)"')
+_CANONICAL = re.compile(r'<link\b[^>]*\brel="canonical"[^>]*\bhref="([^"]*)"')
+
+
+def parse_collection_page(page: str, slug: str) -> tuple[TAGame, bool]:
+    """(game, in the collection) from a logged-in game page's Add / Remove postback."""
+    game = parse_game(page, slug)
+    m = _GC_BUTTON.search(page)
+    if not m or int(m.group(2)) != game.id:
+        raise TAError(f"game page {slug!r} has no Game Collection button (layout changed?)")
+    return game, m.group(1) == "Remove"
+
+
+def edit_options(fragment: str, game_id: int) -> dict[str, list[tuple[str, str]]]:
+    """{field: [(value, label)]} from a GameCollection_EditOptions HTML fragment."""
+    out: dict[str, list[tuple[str, str]]] = {}
+    for field_name, prefix in COLLECTION_FIELDS.items():
+        m = re.search(r'<select[^>]*\bid="%s_%d"[^>]*>(.*?)</select>' % (prefix, game_id), fragment, re.S)
+        if m:
+            out[field_name] = [(html.unescape(v), html.unescape(t).strip())
+                               for v, t in re.findall(r'<option value="([^"]*)"[^>]*>([^<]*)</option>', m.group(1))]
+    return out
+
+
+def pick_option(options: list[tuple[str, str]], field_name: str, wanted: str) -> tuple[str, str]:
+    """The (value, label) whose label matches `wanted`, ignoring case and punctuation."""
+    hits = [(v, t) for v, t in options if _norm(t) == _norm(wanted)]
+    if len(hits) != 1:
+        how = "matches no option" if not hits else f"matches {len(hits)} options"
+        raise TAError(f"{field_name}={wanted!r} {how}; choose one of: " + ", ".join(t or "none" for _, t in options))
+    return hits[0]
 
 
 _ROW_LINK = re.compile(
@@ -752,6 +793,100 @@ class TAClient:
         else:
             slug = quote(str(game), safe="")
         return parse_dlc(self._get(f"{BASE}/game/{slug}/dlc", need_login=True).html)
+
+    def property_list(self, slug: str, max_pages: int = 20) -> list[int]:
+        """TA game ids of the public `/<slug>/games` list. Never a partial list: IncompleteRead on a
+        page with no rows (TA's throttle answer), a page that isn't that list (a wrong slug serves the
+        home page), or a list longer than `max_pages`."""
+        want = f"{BASE}/{slug}/games"
+        ids: list[int] = []
+        for number in range(1, max_pages + 1):
+            body = self._get(f"{want}?page={number}", need_login=False).html
+            canon = _CANONICAL.search(body)
+            if not canon or not canon.group(1).split("?")[0].rstrip("/") == want:
+                raise IncompleteRead(f"{slug} list page {number} has no canonical link to the list (wrong slug?)")
+            rows = [int(n) for n in _LIST_ROW.findall(body)]
+            if not rows:
+                raise IncompleteRead(f"{slug} list page {number} has no rows (throttled?)")
+            ids += rows
+            if len(rows) < LIST_PAGE_ROWS:
+                return ids
+        raise IncompleteRead(f"{slug} list has more than max_pages={max_pages} pages")
+
+    # ---- collection writes
+
+    def collection_page(self, slug: str) -> tuple[TAGame, bool]:
+        """The logged-in game page, and whether the game is in the Game Collection."""
+        return parse_collection_page(self._get(BASE + "/game/" + quote(slug, safe=""), need_login=True).html, slug)
+
+    def collection_add(self, slug: str) -> int:
+        """Add the game to the Game Collection with the page's own postback; returns its TA id."""
+        url = BASE + "/game/" + quote(slug, safe="")
+        p = self._get(url, need_login=True)
+        game, have = parse_collection_page(p.html, slug)
+        if have:
+            return game.id
+        form = login_form(p.html, _POSTBACK_SKIP_TYPES)
+        form.update({"Command": "btnGC_Add", "Argument": str(game.id)})
+        r, _ = self._send("POST", url, urlencode(form), {
+            "Content-Type": "application/x-www-form-urlencoded", "Origin": BASE, "Referer": url,
+        }, follow=False)
+        if r.status >= 300:
+            raise TAError(f"collection add of {slug!r} answered HTTP {r.status}")
+        if f"Postback('btnGC_Remove','{game.id}')" not in r.text:
+            raise TAError(f"collection add of {slug!r} was not accepted (no Remove button afterwards)")
+        return game.id
+
+    def collection_set(self, game_id: int, field_name: str, label: str) -> None:
+        """Set a Game Collection entry's ownership or media to the option labelled `label`."""
+        _check_id(game_id, zero_ok=False)
+        if field_name not in COLLECTION_FIELDS:
+            raise TAError(f"collection field must be one of: {', '.join(COLLECTION_FIELDS)}")
+        what = f"collection {field_name} of {game_id}"
+        options = edit_options(self._collection_ajax(
+            what, "GameCollection_EditOptions", game_id, {"bDropDownOnly": False}), game_id)
+        if field_name not in options:
+            raise TAError(f"{what}: TA offers no {field_name} dropdown (is the game in the collection?)")
+        value, chosen = pick_option(options[field_name], field_name, label)
+        d = self._collection_ajax(what, "GameCollection_UpdateGame", game_id, {}, {
+            "Field": f"{COLLECTION_FIELDS[field_name]}_{game_id}", "Value": value})
+        got = d.get("UpdateValue") if isinstance(d, dict) else None
+        if _norm(got or "") != _norm(chosen):
+            raise TAError(f"{what}: TA answered {got!r}, expected {chosen!r}")
+
+    def _collection_ajax(self, what: str, method: str, game_id: int, extra: dict, data: dict | None = None):
+        """One GameCollection_* call: its `d`, logging in again once on a logged-out answer."""
+        relogged = False
+        while True:
+            hash_key, gamer_id = self._cookies.get("HashKey"), self._cookies.get("GamerID")
+            if hash_key and gamer_id:
+                payload = {"GameID": game_id, **({"GamerID": gamer_id} if data else {}), "HashKey": hash_key,
+                           **(data or {})}
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": BASE,
+                    "Referer": BASE + self._gamer + "/gamecollection",
+                }
+                r, _ = self._send("POST", AJAX + method, json.dumps({"GameCollection_Data": payload, **extra}),
+                                  headers, follow=False)
+                if r.status >= 300:
+                    raise TAError(f"{what} answered HTTP {r.status}")
+                try:
+                    d = json.loads(r.text)["d"]
+                except (ValueError, KeyError, TypeError):
+                    raise TAError(f"{what} answered something that isn't the expected JSON") from None
+                if isinstance(d, dict) and d.get("errors") and not d.get("UpdateValue"):
+                    text = "; ".join(str(e) for e in (d["errors"] if isinstance(d["errors"], list) else [d["errors"]]))
+                    if _LOGGED_OUT not in text.lower():
+                        raise TAError(f"{what} failed: {text[:200]}")
+                elif isinstance(d, (dict, str)) and not (isinstance(d, str) and _LOGGED_OUT in d.lower()):
+                    return d
+            if relogged:
+                raise AuthError(f"{what}: TrueAchievements session not accepted after a fresh login")
+            relogged = True
+            self.login()
 
     # ---- writes
 
