@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote, quote_plus, urlencode, urljoin, urlsplit
 
+from wsync.d2d import ta_last_page
 from wsync.errors import TAError
 from wsync.flaresolverr import FlareSolverr
 from wsync.plan import Entry
@@ -797,19 +798,21 @@ class TAClient:
     def property_list(self, slug: str, max_pages: int = 20) -> list[int]:
         """TA game ids of the public `/<slug>/games` list. Never a partial list: IncompleteRead on a
         page with no rows (TA's throttle answer), a page that isn't that list (a wrong slug serves the
-        home page), or a list longer than `max_pages`."""
-        want = f"{BASE}/{slug}/games"
+        home page), or a list longer than `max_pages`. The list's end is the highest page its own pagination links."""
+        path = f"/{slug}/games"
         ids: list[int] = []
+        last = 1
         for number in range(1, max_pages + 1):
-            body = self._get(f"{want}?page={number}", need_login=False).html
+            body = self._get(f"{BASE}{path}?page={number}", need_login=False).html
             canon = _CANONICAL.search(body)
-            if not canon or not canon.group(1).split("?")[0].rstrip("/") == want:
+            if not canon or canon.group(1).split("?")[0].rstrip("/") != BASE + path:
                 raise IncompleteRead(f"{slug} list page {number} has no canonical link to the list (wrong slug?)")
             rows = [int(n) for n in _LIST_ROW.findall(body)]
             if not rows:
                 raise IncompleteRead(f"{slug} list page {number} has no rows (throttled?)")
             ids += rows
-            if len(rows) < LIST_PAGE_ROWS:
+            last = max(last, ta_last_page(body, path))
+            if number >= last:
                 return ids
         raise IncompleteRead(f"{slug} list has more than max_pages={max_pages} pages")
 

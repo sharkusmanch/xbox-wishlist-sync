@@ -1177,17 +1177,18 @@ def test_collection_writes_never_follow_a_redirect():
     assert http.urls("GET") == []
 
 
-def list_page(ids, slug="xbox-play-anywhere"):
+def list_page(ids, slug="xbox-play-anywhere", pages=0):
+    links = "".join(f'<a href="/{slug}/games?page={n}">{n}</a>' for n in range(1, pages + 1))
     rows = "".join(f'<tr class="{"even" if i % 2 else "odd"}" id="tr{n}"><td>Game {n}</td></tr>'
                    for i, n in enumerate(ids))
     return (f'<html><head><link rel="canonical" href="{BASE}/{slug}/games"></head>'
-            f'<body><table>{rows}</table></body></html>')
+            f'<body><table>{rows}</table>{links}</body></html>')
 
 
 def test_property_list_reads_every_page_and_refuses_an_empty_or_home_page():
     p1, p2 = list(range(1, 101)), list(range(101, 131))
-    c, http = logged_in({("GET", "/example-list/games?page=1"): resp(list_page(p1, "example-list")),
-                         ("GET", "/example-list/games?page=2"): resp(list_page(p2, "example-list"))})
+    c, http = logged_in({("GET", "/example-list/games?page=1"): resp(list_page(p1, "example-list", 2)),
+                         ("GET", "/example-list/games?page=2"): resp(list_page(p2, "example-list", 2))})
     assert c.property_list("example-list") == p1 + p2
     assert http.urls() == ["/example-list/games?page=1", "/example-list/games?page=2"]
     # a throttled page: 0 rows is never an empty list
@@ -1195,8 +1196,8 @@ def test_property_list_reads_every_page_and_refuses_an_empty_or_home_page():
         list_page([], "example-list").replace("<table></table>", "no games that match these criteria"))})
     with pytest.raises(IncompleteRead):
         c.property_list("example-list")
-    c, _ = logged_in({("GET", "/example-list/games?page=1"): resp(list_page(p1, "example-list")),
-                      ("GET", "/example-list/games?page=2"): resp(list_page([], "example-list"))})
+    c, _ = logged_in({("GET", "/example-list/games?page=1"): resp(list_page(p1, "example-list", 2)),
+                      ("GET", "/example-list/games?page=2"): resp(list_page([], "example-list", 2))})
     with pytest.raises(IncompleteRead):
         c.property_list("example-list")
     # a wrong slug answers the home page
@@ -1209,7 +1210,19 @@ def test_property_list_reads_every_page_and_refuses_an_empty_or_home_page():
 
 
 def test_property_list_never_reads_beyond_max_pages():
-    c, http = logged_in({("GET", "/example-list/games"): resp(list_page(range(1, 101), "example-list"))})
+    c, http = logged_in({("GET", "/example-list/games"): resp(list_page(range(1, 101), "example-list", 9))})
     with pytest.raises(IncompleteRead, match="max_pages"):
         c.property_list("example-list", max_pages=2)
     assert len(http.urls()) == 2
+
+
+def test_property_list_of_exactly_a_full_page_ends_by_its_own_pagination():
+    c, http = logged_in({("GET", "/example-list/games"): resp(list_page(range(1, 101), "example-list"))})
+    assert c.property_list("example-list") == list(range(1, 101))
+    assert len(http.urls()) == 1
+    c, http = logged_in({
+        ("GET", "/example-list/games?page=1"): resp(list_page(range(1, 101), "example-list", 2)),
+        ("GET", "/example-list/games?page=2"): resp(list_page(range(101, 201), "example-list", 2)),
+    })
+    assert c.property_list("example-list") == list(range(1, 201))
+    assert http.urls() == ["/example-list/games?page=1", "/example-list/games?page=2"]
