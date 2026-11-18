@@ -584,3 +584,50 @@ def test_an_unexpected_error_in_the_step_is_an_issue_and_the_state_is_still_save
     assert "library step aborted by an unexpected error: RuntimeError: boom" in h.last_issues()[0]
     lib = library_state(h)
     assert pid(1) in lib["pages"] and list(lib["writing"]) == ["901"]  # what the run learned is kept
+
+
+def test_a_failed_write_ahead_save_writes_nothing(tmp_path, monkeypatch):
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Finding")
+    h.ta.pages["Example-Finding"] = page(901, "Example Finding")
+
+    def broken(self):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("wsync.run._Run.checkpoint", broken)
+    assert h.run() == 1
+    assert h.ta.writes == [] and not [c for c in h.ta.calls if c[0] in ("gc-add", "gc-set")]
+    assert "state not saved before writing Example Finding" in h.last_issues()[0]
+    assert library_state(h)["writing"] == {}  # rolled back: nothing to complete next run
+
+
+def test_unfinished_writes_wait_while_the_step_is_dry(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=True)
+    entry = {"kind": "add", "slug": "Example-Finding", "ta_id": 901, "title": "Example Finding",
+             "sets": [["ownership", "Owned"], ["media", "Digital"]], "pids": [pid(1)]}
+    save_state(h.cfg.state, State(library={"writing": {"901": entry}}))
+    assert h.run() == 0
+    assert h.ta.writes == [] and library_state(h)["writing"] == {"901": entry}
+    assert "library: 1 unfinished TA writes wait for a live run" in lines(caplog)
+
+
+def test_the_start_line_names_the_library_steps_mode(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    start = lambda: next(r.getMessage() for r in caplog.records if r.getMessage().startswith("wsync starting"))
+    h = library_only(tmp_path / "dry", dry=True)
+    h.run()
+    assert "lists: none; library step: DRY RUN; Deku collection step: off" in start()
+    caplog.clear()
+    h = library_only(tmp_path / "live", dry=False)
+    h.run()
+    assert "library step: APPLY" in start()
+    caplog.clear()
+    h = library_only(tmp_path / "forced", dry=True)
+    h.cfg.library_dry_run = False  # a dry run is dry for the step too
+    h.run()
+    assert "library step: DRY RUN" in start()
+    caplog.clear()
+    (tmp_path / "off").mkdir()
+    basic(tmp_path / "off").run()
+    assert "library step: off" in start()
