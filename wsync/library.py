@@ -464,16 +464,21 @@ def _err(e: BaseException) -> str:
     return f"{type(e).__name__}: {text}" if text else type(e).__name__
 
 
-def _within(stamp, now: datetime, span: timedelta) -> bool:
-    """`stamp` (ISO text) is at most `span` before `now` (never in the future)."""
+def _when(stamp) -> datetime | None:
+    """An ISO timestamp from state (UTC when it has no offset); None when there is none or it can't be read."""
     try:
         when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")) if stamp else None
     except ValueError:
-        return False
+        return None
     if when is None:
-        return False
-    when = when if when.tzinfo else when.replace(tzinfo=timezone.utc)
-    return timedelta(0) <= now - when < span
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _within(stamp, now: datetime, span: timedelta) -> bool:
+    """`stamp` (ISO text) is at most `span` before `now` (never in the future)."""
+    when = _when(stamp)
+    return when is not None and timedelta(0) <= now - when < span
 
 
 def _unreachable(e: BaseException) -> bool:
@@ -490,10 +495,10 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
     catalog; TA's subscription lists (weekly) and the TA collection; plan; look up pages; plan again; write
     (live): unfinished writes first, then the plan's. A pass that doesn't finish (lookups or writes left, a stop, a
     failed write) goes on at the next run, with the TA collection its first run read and without the writes it has
-    made. A failed Microsoft or TA read is an issue, repeated without a new read for 6 h. A Microsoft sign-in that
-    needs a new token is not an issue: it isn't tried again before the next day's pass unless XBOX_REFRESH_TOKEN
-    changes. A TA write error is an issue about that game only; Cloudflare or network trouble and the write
-    deadline stop the writes quietly. Other exceptions propagate.
+    made. A failed Microsoft or TA read is an issue; the runs within 6 h of it make no new read and only warn. A
+    Microsoft sign-in that needs a new token is not an issue: it isn't tried again before the next day's pass unless
+    XBOX_REFRESH_TOKEN changes. A TA write error is an issue about that game only; Cloudflare or network trouble
+    and the write deadline stop the writes quietly. Other exceptions propagate.
     """
     if now.tzinfo is None:
         raise ValueError("run_library_step needs a timezone-aware `now`")
@@ -560,14 +565,16 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
 
 
 def _backing_off(run, lib: dict, now: datetime, res: LibraryResult) -> bool:
-    """Within READ_RETRY of a failed read: its issue again, without a read (the failure ping is deduplicated)."""
+    """Within READ_RETRY of a failed read: no read, and only a warning, as the Deku collection step's back-off. The
+    failing run was the issue; repeating it would fail every run of the back-off and trip the stale-sync alert."""
     failed = lib.get("failed") if isinstance(lib.get("failed"), dict) else {}
     if not _within(failed.get("at"), now, READ_RETRY):
         return False
     res.stopped = "read back-off"
-    run.say(f"library: no new read within {READ_RETRY.total_seconds() / 3600:.0f} h of the failed one",
+    hours = (now - _when(failed["at"])).total_seconds() / 3600
+    run.say(f"library: no new read within {READ_RETRY.total_seconds() / 3600:.0f} h of the failed one "
+            f"({hours:.1f} h ago: {failed.get('issue') or 'a Microsoft or TrueAchievements read failed'})",
             logging.WARNING)
-    run.issue(failed.get("issue") or "library step: a Microsoft or TrueAchievements read failed; retried after 6 h")
     return True
 
 

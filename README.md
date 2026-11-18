@@ -284,8 +284,9 @@ on TA is dropped; a partial one stays for the next pass.
 
 A failed Microsoft or TA read (a Microsoft or Store error, an incomplete TA read, data that cannot
 be classified) is an issue (exit 1, with the usual deduplicated failure ping), and is **not
-retried for 6 hours**: the runs in between repeat the same issue without a new read. Nothing is
-planned or written from a partial read. A failed refresh of TA's Games with Gold / EA Play list
+retried for 6 hours**: the runs in between make no new read and only log a warning (no issue, so
+they don't fail the run or trip the stale-sync alert), as the Deku collection step's back-off does.
+Nothing is planned or written from a partial read. A failed refresh of TA's Games with Gold / EA Play list
 keeps the copy in state for up to a week (a warning). A sign-in that needs a new token is the task
 above, not a failure. Reporting trouble (Vikunja) is an issue of its own and never breaks the step.
 
@@ -307,7 +308,7 @@ run:
 1. reads the TrueAchievements Game Collection (once a day, at the first run past `WSYNC_TA_READ_AFTER`, or at most once every 24 h without it; cached in state) and the
    public Deku collection share page. A read that is not complete (rows ≠ the page's own total)
    means no adds that run and a failure; a failed TrueAchievements read is retried 6 h later (the
-   runs in between repeat the same failure without a new read or ping). A fresh TrueAchievements
+   runs in between make no new read and only log a warning: no issue, no ping). A fresh TrueAchievements
    read is not started with less than 10 minutes left before the write deadline (the step waits
    for the next run);
 2. keeps the games TA marks **Owned** on Xbox Series X|S or Xbox One, and the Xbox 360 games it

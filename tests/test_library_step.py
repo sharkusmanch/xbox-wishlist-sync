@@ -288,7 +288,8 @@ def test_a_rotated_token_is_on_the_pvc_after_the_run(tmp_path):
 # --------------------------------------------------------------------------- failed reads
 
 
-def test_a_failed_orders_page_writes_nothing_and_backs_off_6h(tmp_path):
+def test_a_failed_orders_page_writes_nothing_and_backs_off_6h(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
     h = library_only(tmp_path, dry=False)
     for n in range(1, 13):  # two pages of orders
         h.xbox.own(pid(n), f"Example Mending {n:02d}")
@@ -298,10 +299,12 @@ def test_a_failed_orders_page_writes_nothing_and_backs_off_6h(tmp_path):
     assert h.ta.calls == []  # nothing read from TA either
     assert "Microsoft read failed" in h.last_issues()[0] and "HTTP 500" in h.last_issues()[0]
     pings, microsoft = len(h.reporter.notes), len(h.xbox.calls)
+    caplog.clear()
     h.now = NOW + 5 * H
-    assert h.run() == 1  # the issue repeats ...
+    assert h.run() == 0  # the back-off is a warning, not a failed run (no issue) ...
     assert len(h.xbox.calls) == microsoft and h.ta.calls == []  # ... without a new Microsoft or TA request
     assert len(h.reporter.notes) == pings  # ... or a new ping
+    assert any("no new read within 6 h" in m and "HTTP 500" in m for m in lines(caplog))
     del h.xbox.fail["?page=2"]
     h.now = NOW + 6 * H
     assert h.run() == 0
@@ -322,6 +325,30 @@ def test_an_incomplete_ta_read_writes_nothing(tmp_path):
     assert not [c for c in h.ta.calls if c[0] in ("page", "gc-add", "gc-set")]
     lib = library_state(h)
     assert "90 of 100" in lib["failed"]["issue"] and "last_pass" not in lib
+
+
+def test_a_failed_ta_collection_read_backs_off_6h_without_failing_the_runs_between(tmp_path, caplog):
+    """The Deku step's back-off: the failing run is the issue; the runs within 6 h only warn (exit 0)."""
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Mending 01")
+    h.ta.owned_rows = [wrong(501, "Example Mending 01")]
+    h.ta.fail_collection = IncompleteRead("read 90 of 100 collection titles")
+    assert h.run() == 1 and h.ta.collection_calls == 1
+    assert "90 of 100" in h.last_issues()[0]
+    pings, microsoft = len(h.reporter.notes), len(h.xbox.calls)
+    for hours in (1, 3, 5):
+        h.ta.calls.clear()
+        caplog.clear()
+        h.now = NOW + hours * H
+        assert h.run() == 0  # no issue: the stale-sync alert isn't tripped by a back-off
+        assert h.ta.calls == [] and len(h.xbox.calls) == microsoft  # no Microsoft or TA request
+        assert any("no new read within 6 h" in m for m in lines(caplog))
+    assert len(h.reporter.notes) == pings and h.ta.writes == []  # no new ping, nothing written
+    h.ta.fail_collection = None
+    h.now = NOW + 6 * H
+    assert h.run() == 0 and h.ta.collection_calls == 2 and written(h) == [501]
+    assert "failed" not in library_state(h) and library_state(h)["last_pass"] == "2026-11-01"
 
 
 def test_a_failed_sign_in_is_no_issue_pings_once_and_waits_for_the_next_days_pass(tmp_path, caplog):
@@ -392,8 +419,11 @@ def test_a_list_read_failure_without_a_copy_is_an_issue_with_a_back_off(tmp_path
     assert h.run() == 1 and h.ta.writes == [] and h.ta.collection_calls == 0
     assert "ea-play list read failed" in h.last_issues()[0]
     h.ta.fail_list.clear()
+    pings, microsoft = len(h.reporter.notes), len(h.xbox.calls)
+    h.ta.calls.clear()
     h.now = NOW + 5 * H
-    assert h.run() == 1 and h.ta.collection_calls == 0
+    assert h.run() == 0 and h.ta.calls == [] and len(h.xbox.calls) == microsoft  # a warning: no issue, no request
+    assert len(h.reporter.notes) == pings
     h.now = NOW + 6 * H
     assert h.run() == 0 and written(h) == [501]
 

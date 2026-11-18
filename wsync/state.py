@@ -40,7 +40,7 @@ class State:
     collection_360_review: str | None = None
     # Library step (Microsoft -> TA, see wsync.library):
     #   "last_pass": "YYYY-MM-DD"  the UTC day of the last complete daily pass;
-    #   "failed": {"at": iso, "issue": str}  a failed Microsoft or TA read: repeated, without a read, for 6 h;
+    #   "failed": {"at": iso, "issue": str}  a failed Microsoft or TA read: no new read for 6 h (a warning);
     #   "signin_failed": {"day": "YYYY-MM-DD", "seed": SHA-256 of XBOX_REFRESH_TOKEN}  a sign-in that needed a new
     #              token: not tried again that day with the same seed; removed by a working sign-in;
     #   "pass": {"day": "YYYY-MM-DD", "rows": [OwnedRow as dict], "done": [TA game id]}  the TA collection the
