@@ -110,3 +110,30 @@ def test_collection_override_keys_normalising_to_one_id_fail(tmp_path):
 
     with pytest.raises(OverridesError, match="more than once"):
         load_collection_overrides(write(tmp_path, {"collection": {"1": {"deku": "a"}, " 01": {"deku": "b"}}}))
+
+
+def test_load_overrides_ignores_the_library_section(tmp_path):
+    path = write(tmp_path, {"9ZZTEST00009": {"deku": "example-quest"},
+                            "library": {"9ZZTEST00001": {"ta": "Example-Quest"}}})
+    assert load_overrides(path) == {"9ZZTEST00009": {"deku": "example-quest"}}
+
+
+def test_load_library_overrides_validates_the_section(tmp_path):
+    from wsync.overrides import load_library_overrides
+
+    path = write(tmp_path, {
+        "9ZZTEST00009": {"deku": "example-quest"},
+        "collection": {"123": {"deku": "example-quest"}},
+        "library": {"9ZZTEST00001": {"ta": "Example-Quest", "note": "TA names it differently"},
+                    " 9ZZTEST00002 ": {"ta": "skip"}},
+    })
+    assert load_library_overrides(path) == {"9ZZTEST00001": {"ta": "Example-Quest"}, "9ZZTEST00002": {"ta": "skip"}}
+    assert load_library_overrides(tmp_path / "nope.json") == {}
+    assert load_library_overrides(write(tmp_path, {"9ZZTEST00009": {"deku": "x"}})) == {}
+    for bad in ([], "x", {"": {"ta": "x"}}, {" ": {"ta": "x"}}, {"P1": "skip"}, {"P1": {}}, {"P1": {"note": "x"}},
+                {"P1": {"ta": ""}}, {"P1": {"ta": 3}}, {"P1": {"ta": "x", "deku": "y"}}, {"P1": {"ta": "x", "note": 4}},
+                {"P1": {"ta": "a"}, " P1": {"ta": "b"}}):
+        with pytest.raises(OverridesError):
+            load_library_overrides(write(tmp_path, {"library": bad}))
+    with pytest.raises(OverridesError, match="JSON"):
+        load_library_overrides(write(tmp_path, "{nope"))
