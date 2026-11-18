@@ -186,6 +186,48 @@ FlareSolverr).
 - A DLC entry is `GameID` = the parent game, `DLCID` = the DLC id; it showed up as a DLC row and was
   removed with the same pair.
 
+## Game Collection (writes)
+
+Used by the library step (`TAClient.collection_page`, `collection_add`, `collection_set`).
+
+- **Add.** The logged-in game page carries `Postback('btnGC_Add','<id>')` or `btnGC_Remove` (in the
+  collection already). Adding posts the page's own form with `Command=btnGC_Add` and
+  `Argument=<game id>`; success is a page containing `Postback('btnGC_Remove','<id>')` afterwards,
+  checked. Both the button's id and, when given, the expected id are checked before posting. A game
+  already in the collection is not posted; a *new* add of one raises `AlreadyListed`.
+- **EditOptions.** `GameCollection_EditOptions` (the same AJAX endpoint family as the wishlist
+  writes, payload `GameCollection_Data` with `GameID`, `HashKey`) returns an HTML fragment with a
+  `<select>` per field (`id="<prefix>_<game id>"`; ownership and media). The current choice carries
+  the `selected` marker (`<option value="1" selected="selected">Owned</option>`, verified
+  2026-11-03). Options are parsed attribute by attribute, **in any order**, quoted or bare; a
+  dropdown with several selected options is a parse failure, not a guess; none selected, or value
+  `""`/`"0"`, is blank.
+- **UpdateGame.** `GameCollection_UpdateGame` with `Field=<prefix>_<game id>` and `Value=<option
+  value>` (plus `GamerID`). The answer's `d.UpdateValue` is the label now set; the client checks it
+  equals the wanted label and raises otherwise. A logged-out answer logs in again once.
+- **Compare-and-set.** The one EditOptions read decides first: already the target label -> no
+  post; with the caller's expected labels, a current one that is neither -> `ChangedOnTA`, no post.
+
+## Page not found
+
+An unknown `/game/<slug>` is answered with HTTP 200 and TA's page-not-found page: `<h1
+class="pagetitle">Page not found</h1>` and the marker `PageNotFound404`, with no game id and no
+canonical link (verified 2026-11-17). A real 404 is possible as well. "No page" is therefore HTTP
+404 *or* the marker; any other page without exactly one game id (throttling, maintenance, a
+challenge) is *not* "no page" and must be retried later.
+
+## Property lists
+
+Public lists such as Games with Gold and EA Play: `GET /<slug>/games?page=N` (no login).
+
+- Each page must carry `<link rel="canonical">` to `/<slug>/games`; a wrong slug serves the home
+  page, so a page without it is an error.
+- Rows are `<tr id="tr<game id>">`. **0 rows** on a page is TA's throttle answer: an error, never
+  an empty list.
+- The last page is the highest page number in the page's own pagination links (not "until a page
+  has fewer than 100 rows", which fails for a list that is an exact multiple of 100); the list is
+  returned only when read to that page, and a list longer than the page cap (20) is an error.
+
 ## Search
 
 **Layout change seen 2026-11-01.** `/searchresults.aspx` now

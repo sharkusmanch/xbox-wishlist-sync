@@ -15,14 +15,16 @@ missing, stale, empty or has shrunk sharply since the last run.
 ## Running
 
 ```
-python -m wsync [--only deku|ta|collection] [--dry-run | --apply] [--no-report] [--accept-feed-count N]
+python -m wsync [--only deku|ta|collection|library] [--dry-run | --apply] [--no-report] [--accept-feed-count N]
 ```
 
 - `--dry-run` / `--apply` override `DRY_RUN`. With neither, `DRY_RUN` decides, and anything but
   `false`/`0`/`no`/`off` (including unset) means a dry run.
 - `--only deku|ta` syncs one list (and skips the collection step). Problem tasks for the other
   list are left as they are. `--only collection` runs only the Deku collection step: no feed is
-  read and no wishlist is touched (it needs both logins).
+  read and no wishlist is touched (it needs both logins). `--only library` runs only the
+  library step (below): no feed, no wishlist, no Deku (it needs the TrueAchievements login and the
+  Microsoft token). `--only deku|ta|collection` skip the library step.
 - `--no-report` sends nothing to Vikunja or Apprise; the plan is only logged. Use it for local
   runs.
 - Exit code 0 means a clean run; 1 means a list-level failure (feed, state or overrides
@@ -59,6 +61,10 @@ report.
 | `APPRISE_URL` | Notifications |
 | `DRY_RUN` | `true` (default) plans only; `false` applies changes |
 | `COLLECTION_DRY_RUN` | The collection step's own switch: `true` (default) plans only; `false` adds to the Deku collection. A dry run (`DRY_RUN` or `--dry-run`) is always dry here too |
+| `LIBRARY_DRY_RUN` | The library step's own switch: `true` (default) plans only; `false` writes to the TrueAchievements Game Collection. A dry run (`DRY_RUN` or `--dry-run`) is always dry here too |
+| `WSYNC_LIBRARY_AFTER` | `HH:MM` (UTC, default `11:30`): the library step's daily pass starts at the first run past this time (before TA's own purchase import and the collection step's read) |
+| `XBOX_REFRESH_TOKEN` | The Microsoft sign-in's **seed**: a refresh token used only when the token file has none that works, or when it is new (see "Microsoft sign-in") |
+| `WSYNC_XBOX_TOKEN` | The rotating Microsoft refresh token's file (default `/state/xbox-token.json`, mode 600) |
 | `COLLECTION_360_DRY_RUN` | Xbox 360 games in the collection step: `true` (default) lists them in their own review task; `false` adds them. A dry collection step is always dry here too |
 
 Credentials come only from the environment. They are never logged, put in a notification or task,
@@ -140,6 +146,156 @@ unmatched list):
 is used when the item lists it, otherwise the other Xbox platform the item lists.
 An override applies to the whole game (its Series and One rows). An invalid `collection` object
 fails the collection step only; the wishlist step runs as usual.
+
+The file may also carry a `"library"` object for the library step, keyed by Microsoft Store
+product id (the `productId` shown in the step's Vikunja tasks):
+
+```json
+{
+  "library": {
+    "9AAAAAAAAAAA": {"ta": "Example-Game-Xbox-One", "note": "TA names it differently"},
+    "9BBBBBBBBBBB": {"ta": "skip", "note": "not a game"}
+  }
+}
+```
+
+`ta` is required: the TrueAchievements game slug of the page to use, or `"skip"` to leave the game
+out of the step. A slug is the game's page as it is: the title and generation rules are not applied
+to it, and the lookup reads that page alone. A slug whose page does not exist on TA is a
+check-by-hand item of its own kind, `override`, which always shows in the task (it is a mistake in
+this file, never backfill noise). `note` is free text, ignored. An invalid `library` object stops
+the library step only (an issue); the other steps run as usual.
+
+## Library step: Microsoft to TrueAchievements
+
+Keeps the TrueAchievements (TA) Game Collection in line with what Microsoft says the owner owns, so
+that the TA collection (which the Deku collection step below mirrors onto Deku Deals) is complete:
+Microsoft licences, orders and the Store catalog -> TA -> Deku. It adds owned games missing from
+the collection and fixes entries with the wrong ownership; it never removes anything. Its own
+failures never affect the wishlist or Deku collection steps.
+
+**When.** One *pass* a day: the first run past `WSYNC_LIBRARY_AFTER` (UTC). A pass that has more to
+do than one run allows (page lookups, writes) goes on over the following hourly runs until nothing
+is left, and then it is complete for the day. A pass reads the TA collection **once**, in its first
+run (it needs its own read; the Deku collection step's cache is not used), keeps the rows in state
+for its later runs, and remembers which TA games it has already written so that re-planning never
+repeats a write. TA's Games with Gold and EA Play lists are read at most weekly.
+
+### Microsoft sign-in
+
+The step signs in with a refresh token kept in a file on the state volume (`WSYNC_XBOX_TOKEN`,
+mode 0600, written atomically), **rotated every run**: the new token is saved before any Xbox Live
+call. `XBOX_REFRESH_TOKEN` is only a seed. It is tried when the file has no token or its token is
+rejected, and when its SHA-256 differs from the one recorded with the file, so a re-seed in OpenBao
+takes effect on the next run (after the secret reaches the pod) without deleting anything. Tokens,
+the XUID and the gamertag are scrubbed from every log line and report.
+
+When neither works, the step is **not** an error run. It posts the Vikunja task "Library sync:
+Microsoft sign-in needed" (one Apprise ping per episode) and does not try again before the next
+day's pass, unless `XBOX_REFRESH_TOKEN` has changed. Fix, in the games repo:
+
+1. `scripts/xbox-library.py --token-file <tmp> login` (the temp file is created mode 0600), and
+   approve the code at microsoft.com/link;
+2. store the token from that file in OpenBao `secret/apps/tools/xbox-wishlist-sync` as
+   `XBOX_REFRESH_TOKEN`;
+3. delete the temp file (it holds a live refresh token plus the XUID and gamertag).
+
+The task closes itself at the first working sign-in.
+
+### Ownership rules
+
+Each owned game (grouped by title, a Collections game never merged with an orders-only one) is
+compared with the TA collection rows:
+
+- **Adds.** A game with no TA entry gets its own TA page's entry: ownership **Owned** (**Games with
+  Gold** for a free claim that is on TA's Games with Gold list), media **Digital**.
+- **Fixes.** An entry that exists with a wrong ownership becomes **Owned** (media Digital when it
+  has none). A subscription status (Game Pass, EA Play, Ubisoft+ ...) is only changed on
+  **evidence**: a paid order or a claim. A licence alone, which a subscription also grants, is
+  not enough, and the same holds for pre-2016 licences of EA Play games (they may be vault
+  licences).
+- **Never.** Nothing is removed. An entry already Owned or Games with Gold is never changed, no
+  other ownership is ever written on a fix, and an entry that has media (Disc, Disc to Digital ...)
+  never has it changed.
+- **Compare-and-set.** A write reads TA's current dropdown selection first: already the target ->
+  nothing posted; neither what the plan saw nor the target -> nothing posted and the entry is left
+  as it is (a warning, not an issue; the next pass plans from a fresh read).
+
+Anything uncertain is a **check-by-hand** item, never a write: a near-miss title already in the
+collection, an uncertain version or ownership, several non-Owned entries for one game, a game with
+no TA page (`no-page`), an override whose page does not exist (`override`).
+
+### Versions and generations
+
+The TA page's own Platform field decides which TA game a purchase is; the Store catalog's console
+generation only chooses among the pages that fit. A Collections licence, a ConsoleGen9 or Smart
+Delivery purchase and a PC-only one never take an Xbox 360 / Xbox page or entry: ConsoleGen9 takes
+the Xbox Series X|S page, ConsoleGen8 the Xbox One page (both for both; one page listing both is one
+add), a PC-only licence the Windows page. Only an orders-only console game without ConsoleGen9 can
+be a 360 or original Xbox game (backward compatible 360 products report ConsoleGen8 only); when
+both a 360 and a modern page fit, it is a review. **Bundle twin rule:** an orders-only game whose
+title key equals that of a Collections game (a bundled copy of a modern game) never writes an Xbox
+360 / Xbox entry: a review instead. A console licence never fixes TA's separate "(Windows)" entry
+(its console page is added instead); a PC-only licence fixes only a Windows entry.
+
+### Page lookups
+
+A missing game's TA page is found by guessing addresses from the title (platform phrases and
+trailing tiers stripped; at most **6 candidates** per game; Windows too for a PC-only game), or the
+`library` override's slug alone. At most **10 games a run** are looked up, **4 s** before every TA
+request, none past the 45-minute write deadline. Results are cached per game: 7 days, 30 days for a
+game with no page or a product already seen at go-live (a changed address set or override is looked
+up again). **No page** means HTTP 404 or TA's page-not-found page (marker `PageNotFound404`).
+Any other page that is not exactly one game's page (a challenge, maintenance or throttling page)
+is *unreachable*: the lookups stop quietly for the run, nothing is cached, so a throttled day never
+turns into a month of "no page".
+
+### Writes
+
+Live only (`LIBRARY_DRY_RUN` `false`). At most **25 games a run**, 4 s before each TA request, none
+started past the write deadline. Each write goes into state **before** its first request
+(write-ahead, with what the plan saw), is checkpointed after each request, and removed after its
+last; one left behind by a crash or stop is completed **at most once per pass** and never blocks
+the reads, the plan or other writes. An add whose game TA already lists is never written
+(`AlreadyListed`: a warning; TA's own import added it after the read). An entry changed on TA since
+the read (`ChangedOnTA`) is left as it is (a warning). Any other failure of one game's write is an
+issue naming that game and its product id (for a `skip` override), and the others go on; after
+**3 consecutive write errors** the pass's writes stop until the next day's pass. Cloudflare or
+network trouble and the write deadline stop the writes quietly. A failed write that reached nothing
+on TA is dropped; a partial one stays for the next pass.
+
+### Reporting
+
+- **Dry run** (`LIBRARY_DRY_RUN` not `false`, or the whole run dry): no TA writes. The Vikunja task
+  "Review the library sync plan" lists what a live run would add (title, TA slug, ownership and
+  media), would fix, the games to check by hand, and the counts (already right, waiting for a
+  lookup). It is updated every run; Apprise pings "Library sync plan ready" **once**, when the
+  plan is complete (no lookup pending) and its lists changed.
+- **Live:** that task closes. The task "Library sync: check by hand" holds the items needing a
+  look, with the product id to key a `library` override. It holds **only new items**: at the first
+  live run the step records a *seen baseline* (decision A) of every product in the plan's review
+  items and in the games still waiting for a lookup, before any write, so the leftovers a dry run
+  already showed never surface as new. `no-page` items never go in the task; an `override` item
+  always does. Apprise pings when its item set changes (titles and a count, never product ids).
+  "+N TA library" (the titles) is sent when a run added games.
+- **Sign-in:** the task above, plus one "Library sync: Microsoft sign-in needed" ping per episode.
+
+### Failures and back-offs
+
+A failed Microsoft or TA read (a Microsoft or Store error, an incomplete TA read, data that cannot
+be classified) is an issue (exit 1, with the usual deduplicated failure ping), and is **not
+retried for 6 hours**: the runs in between repeat the same issue without a new read. Nothing is
+planned or written from a partial read. A failed refresh of TA's Games with Gold / EA Play list
+keeps the copy in state for up to a week (a warning). A sign-in that needs a new token is the task
+above, not a failure. Reporting trouble (Vikunja) is an issue of its own and never breaks the step.
+
+### TA traffic it adds
+
+A first run of a day: the Microsoft calls (not TA), the weekly two property-list reads (about
+1-2 pages each), one Game Collection read (about 16 pages), then at most 10 games x 6 candidates
+page lookups and 25 games' writes (a page read, then a post or two each), all paced at 4 s. A
+catch-up spreads over several runs; a steady day reads about 16 pages once. TA has withheld
+won/not-won data from this IP after heavy automated traffic, so keep these budgets.
 
 ## Deku collection step
 
@@ -260,6 +416,16 @@ again until their page shows an Xbox entry). Deleting it is safe for the caches:
 rebuilds them (slower, up to the 35-minute lookup budget; lookups past it wait for the next run
 with removals paused). It also forgets the unconfirmed adds, so check the "Check by hand" items
 on Deku first.
+
+The **library step**'s state lives under `library` in the same file: the day of the last complete
+pass, a failed read (retried after 6 h), a failed sign-in (day and the seed's SHA-256), the current
+pass (day, the TA collection rows its first run read, the TA ids it has written, a write-error
+count), TA's Games with Gold / EA Play lists (7 days), the cached page lookups, the write-ahead
+entries of unfinished writes, the "seen" baseline product ids, and the report signatures that keep
+pings to one per change. Deleting it is safe: the next pass starts from a fresh read (the seen
+baseline is gone, so a live run reports every check-by-hand item again). The Microsoft refresh
+token is a separate file, `WSYNC_XBOX_TOKEN` (`/state/xbox-token.json`, mode 600), beside it;
+deleting it falls back to the `XBOX_REFRESH_TOKEN` seed.
 
 ## Development
 
