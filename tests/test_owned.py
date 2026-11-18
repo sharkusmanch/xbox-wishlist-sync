@@ -34,15 +34,15 @@ def test_summarize_owned_games_from_collections_and_order_only_purchases():
 
 
 @pytest.mark.parametrize("store, ta", [
-    ("Example Quest® Odyssey - GOLD EDITION", "Example Quest Odyssey"),
+    ("Example Voyage® Odyssey - GOLD EDITION", "Example Voyage Odyssey"),
     ("Blockworld for Windows", "Blockworld (Windows)"),
     ("Example Ball® 21 Xbox Series X | S", "Example Ball 21"),
-    ("Quiet House", "Quiet House: Console Edition"),
-    ("Dragon Realm 2: Stay Brave - Reloaded Edition", "Dragon Realm 2: Stay Brave"),
-    ("Sample Tale - The Series - Episode 1: Realm of Shadows", "Sample Tale: The Series"),
-    ("Example Duty®: Modern Combat® II - Vault Edition", "Example Duty: Modern Combat II"),
+    ("Silent Cottage", "Silent Cottage: Console Edition"),
+    ("Moon Tower 2: Stay Brave - Reloaded Edition", "Moon Tower 2: Stay Brave"),
+    ("Sample Tale - The Series - Episode 1: Hollow Road", "Sample Tale: The Series"),
+    ("Example Strike®: Modern Clash® II - Vault Edition", "Example Strike: Modern Clash II"),
     ("Space Hall™ 2", "Space Hall 2"),
-    ("Example Duty®: Cold Front - Cross-Gen Bundle", "Example Duty: Cold Front"),
+    ("Example Strike®: Cold Front - Cross-Gen Bundle", "Example Strike: Cold Front"),
 ])
 def test_same_game_across_store_and_ta_names(store, ta):
     assert same_game(store, ta)
@@ -50,28 +50,28 @@ def test_same_game_across_store_and_ta_names(store, ta):
 
 @pytest.mark.parametrize("a, b", [
     ("Space Hall (2008)", "Space Hall"),
-    ("Wake Light Remastered", "Wake Light"),
-    ("Halo Sample 5: Guardians", "Halo Sample"),
-    ("Mobster II: Definitive Edition", "Mobster II"),
+    ("Dim Lantern Remastered", "Dim Lantern"),
+    ("Quartz Vale 5: Wardens", "Quartz Vale"),
+    ("Harbor Boss II: Definitive Edition", "Harbor Boss II"),
 ])
 def test_different_games_stay_apart(a, b):
     assert not same_game(a, b)
 
 
-@pytest.mark.parametrize("title", ["Example™ Demo", "Battle Sample™ 1 Open Beta", "Fiction Beast Pre-Order Bundle",
-                                   "Example Duty®: Black Ops 4 - Private Beta", "Atlas Sample (Pre-Order)"])
+@pytest.mark.parametrize("title", ["Example™ Demo", "Tin Harbor™ 1 Open Beta", "Fiction Beast Pre-Order Bundle",
+                                   "Example Strike®: Iron Dawn 4 - Private Beta", "Map Sample (Pre-Order)"])
 def test_demos_betas_and_preorders_are_noise(title):
     assert is_noise(title)
 
 
 def test_full_games_are_not_noise():
-    assert not is_noise("Sample Jump") and not is_noise("Battle Sample™ Hardline Standard Edition")
+    assert not is_noise("Sample Jump") and not is_noise("Tin Harbor™ Standard Edition")
 
 
 @pytest.mark.parametrize("title", ["Fiction Digital Artbook & Original Soundtrack",
-                                   "Example Rally ®2 Open Multiplayer Tech Test", "Evolve Sample Big Alpha",
-                                   "Elder Sample® Online: Summerset Upgrade - Prepurchase",
-                                   "HOLLOW HILL 2 Bonus Content (Digital Artbook and Soundtrack）"])
+                                   "Example Rally ®2 Open Multiplayer Tech Test", "Moss Giant Big Alpha",
+                                   "Old Lore® Online: Coastland Upgrade - Prepurchase",
+                                   "PALE RIDGE 2 Bonus Content (Digital Artbook and Soundtrack）"])
 def test_extras_are_noise(title):
     assert is_noise(title)
 
@@ -116,17 +116,17 @@ def test_order_totals_sum_purchased_lines():
 
 
 def test_a_trailing_mode_tag_is_the_same_game_but_a_year_is_not():
-    assert same_game("Example Doom (BATTLEMODE)", "Example Doom")
+    assert same_game("Example Blast (SPRINTMODE)", "Example Blast")
     assert not same_game("Space Hall (2008)", "Space Hall")
 
 
 @pytest.mark.parametrize("store, ta, want", [
-    ("Arena Sample", ["Arena Sample: Champions of the Realm"], "Arena Sample: Champions of the Realm"),
+    ("Arena Sample", ["Arena Sample: Heroes of Dusk"], "Arena Sample: Heroes of Dusk"),
     ("Dark Spire III", ["Dark Spire"], None),
-    ("Example Duty®: Black Ops 4", ["Example Duty"], None),
+    ("Example Strike®: Iron Dawn 4", ["Example Strike"], None),
     ("Demon Hunt® IV - Ultimate Edition", ["Demon Hunt IV", "Demon Hunt"], "Demon Hunt IV"),
-    ("Dead Sample 4 Bundle", ["Dead Sample", "Dead Sample 4"], "Dead Sample 4"),
-    ("FANTASY SAGA VII", ["FANTASY SAGA VII REMAKE INTERGRADE"], None),
+    ("Grave Run 4 Bundle", ["Grave Run", "Grave Run 4"], "Grave Run 4"),
+    ("ORBIT SAGA VII", ["ORBIT SAGA VII REMAKE PLUS"], None),
 ])
 def test_possible_match_hints(store, ta, want):
     assert hint(match_keys(store), ta) == want
@@ -139,6 +139,10 @@ def test_accents_fold():
 def test_a_bare_trailing_platform_phrase_is_stripped():
     assert same_game("Example Ball 21 Xbox One", "Example Ball 21")
     assert same_game("Example Ball 22 Xbox One & Xbox Series X|S", "Example Ball 22")
+    assert same_game("Example for Xbox One", "Example")
+    assert same_game("Example on Xbox Series X|S", "Example")
+    assert same_game("Example for Xbox Series X|S", "Example")
+    assert same_game("Example for Windows 10", "Example")
 
 
 def test_a_platform_in_the_middle_or_alone_is_not_mangled():
@@ -158,7 +162,7 @@ def test_one_row_per_game_when_microsoft_has_several_products():
         {"productId": "A1", "totalAmount": 10}, {"productId": "B1", "totalAmount": 10}, {"productId": "B2", "totalAmount": 10}]},
         {"orderId": "O2", "orderState": "Purchased", "orderLineItems": [{"productId": "A2", "totalAmount": 0}]}]
     catalog = {"A1": prod("A1", "Black Forest"), "A2": prod("A2", "Black Forest - Standard Edition"),
-               "B1": prod("B1", "Two Point Clinic™"), "B2": prod("B2", "Two Point Clinic: JUMBO Edition")}
+               "B1": prod("B1", "Twin Peak Clinic™"), "B2": prod("B2", "Twin Peak Clinic: MEGA Edition")}
     games = {g.pids: g for g in owned_games(items, orders, catalog)}
     assert set(games) == {("A1", "A2"), ("B1", "B2")}
     g = games[("A1", "A2")]
@@ -166,15 +170,37 @@ def test_one_row_per_game_when_microsoft_has_several_products():
     assert g.key == "black forest"
 
 
-def test_missing_editions_of_one_game_collapse_but_numbered_entries_do_not():
-    items = [_lic(p) for p in ("F1", "F2", "M1", "M2")]
+def test_tier_editions_collapse_but_protected_editions_and_numbered_entries_stay_apart():
+    items = [_lic(p) for p in ("F1", "F2", "F3", "U1", "M1", "M2")]
     catalog = {p: prod(p, t) for p, t in [
-        ("F1", "Racer Motorsport 7"), ("F2", "Racer Motorsport 7 Ultimate Edition"),
-        ("M1", "Mega Hero X Legacy Collection"), ("M2", "Mega Hero X Legacy Collection 2")]}
+        ("F1", "Track Master 7"), ("F2", "Track Master 7 Deluxe Edition"), ("F3", "Track Master 7 - Gold Edition"),
+        ("U1", "Track Master 7 Ultimate Edition"),
+        ("M1", "Tiny Bot X Legacy Collection"), ("M2", "Tiny Bot X Legacy Collection 2")]}
     out = owned_games(items, [], catalog)
     assert [(g.title, g.pids) for g in out] == [
-        ("Mega Hero X Legacy Collection", ("M1",)), ("Mega Hero X Legacy Collection 2", ("M2",)),
-        ("Racer Motorsport 7", ("F1", "F2"))]
+        ("Tiny Bot X Legacy Collection", ("M1",)), ("Tiny Bot X Legacy Collection 2", ("M2",)),
+        ("Track Master 7", ("F1", "F2", "F3")), ("Track Master 7 Ultimate Edition", ("U1",))]
+
+
+def test_a_remaster_edition_is_a_separate_game_from_the_order_only_original():
+    items = [_lic("DE")]
+    orders = [{"orderId": "O1", "orderState": "Purchased", "orderLineItems": [
+        {"productId": "OG", "productType": "Game", "title": "Example Saga", "totalAmount": 10}]}]
+    catalog = {"DE": prod("DE", "Example Saga: Definitive Edition", gen=("ConsoleGen9",)),
+               "OG": prod("OG", "Example Saga", gen=("ConsoleGen8",))}
+    games = {g.pids: g for g in owned_games(items, orders, catalog)}
+    assert set(games) == {("DE",), ("OG",)}
+    assert (games[("OG",)].source, games[("OG",)].gen, games[("OG",)].evidence) == ("orders", ("ConsoleGen8",), "paid")
+    assert games[("DE",)].source == "collections" and games[("DE",)].gen == ("ConsoleGen9",)
+
+
+def test_a_collections_product_and_an_orders_only_product_with_one_title_stay_two_games():
+    items = [_lic("C1")]
+    orders = [{"orderId": "O1", "orderState": "Purchased", "orderLineItems": [
+        {"productId": "O1P", "productType": "Game", "title": "Same Title", "totalAmount": 5}]}]
+    catalog = {"C1": prod("C1", "Same Title")}
+    out = owned_games(items, orders, catalog)
+    assert sorted((g.source, g.pids) for g in out) == [("collections", ("C1",)), ("orders", ("O1P",))]
 
 
 def test_evidence_levels():

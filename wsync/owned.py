@@ -24,7 +24,7 @@ PLATFORM_SUFFIX = re.compile(r"(?:\s+(?:for|on)\s+(?:windows(?:\s*10)?|xbox one|
 # A bare phrase at the very end ("Ball 21 Xbox One", "Ball 22 Xbox One and Xbox Series X|S"). It needs a
 # title before it, so a title that is only a platform name, or one that has it mid-title, is left alone.
 _PLAT = r"(?:xbox series x\s*\|\s*s|xbox series x|xbox one)"
-BARE_PLATFORM = re.compile(rf"(?<=\S)\s+{_PLAT}(?:\s+and\s+{_PLAT})*\s*$")
+BARE_PLATFORM = re.compile(rf"(?<=\S)\s+(?:(?:for|on)\s+)?{_PLAT}(?:\s+and\s+{_PLAT})*\s*$")
 SEP = re.compile(r"\s+[-–—]\s+|\s*:\s*")  # " - ", " – ", ":"; not "Cross-Gen"
 EPISODE = re.compile(r"(?:\s+[-–—]\s+|\s*:\s*)episode\s+\d+.*$")
 # A final " - Something Edition" / ": Something Bundle" segment is a purchase tier, unless it names a version that
@@ -41,14 +41,11 @@ HINT_WORDS = re.compile(r"\b(?:edition|bundle|collection|expansion|part|pack|sea
 SEQUEL_WORDS = set(ROMAN.values()) | {"x", "remake", "remaster", "remastered", "rebirth", "reborn", "reunion", "re"}
 RANK = {"bought": 0, "claim": 1, "free": 2}
 EVIDENCE_RANK = {"paid": 0, "claim": 1, "unknown-order": 2, "legacy": 3, "free": 4}
-EDITION_WORDS = re.compile(r"(?:\s+(?:ultimate|complete|deluxe|digital|definitive|gold|standard|premium|special|"
-                           r"anniversary|legendary|enhanced|launch|collector s|super|game of the year|goty|hd))+"
-                           r"\s+edition$")
 
 
 @dataclass(frozen=True)
 class OwnedGame:
-    key: str  # group_key of its title
+    key: str  # game_key of its title
     title: str  # the shortest Store title among its products
     pids: tuple[str, ...]  # every product id folded into this game
     source: str  # "collections" when any product has a Collections licence, else "orders"
@@ -192,10 +189,10 @@ def owned_games(items, orders, catalog: dict[str, Product]) -> list[OwnedGame]:
         pid = r["product_id"]
         row = dict(r, acquisition=acquisition(pid, licences.get(pid, []), lines, paid.get(pid), totals),
                    evidence=evidence(pid, licences.get(pid, []), lines, totals, paid.get(pid)))
-        key = group_key(r["title"]) or pid
+        key = (r["source"], game_key(r["title"]) or pid)  # a Collections and an orders-only product stay apart
         e = groups.get(key)
         if e is None:
-            groups[key] = {"key": key, "title": r["title"] or pid, "pids": [pid], "collections": r["source"] == "collections",
+            groups[key] = {"title": r["title"] or pid, "pids": [pid], "collections": r["source"] == "collections",
                            "acquisition": row["acquisition"], "evidence": row["evidence"], "gen": set(),
                            "known": [], "xbox": False}
             e = groups[key]
@@ -210,7 +207,7 @@ def owned_games(items, orders, catalog: dict[str, Product]) -> list[OwnedGame]:
             e["known"].append(c)
             e["gen"].update(c.gen)
             e["xbox"] = e["xbox"] or "Xbox" in c.platforms
-    out = [OwnedGame(key=e["key"], title=e["title"], pids=tuple(sorted(e["pids"])),
+    out = [OwnedGame(key=game_key(e["title"]) or e["pids"][0], title=e["title"], pids=tuple(sorted(e["pids"])),
                      source="collections" if e["collections"] else "orders", acquisition=e["acquisition"],
                      evidence=e["evidence"], gen=tuple(sorted(e["gen"])),
                      pc_only=bool(e["known"]) and not e["xbox"]) for e in groups.values()]
@@ -252,12 +249,6 @@ def match_keys(title) -> set[str]:
 
 def game_key(title) -> str:
     return _keys(title)[1]
-
-
-def group_key(title) -> str:
-    """Looser key for folding several products into one game: also drops any trailing "... Edition"
-    phrase ("Racer Motorsport 7 Ultimate Edition" -> "racer motorsport vii")."""
-    return EDITION_WORDS.sub("", game_key(title)) or game_key(title)
 
 
 def same_game(a, b) -> bool:
