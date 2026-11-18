@@ -1290,3 +1290,11 @@ def test_collection_add_with_a_game_id_refuses_another_games_page():
     assert http.urls("POST") == []  # nothing was posted
     assert c.collection_add("Example-Quest", game_id=12345) == 12345
     assert len(http.urls("POST")) == 1
+
+
+def test_a_new_collection_add_refuses_a_game_already_in_the_collection():
+    c, http = logged_in({("GET", EXAMPLE): resp(COLL_GAME_IN)})
+    with pytest.raises(AlreadyListed, match="already in the collection"):
+        c.collection_add("Example-Quest", new=True)
+    assert c.collection_add("Example-Quest") == 12345  # without `new`: left as it is, its id returned
+    assert http.urls("POST") == []

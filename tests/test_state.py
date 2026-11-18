@@ -67,3 +67,20 @@ def test_state_round_trips_the_360_review_signature(tmp_path):
     assert load_state(path) == state
     path.write_text(json.dumps({"mapping": {}, "collection_review": "abc"}))
     assert load_state(path).collection_360_review is None
+
+
+def test_state_round_trips_the_library_section_and_old_files_load(tmp_path):
+    path = tmp_path / "state.json"
+    library = {
+        "last_pass": "2026-11-01",
+        "lists": {"games-with-gold": {"fetched": "2026-11-01T12:00:00+00:00", "ids": [1, 2]}},
+        "pages": {"9ZZTEST00001": {"checked": "2026-11-01T12:00:00+00:00", "slugs": ["Example-Quest"],
+                                   "pages": [{"id": 5, "title": "Example Quest", "platform": "Xbox One",
+                                              "slug": "Example-Quest", "platforms": ["Xbox One"]}]}},
+        "writing": {"5": {"kind": "add", "slug": "Example-Quest", "ta_id": 5, "title": "Example Quest",
+                          "sets": [["ownership", "Owned"], ["media", "Digital"]]}},
+    }
+    save_state(path, State(library=library))
+    assert load_state(path).library == library
+    path.write_text(json.dumps({"mapping": {}, "collection_review": "abc"}))
+    assert load_state(path).library == {}

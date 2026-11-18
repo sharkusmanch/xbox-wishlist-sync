@@ -38,6 +38,15 @@ class State:
     collection_review: str | None = None
     # the same digest for the Xbox 360 review (COLLECTION_360_DRY_RUN): would add and unmatched 360 games
     collection_360_review: str | None = None
+    # Library step (Microsoft -> TA, see wsync.library):
+    #   "last_pass": "YYYY-MM-DD"  the UTC day of the last complete daily pass;
+    #   "failed": {"at": iso, "issue": str}  a failed Microsoft or TA read: repeated, without a read, for 6 h;
+    #   "lists": {"games-with-gold" | "ea-play": {"fetched": iso, "ids": [TA game id], "tried": iso}};
+    #   "pages": {lookup key: {"checked": iso, "slugs": [addresses tried], "pages": [TAGame as dict]}};
+    #   "writing": {TA game id: {"kind", "slug", "ta_id", "sets", "title", "pids", "since"}}  write-ahead:
+    #              saved before a write's first request, removed after its last;
+    #   "seen": [Store product id]  review items already reported (decision A).
+    library: dict = field(default_factory=dict)
 
 
 def load_state(path: Path) -> State:
@@ -59,6 +68,7 @@ def load_state(path: Path) -> State:
         collection_unconfirmed=data.get("collection_unconfirmed") or {},
         collection_review=data.get("collection_review"),
         collection_360_review=data.get("collection_360_review"),
+        library=data.get("library") or {},
     )
 
 

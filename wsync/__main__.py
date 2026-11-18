@@ -1,4 +1,4 @@
-"""`python -m wsync [--only deku|ta|collection] [--dry-run|--apply] [--no-report] [--accept-feed-count N]`."""
+"""`python -m wsync [--only deku|ta|collection|library] [--dry-run|--apply] [--no-report] [--accept-feed-count N]`."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import os
 import signal
 import sys
 
-from wsync.run import ConfigError, RedactingFilter, Terminated, config_from, run
+from wsync.run import ConfigError, RedactingFilter, Scrubber, Terminated, config_from, run
 
 
 def _on_sigterm(signum, frame):
@@ -24,11 +24,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    handler.addFilter(RedactingFilter(cfg.secrets()))
+    scrub = Scrubber(cfg.secrets())  # one live scrubber: the run adds the secrets it meets
+    handler.addFilter(RedactingFilter(scrub))
     logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
     previous = signal.signal(signal.SIGTERM, _on_sigterm)
     try:
-        return run(cfg)  # catches Terminated: saves state, reports, returns 1
+        return run(cfg, scrub=scrub)  # catches Terminated: saves state, reports, returns 1
     finally:
         signal.signal(signal.SIGTERM, previous)
 

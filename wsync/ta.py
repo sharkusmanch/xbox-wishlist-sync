@@ -77,7 +77,8 @@ class IncompleteRead(TAError):
 
 
 class AlreadyListed(TAError):
-    """An add found the entry already on the wishlist: our read of the list was wrong or stale."""
+    """An add found the entry already on the wishlist (or, for a new collection add, in the Game Collection): our
+    read of the list was wrong or stale."""
 
 
 @dataclass(frozen=True)
@@ -845,15 +846,18 @@ class TAClient:
         """The logged-in game page, and whether the game is in the Game Collection."""
         return parse_collection_page(self._get(BASE + "/game/" + quote(slug, safe=""), need_login=True).html, slug)
 
-    def collection_add(self, slug: str, *, game_id: int | None = None) -> int:
-        """Add the game to the Game Collection with the page's own postback; returns its TA id. With `game_id`,
-        the page must be that game's: anything else raises before a request is posted."""
+    def collection_add(self, slug: str, *, game_id: int | None = None, new: bool = False) -> int:
+        """Add the game to the Game Collection with the page's own postback; returns its TA id. A game already in
+        the collection is left as it is (its id returned), or with `new` raises AlreadyListed. With `game_id`, the
+        page must be that game's. Both checks come before a request is posted."""
         url = BASE + "/game/" + quote(slug, safe="")
         p = self._get(url, need_login=True)
         game, have = parse_collection_page(p.html, slug)
         if game_id is not None and game.id != game_id:
             raise TAError(f"collection add of {slug!r}: the page is game {game.id}, not {game_id}")
         if have:
+            if new:
+                raise AlreadyListed(f"collection add of {slug!r}: game {game.id} is already in the collection")
             return game.id
         form = login_form(p.html, _POSTBACK_SKIP_TYPES)
         form.update({"Command": "btnGC_Add", "Argument": str(game.id)})
