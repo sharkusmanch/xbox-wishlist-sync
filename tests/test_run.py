@@ -13,7 +13,7 @@ from wsync.match import norm
 from wsync.plan import Entry
 from wsync.run import Config, ConfigError, Deps, config_from, run
 from wsync.state import State, load_state, save_state
-from wsync.ta import AlreadyListed, AuthError as TAAuthError, IncompleteRead, TAGame
+from wsync.ta import AlreadyListed, AuthError as TAAuthError, ChangedOnTA, IncompleteRead, TAGame
 from wsync.ta_coll import OwnedRow
 
 NOW = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
@@ -152,6 +152,7 @@ class FakeTA:
         self.fail_add = {}  # slug -> exception from collection_add()
         self.fail_set = {}  # (game id, field) -> exception from collection_set()
         self.on_add = None  # called with the slug before an add is made
+        self.on_set = None  # called with (game id, field) when a field set is asked for; may raise
         self.unlisted = set()  # TA game ids in the collection that the collection read doesn't show
 
     def collection(self):
@@ -189,18 +190,28 @@ class FakeTA:
         self.journal.append(("ta", "gc-add", slug))
         icon = {"Xbox Series X|S": "xbox-series-x-s", "Xbox One": "xbox-one", "Xbox 360": "xbox-360",
                 "Windows": "windows"}.get(g.platform, "xbox-one")
-        self.owned_rows.append(OwnedRow(g.id, g.title, icon, "", ""))
+        self.owned_rows.append(OwnedRow(g.id, g.title, icon, "Owned", ""))  # TA's defaults for a new entry
         return g.id
 
-    def collection_set(self, game_id, field_name, label):
+    def collection_set(self, game_id, field_name, label, expect=None):
+        """Compare-and-set, as the client: nothing posted when the entry already shows `label`; ChangedOnTA when it
+        shows something `expect` doesn't hold."""
         self.calls.append(("gc-set", game_id, field_name, label))
+        if self.on_set:
+            self.on_set(game_id, field_name)
         if (game_id, field_name) in self.fail_set:
             raise self.fail_set[(game_id, field_name)]
         i = next(n for n, r in enumerate(self.owned_rows) if r.ta_id == game_id)
         r = self.owned_rows[i]
+        current = r.ownership if field_name == "ownership" else r.media
+        if current == label:
+            return False
+        if expect is not None and current not in expect:
+            raise ChangedOnTA(f"collection {field_name} of {game_id}: TA shows {current!r}")
         self.owned_rows[i] = replace(r, **({"ownership": label} if field_name == "ownership" else {"media": label}))
         self.writes.append(("gc-set", game_id, field_name, label))
         self.journal.append(("ta", "gc-set", game_id))
+        return True
 
     def wishlist(self):
         self.wishlist_calls += 1

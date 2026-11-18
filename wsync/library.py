@@ -48,7 +48,7 @@ from .flaresolverr import FlareSolverrError
 from .overrides import SKIP
 from .owned import (BARE_PLATFORM, PLATFORM_SUFFIX, PLATFORM_TAG, TIER_PLAIN, OwnedGame, game_key, hint, match_keys,
                     owned_games, same_game)
-from .ta import ONE, SERIES, AlreadyListed, TAGame, Unreachable
+from .ta import ONE, SERIES, AlreadyListed, ChangedOnTA, TAGame, Unreachable
 from .ta_coll import OwnedRow
 from .xbox import SignInNeeded, TokenStore, XboxError, catalog_lookup, fetch_collections, fetch_orders, open_session
 
@@ -201,7 +201,11 @@ def _pages(pages) -> str:
 def override_for(game: OwnedGame, overrides: dict[str, dict]) -> str | None:
     """A game's `library` override, keyed on any of its products: "skip" when one says so, else the slug of its
     first product that has one; None without one."""
-    slugs = [o["ta"] for pid in game.pids if (o := overrides.get(pid)) and o.get("ta")]
+    return _override(game.pids, overrides)
+
+
+def _override(pids, overrides: dict[str, dict]) -> str | None:
+    slugs = [o["ta"] for pid in sorted(pids) if (o := overrides.get(pid)) and o.get("ta")]
     return SKIP if SKIP in slugs else (slugs[0] if slugs else None)
 
 
@@ -432,6 +436,7 @@ READ_RETRY = timedelta(hours=6)  # after a failed Microsoft or TA read, no new r
 PAGES_FRESH = timedelta(days=7)  # a game's looked-up pages are reused this long,
 PAGES_FRESH_LONG = timedelta(days=30)  # or this long for a game with no page or a seen product
 LISTS_FRESH = timedelta(days=7)  # TA's Games with Gold and EA Play lists are read at most weekly
+MAX_WRITE_ERRORS = 3  # TA write errors without a successful write between them: the run's writes stop
 GWG_LIST, EA_LIST = "games-with-gold", "ea-play"
 
 
@@ -444,6 +449,7 @@ class LibraryResult:
     looked_up: int = 0  # games whose TA pages were looked up this run
     pending: int = 0  # games still waiting for a page lookup
     left: int = 0  # live: planned writes left for the next run
+    failed: list[str] = field(default_factory=list)  # titles whose TA write failed this run (each an issue)
     stopped: str | None = None  # why the pass ended early this run
     complete: bool = False  # the day's pass is done: state.library["last_pass"] is today
 
@@ -481,11 +487,12 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
 
     Once a day, at the first run past `cfg.library_after` (UTC), a pass: sign in; read the licences, orders and
     catalog; TA's subscription lists (weekly) and the TA collection; plan; look up pages; plan again; write
-    (live). A pass that doesn't finish (lookups or writes left, a stop) goes on at the next run, with the TA
-    collection its first run read and without the writes it has made. A failed Microsoft or TA read is an issue,
-    repeated without a new read for 6 h. A Microsoft sign-in that needs a new token is not an issue: it isn't
-    tried again before the next day's pass unless XBOX_REFRESH_TOKEN changes. TA write errors are issues;
-    Cloudflare or network trouble and the write deadline stop the step quietly. Other exceptions propagate.
+    (live): unfinished writes first, then the plan's. A pass that doesn't finish (lookups or writes left, a stop, a
+    failed write) goes on at the next run, with the TA collection its first run read and without the writes it has
+    made. A failed Microsoft or TA read is an issue, repeated without a new read for 6 h. A Microsoft sign-in that
+    needs a new token is not an issue: it isn't tried again before the next day's pass unless XBOX_REFRESH_TOKEN
+    changes. A TA write error is an issue about that game only; Cloudflare or network trouble and the write
+    deadline stop the writes quietly. Other exceptions propagate.
     """
     if now.tzinfo is None:
         raise ValueError("run_library_step needs a timezone-aware `now`")
@@ -507,12 +514,6 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
         return res
     if _backing_off(run, lib, now, res):
         return res
-    writer = _Writer(run, ta, lib, overrides, now, res)
-    if lib.get("writing"):
-        if res.dry_run:
-            run.say(f"library: {len(lib['writing'])} unfinished TA writes wait for a live run")
-        elif not writer.leftovers():
-            return _end(run, res, lib, today)
     seed = hashlib.sha256(run.cfg.xbox_refresh_token.encode()).hexdigest()  # never the value itself
     signin = lib.get("signin_failed") if isinstance(lib.get("signin_failed"), dict) else {}
     if signin.get("day") == today and signin.get("seed") == seed:
@@ -523,7 +524,7 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
     try:
         games = _owned(run, http, lib)
         gwg, ea_play = _lists(run, ta, lib, now)
-        rows, writer.fresh = _pass_rows(run, ta, lib, today)
+        rows = _pass_rows(run, ta, lib, today)
     except SignInNeeded as e:
         lib["signin_failed"] = {**signin, "day": today, "seed": seed}
         res.stopped = "Microsoft sign-in needed"
@@ -546,7 +547,9 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
     res.plan, res.pending = plan, len(plan.lookups)
     _log_plan(run, res, len(games), len(rows), plan)
     if not res.dry_run:
-        writer.write_all(plan.actions)
+        _Writer(run, ta, lib, overrides, now, res).write_phase(plan.actions, {r.ta_id: r for r in rows})
+    elif lib.get("writing"):
+        run.say(f"library: {len(lib['writing'])} unfinished TA writes wait for a live run")
     return _end(run, res, lib, today)
 
 
@@ -563,14 +566,15 @@ def _backing_off(run, lib: dict, now: datetime, res: LibraryResult) -> bool:
 
 
 def _end(run, res: LibraryResult, lib: dict, today: str) -> LibraryResult:
-    """The run's summary; the day's pass is complete when nothing stopped it and no lookup or write is left. Its
-    stored TA collection read goes with it."""
-    res.complete = res.stopped is None and not res.pending and not res.left
+    """The run's summary; the day's pass is complete when nothing stopped or failed and no lookup or write is left.
+    Its stored TA collection read goes with it."""
+    res.complete = res.stopped is None and not res.failed and not res.pending and not res.left
     if res.complete:
         lib["last_pass"] = today
         lib.pop("pass", None)
     run.say(f"library: this run: looked up {res.looked_up}, written {len(res.written)}"
             + (f", {res.left} writes left" if res.left else "")
+            + (f", {len(res.failed)} failed" if res.failed else "")
             + (f", {res.pending} games waiting for a lookup" if res.pending else "")
             + (f"; stopped: {res.stopped}" if res.stopped else "")
             + ("; today's pass is complete" if res.complete else "; the pass goes on next run"))
@@ -580,25 +584,38 @@ def _end(run, res: LibraryResult, lib: dict, today: str) -> LibraryResult:
 def _owned(run, http, lib: dict) -> list[OwnedGame]:
     """Microsoft sign-in, licences, orders and the Store catalog -> the owned games. Every token and the XUID go to
     the scrubber the moment they exist; a working sign-in clears a recorded failed one. SignInNeeded passes
-    through; any other failure is a _ReadFailed: nothing is planned from a partial read."""
+    through; any other failure is a _ReadFailed: nothing is planned from a partial read. Data that can't be
+    classified is one too, named by its exception type only: the message could quote a price or an order."""
     try:
         s = open_session(http, TokenStore(run.cfg.xbox_token, run.cfg.xbox_refresh_token), run.scrub.add)
         run.scrub.add(s.xuid)
         lib.pop("signin_failed", None)
         items = fetch_collections(http, s)
         orders = fetch_orders(http, s)
-        pids = [i.get("productId") for i in items if i.get("productId")]
-        pids += [li.get("productId") for o in orders for li in o.get("orderLineItems") or [] if li.get("productId")]
-        catalog = catalog_lookup(http, pids)
+        catalog = catalog_lookup(http, _product_ids(items, orders))
     except SignInNeeded:
         raise
     except XboxError as e:
         raise _ReadFailed(f"library step: Microsoft read failed, nothing planned or written: {_err(e)}; "
                           "retried after 6 h") from None
-    games = owned_games(items, orders, catalog)
+    try:
+        games = owned_games(items, orders, catalog)
+    except Exception as e:  # noqa: BLE001 - malformed licences or orders
+        raise _ReadFailed(f"library step: Microsoft licences and orders could not be read ({type(e).__name__}), "
+                          "nothing planned or written; retried after 6 h") from None
     run.say(f"library: Microsoft: {len(items)} licences, {len(orders)} orders, {len(catalog)} catalog products; "
             f"{len(games)} games owned")
     return games
+
+
+def _product_ids(items: list, orders: list) -> list[str]:
+    """The product ids of the licences and order lines, whatever else their entries hold."""
+    out = [i["productId"] for i in items if isinstance(i, dict) and isinstance(i.get("productId"), str)]
+    for o in orders:
+        lines = o.get("orderLineItems") if isinstance(o, dict) else None
+        out += [li["productId"] for li in (lines if isinstance(lines, list) else [])
+                if isinstance(li, dict) and isinstance(li.get("productId"), str)]
+    return out
 
 
 def _lists(run, ta, lib: dict, now: datetime) -> tuple[set[int], set[int]]:
@@ -631,11 +648,12 @@ def _lists(run, ta, lib: dict, now: datetime) -> tuple[set[int], set[int]]:
     return out[0], out[1]
 
 
-def _pass_rows(run, ta, lib: dict, today: str) -> tuple[list[OwnedRow], bool]:
-    """(the TA collection, read this run). A day's pass reads it once, in its first run, never from the Deku
+def _pass_rows(run, ta, lib: dict, today: str) -> list[OwnedRow]:
+    """The TA collection for today's pass. A day's pass reads it once, in its first run, never from the Deku
     collection step's cache, and keeps it in state.library["pass"] = {"day", "rows", "done"}, where "done" lists
-    the TA ids the pass has written since; its later runs reuse it. A new day's pass reads it again. Any failed
-    read, an incomplete one included, is a _ReadFailed, so nothing is planned or written from it."""
+    the TA ids the pass has since written, found already written or changed, or failed to write: never planned
+    again in the pass. Its later runs reuse it; a new day's pass reads it again. Any failed read, an incomplete one
+    included, is a _ReadFailed, so nothing is planned or written from it."""
     stored = lib.get("pass")
     if isinstance(stored, dict) and stored.get("day") == today:
         try:
@@ -644,7 +662,7 @@ def _pass_rows(run, ta, lib: dict, today: str) -> tuple[list[OwnedRow], bool]:
             rows = None  # unreadable: read again
         if rows is not None:
             run.say(f"library: the TrueAchievements collection as this pass read it ({len(rows)} titles)")
-            return rows, False
+            return rows
     try:
         run.sleep(PACE)
         rows = ta.collection()
@@ -653,7 +671,7 @@ def _pass_rows(run, ta, lib: dict, today: str) -> tuple[list[OwnedRow], bool]:
                           f"{_err(e)}; retried after 6 h") from None
     lib["pass"] = {"day": today, "rows": [asdict(r) for r in rows], "done": []}
     run.say(f"library: read the TrueAchievements collection ({len(rows)} titles)")
-    return rows, True
+    return rows
 
 
 def _without(done: set[int], plan: LibraryPlan) -> LibraryPlan:
@@ -741,55 +759,104 @@ def _log_plan(run, res: LibraryResult, owned: int, titles: int, plan: LibraryPla
         run.say("library: check by hand: " + ", ".join(f"{k} {n}" for k, n in sorted(kinds.items())))
 
 
+def _reached(entry: dict) -> bool:
+    """Part of the write reached TA: the add, or a field set."""
+    return bool(entry.get("added") or entry.get("sets_done"))
+
+
 class _Writer:
-    """Live TA writes: at most cfg.library_budget games a run, PACE seconds before each request, none started past
-    the write deadline. Write-ahead: a write goes into state.library["writing"], saved, before its first request,
-    and leaves it after its last; one a crash left there is completed first on the next run (adding a game the
-    collection already lists posts nothing). Every write made, and every add found already made, goes into the
-    pass's "done", so the pass never plans it again. A planned add whose game TA already lists is never written:
-    the plan was made without that entry, so its ownership may be one only a paid order may change. That's an
-    issue when the collection was read this run; with the pass's stored read, TA listed it since (its own import),
-    so it is left for the next day's read."""
+    """The write phase (live): unfinished writes first, then the plan's.
+
+    - At most cfg.library_budget games a run, PACE seconds before each TA request, none started past the write
+      deadline; Cloudflare or network trouble stops the writes quietly (what was started stays for the next run).
+    - Write-ahead: a write goes into state.library["writing"] with what the plan saw of the entry ("expect"), saved
+      before its first request; its progress ("added", "sets_done") is saved after each request; it leaves after
+      its last. One left there (a crash, a stop, a partial failure) is completed at most once a pass, from where it
+      got to. A `library` override that skips its game drops it, as does one that names another page while nothing
+      of it reached TA.
+    - Compare-and-set: a field already right isn't posted, and an entry changed on TA since the read (ChangedOnTA)
+      is left as it is (a warning). An add whose game TA already lists is never written either (a warning): the
+      plan was made without that entry, so its ownership may be one only a paid order may change.
+    - A TA write error is an issue naming the game and its product ids (for a `skip` override); the run's other
+      writes go on, until MAX_WRITE_ERRORS errors come without a successful write between them. A failed write
+      that reached nothing on TA is dropped; a partial one stays for the next pass.
+    - Every write made, failed or found already made goes into the pass's "done": the pass never plans it again.
+    """
 
     def __init__(self, run, ta, lib: dict, overrides: dict[str, dict], now: datetime, res: LibraryResult):
         self.run, self.ta, self.lib, self.overrides, self.now, self.res = run, ta, lib, overrides, now, res
-        self.fresh = True  # the TA collection the plan was made from was read this run
+        self.today = now.astimezone(timezone.utc).date().isoformat()
+        self.errors = 0  # write errors since the last successful write
 
     @property
     def writing(self) -> dict:
         return self.lib.setdefault("writing", {})
 
-    def _done(self, game_id: int) -> None:
-        """The pass never plans this TA game again (the stored collection read predates the write)."""
+    def _done_ids(self) -> list:
         stored = self.lib.get("pass")
-        if isinstance(stored, dict) and stored.get("day") == self.now.astimezone(timezone.utc).date().isoformat():
-            done = stored.setdefault("done", [])
-            if game_id not in done:
-                done.append(game_id)
+        if isinstance(stored, dict) and stored.get("day") == self.today:
+            return stored.setdefault("done", [])
+        return []  # no pass of today's to plan from: nothing to keep out of it
 
-    def leftovers(self) -> bool:
-        """Complete the writes an earlier run left unfinished; False when one couldn't be (the step stops). A game a
-        `library` override now skips is dropped instead."""
-        for key, entry in sorted(self.writing.items()):
-            if any((self.overrides.get(p) or {}).get("ta") == SKIP for p in entry.get("pids") or ()):
-                self.writing.pop(key)
-                self.run.say(f"library: dropped the unfinished TA write of {entry.get('title')}: "
-                             "a library override skips it")
-                continue
-            self.run.say(f"library: completing the unfinished TA write of {entry.get('title')}")
-            if not self._write(key, entry):
-                return False
-        return True
+    def _done(self, game_id: int) -> None:
+        """The pass never plans this TA game again (its stored collection read predates the write)."""
+        done = self._done_ids()
+        if game_id not in done:
+            done.append(game_id)
 
-    def write_all(self, actions: list[Action]) -> None:
-        for n, a in enumerate(actions):
-            entry = {"kind": a.kind, "slug": a.slug, "ta_id": a.ta_id, "title": a.title,
-                     "sets": [list(s) for s in a.sets], "pids": list(a.game.pids), "since": self.now.isoformat()}
-            if not self._write(str(a.ta_id), entry, ahead=True):
-                self.res.left = len(actions) - n
+    def write_phase(self, actions: list[Action], rows: dict[int, OwnedRow]) -> None:
+        todo = [(key, entry, False) for key, entry in self._leftovers()]
+        todo += [(str(a.ta_id), self._entry(a, rows), True) for a in actions]
+        for n, (key, entry, ahead) in enumerate(todo):
+            if ahead and entry["ta_id"] in self._done_ids():
+                continue  # an unfinished write of the same game was just completed
+            if not self._write(key, entry, ahead=ahead):
+                self.res.left = len(todo) - n
                 return
 
-    def _write(self, key: str, entry: dict, *, ahead: bool = False) -> bool:
+    def _leftovers(self) -> list[tuple[str, dict]]:
+        """The unfinished writes to complete this pass (each at most once a pass)."""
+        out = []
+        for key, entry in sorted(self.writing.items()):
+            if entry.get("tried") == self.today:
+                continue  # it failed earlier in this pass: the next pass tries it again
+            pids = entry.get("pids") or ()
+            override = _override(pids, self.overrides)
+            if override == SKIP:
+                why = "a library override skips its game"
+            elif override and override.lower() != str(entry.get("slug") or "").lower() and not _reached(entry):
+                why = "its library override now names another page"
+            else:
+                out.append((key, entry))
+                continue
+            self.writing.pop(key)
+            self.run.say(f"library: dropped the unfinished TA write of {entry.get('title')}: {why}")
+        return out
+
+    def _entry(self, a: Action, rows: dict[int, OwnedRow]) -> dict:
+        """The write-ahead of an action, with what the plan saw of each field it sets: TA's defaults for a new
+        entry (Owned, no media), else the entry as the collection read showed it."""
+        if a.kind == "add":
+            expect = {"ownership": [OWNED], "media": [""]}
+        else:
+            row = rows[a.ta_id]  # a fix is always of an entry the read listed
+            expect = {"ownership": [row.ownership], "media": [row.media]}
+        return {"kind": a.kind, "slug": a.slug, "ta_id": a.ta_id, "title": a.title, "sets": [list(s) for s in a.sets],
+                "expect": expect, "pids": list(a.game.pids), "since": self.now.isoformat()}
+
+    def _save(self, entry: dict, *, before: bool = False) -> bool:
+        try:
+            self.run.checkpoint()
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.res.stopped = "state not saved"
+            when = "before writing" if before else "while writing"
+            self.run.issue(f"library step: state not saved {when} {entry['title']} on TrueAchievements "
+                           f"({type(e).__name__}); " + ("not written, " if before else "") + "library writes stopped")
+            return False
+
+    def _write(self, key: str, entry: dict, *, ahead: bool) -> bool:
+        """One game's write; False when the run's writes stop."""
         run, res = self.run, self.res
         if len(res.written) >= run.cfg.library_budget:
             res.stopped = "write budget"
@@ -800,45 +867,74 @@ class _Writer:
             return False
         if ahead:
             self.writing[key] = entry
-            try:
-                run.checkpoint()
-            except Exception as e:  # noqa: BLE001
+            if not self._save(entry, before=True):
                 self.writing.pop(key, None)
-                res.stopped = "state not saved"
-                run.issue(f"library step: state not saved before writing {entry['title']} on TrueAchievements "
-                          f"({type(e).__name__}); not written, library writes stopped")
                 return False
+        else:
+            run.say(f"library: completing the unfinished TA write of {entry['title']}")
+        game_id = int(entry["ta_id"])
+        expect = entry.get("expect") or {}
         try:
-            game_id = int(entry["ta_id"])
-            if entry["kind"] == "add":
+            if entry["kind"] == "add" and not entry.get("added"):
                 run.sleep(PACE)
-                self.ta.collection_add(entry["slug"], game_id=game_id, new=ahead)
+                self.ta.collection_add(entry["slug"], game_id=game_id, new=True)
+                entry["added"] = True
+                if not self._save(entry):
+                    return False
             for field_name, label in entry["sets"]:
+                if field_name in (entry.get("sets_done") or ()):
+                    continue
                 run.sleep(PACE)
-                self.ta.collection_set(game_id, field_name, label)
+                seen = expect.get(field_name)
+                self.ta.collection_set(game_id, field_name, label, expect=set(seen) if seen is not None else None)
+                entry.setdefault("sets_done", []).append(field_name)
+                if not self._save(entry):
+                    return False
         except AlreadyListed:
-            self.writing.pop(key, None)  # nothing written: the next day's pass plans it from a fresh read
-            self._done(game_id)
-            if not self.fresh:
-                run.say(f"library: TrueAchievements has listed {entry['title']} since this pass read the collection: "
-                        "left as it is until the next day's pass", logging.WARNING)
-                return True
-            res.stopped = "TrueAchievements collection read out of date"
-            run.issue(f"library step: TrueAchievements already has {entry['title']} in the collection, though the "
-                      "collection read didn't list it: left as it is, library writes stopped")
-            return False
+            self._left_alone(key, game_id, f"TrueAchievements already lists {entry['title']}, though the collection "
+                                           "read didn't; left as it is until the next day's pass")
+            return True
+        except ChangedOnTA:
+            self._left_alone(key, game_id, f"{entry['title']} changed on TrueAchievements since the read; left as is")
+            return True
         except TAError as e:
             if _unreachable(e):
                 res.stopped = f"TrueAchievements unreachable ({type(e).__name__})"
                 run.say(f"library: writing {entry['title']} stopped ({_err(e)}); retried next run", logging.WARNING)
-            else:
-                res.stopped = "TrueAchievements write failed"
-                run.issue(f"library step: TrueAchievements write failed for {entry['title']}: {_err(e)}; library "
-                          "writes stopped, retried next run (a library override \"skip\" on its product drops it)")
-            return False
+                return False
+            return self._failed(key, entry, game_id, e)
         self.writing.pop(key, None)
         self._done(game_id)
+        self.errors = 0
         res.written.append(entry["title"])
         run.say(f"library: {'added' if entry['kind'] == 'add' else 'fixed'} {entry['title']} "
                 f"({', '.join(label for _, label in entry['sets'])})")
         return True
+
+    def _left_alone(self, key: str, game_id: int, why: str) -> None:
+        self.writing.pop(key, None)
+        self._done(game_id)
+        self.run.say(f"library: {why}", logging.WARNING)
+
+    def _failed(self, key: str, entry: dict, game_id: int, e: TAError) -> bool:
+        """A TA write error: an issue naming the game and its products. The run's other writes go on, unless it is
+        the MAX_WRITE_ERRORS-th error since the last successful write."""
+        run, res = self.run, self.res
+        self._done(game_id)
+        res.failed.append(entry["title"])
+        if _reached(entry):
+            entry["tried"] = self.today
+            what = "partly written: the next day's pass tries the rest again"
+        else:
+            self.writing.pop(key, None)
+            what = "nothing written: the next day's pass plans it again"
+        products = ", ".join(entry.get("pids") or ()) or "unknown"
+        run.issue(f"library step: TrueAchievements write failed for {entry['title']}: {_err(e)}; {what}. To leave "
+                  f"the game out, add a library override \"skip\" for product {products}")
+        self.errors += 1
+        if self.errors < MAX_WRITE_ERRORS:
+            return True
+        res.stopped = f"{MAX_WRITE_ERRORS} TrueAchievements write errors in a row"
+        run.say(f"library: writes stopped after {MAX_WRITE_ERRORS} write errors in a row; the rest next run",
+                logging.WARNING)
+        return False

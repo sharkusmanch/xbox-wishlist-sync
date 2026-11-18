@@ -69,7 +69,12 @@ class NotFound(TAError):
 
 class Unreachable(TAError):
     """No answer from TrueAchievements itself: a network error, a Cloudflare challenge that a fresh clearance didn't
-    pass, or no usable clearance from FlareSolverr. A later run may get through."""
+    pass, no usable clearance from FlareSolverr, or a page that is neither a game page nor TA's page-not-found page
+    (maintenance, throttling). A later run may get through."""
+
+
+class ChangedOnTA(TAError):
+    """A collection entry no longer shows what the caller planned from (it was changed on TA since): nothing posted."""
 
 
 class IncompleteRead(TAError):
@@ -243,6 +248,8 @@ def _norm(s: str) -> str:
 
 
 _GC_BUTTON = re.compile(r"Postback\('btnGC_(Add|Remove)','(\d+)'\)")
+_OPTION = re.compile(r'<option value="([^"]*)"([^>]*)>([^<]*)</option>')
+NOT_FOUND_MARK = "PageNotFound404"  # in TA's page-not-found page, served with HTTP 200 for an unknown game address
 _LIST_ROW = re.compile(r'<tr\b[^>]*\bid="tr(\d+)"')
 _CANONICAL = re.compile(r'<link\b[^>]*\brel="canonical"[^>]*\bhref="([^"]*)"')
 
@@ -256,14 +263,27 @@ def parse_collection_page(page: str, slug: str) -> tuple[TAGame, bool]:
     return game, m.group(1) == "Remove"
 
 
-def edit_options(fragment: str, game_id: int) -> dict[str, list[tuple[str, str]]]:
-    """{field: [(value, label)]} from a GameCollection_EditOptions HTML fragment."""
-    out: dict[str, list[tuple[str, str]]] = {}
+def _selects(fragment: str, game_id: int):
+    """(field, [(value, attributes, label)]) for each collection dropdown in an EditOptions HTML fragment."""
     for field_name, prefix in COLLECTION_FIELDS.items():
         m = re.search(r'<select[^>]*\bid="%s_%d"[^>]*>(.*?)</select>' % (prefix, game_id), fragment, re.S)
         if m:
-            out[field_name] = [(html.unescape(v), html.unescape(t).strip())
-                               for v, t in re.findall(r'<option value="([^"]*)"[^>]*>([^<]*)</option>', m.group(1))]
+            yield field_name, [(html.unescape(v), a, html.unescape(t).strip())
+                               for v, a, t in _OPTION.findall(m.group(1))]
+
+
+def edit_options(fragment: str, game_id: int) -> dict[str, list[tuple[str, str]]]:
+    """{field: [(value, label)]} from a GameCollection_EditOptions HTML fragment."""
+    return {field_name: [(v, t) for v, _, t in opts] for field_name, opts in _selects(fragment, game_id)}
+
+
+def selected_options(fragment: str, game_id: int) -> dict[str, str]:
+    """{field: the label of its selected option} from an EditOptions fragment (`<option value="1"
+    selected="selected">Owned</option>`): blank when none is selected or the blank option (value "" or "0") is."""
+    out: dict[str, str] = {}
+    for field_name, opts in _selects(fragment, game_id):
+        chosen = next(((v, t) for v, a, t in opts if re.search(r"\bselected\b", a)), ("", ""))
+        out[field_name] = "" if chosen[0] in ("", "0") else chosen[1]
     return out
 
 
@@ -796,16 +816,19 @@ class TAClient:
         return parse_game(p.html, slug)
 
     def game_page_or_none(self, slug: str) -> TAGame | None:
-        """The game page at /game/<slug>, or None when there is none there: HTTP 404, or a page that isn't one
-        game's page. Any other failure raises (Unreachable for the network or Cloudflare)."""
+        """The game page at /game/<slug>, or None when there is none there: HTTP 404, or TA's page-not-found page.
+        Any other page that isn't one game's page is Unreachable (maintenance, throttling), never "no page"; other
+        failures raise as usual."""
         try:
             p = self._get(BASE + "/game/" + quote(slug, safe=""), need_login=False)
         except NotFound:
             return None
+        if NOT_FOUND_MARK in p.html:
+            return None
         try:
             return parse_game(p.html, slug)
-        except TAError:
-            return None
+        except TAError as e:
+            raise Unreachable(f"game page {slug!r} is neither a game page nor TA's page-not-found page ({e})") from None
 
     def dlc(self, game: int | str) -> list[tuple[str, int]]:
         """(title, DLC id) pairs from `/game/<slug>/dlc`; a game id is resolved to its slug first."""
@@ -870,22 +893,32 @@ class TAClient:
             raise TAError(f"collection add of {slug!r} was not accepted (no Remove button afterwards)")
         return game.id
 
-    def collection_set(self, game_id: int, field_name: str, label: str) -> None:
-        """Set a Game Collection entry's ownership or media to the option labelled `label`."""
+    def collection_set(self, game_id: int, field_name: str, label: str, expect=None) -> bool:
+        """Set a Game Collection entry's ownership or media to the option labelled `label`; True when it posted.
+        Compare-and-set on the one EditOptions read: an entry that already shows `label` is left as it is, and with
+        `expect` (the labels the caller planned from) one that shows anything else raises ChangedOnTA; neither
+        posts anything."""
         _check_id(game_id, zero_ok=False)
         if field_name not in COLLECTION_FIELDS:
             raise TAError(f"collection field must be one of: {', '.join(COLLECTION_FIELDS)}")
         what = f"collection {field_name} of {game_id}"
-        options = edit_options(self._collection_ajax(
-            what, "GameCollection_EditOptions", game_id, {"bDropDownOnly": False}), game_id)
+        fragment = self._collection_ajax(what, "GameCollection_EditOptions", game_id, {"bDropDownOnly": False})
+        options = edit_options(fragment, game_id)
         if field_name not in options:
             raise TAError(f"{what}: TA offers no {field_name} dropdown (is the game in the collection?)")
         value, chosen = pick_option(options[field_name], field_name, label)
+        current = selected_options(fragment, game_id).get(field_name, "")
+        if _norm(current) == _norm(chosen):
+            return False
+        if expect is not None and _norm(current) not in {_norm(e) for e in expect}:
+            raise ChangedOnTA(f"{what}: TA shows {current or 'none'!r}, the plan saw "
+                              + " or ".join(repr(e or "none") for e in sorted(expect)))
         d = self._collection_ajax(what, "GameCollection_UpdateGame", game_id, {}, {
             "Field": f"{COLLECTION_FIELDS[field_name]}_{game_id}", "Value": value})
         got = d.get("UpdateValue") if isinstance(d, dict) else None
         if _norm(got or "") != _norm(chosen):
             raise TAError(f"{what}: TA answered {got!r}, expected {chosen!r}")
+        return True
 
     def _collection_ajax(self, what: str, method: str, game_id: int, extra: dict, data: dict | None = None):
         """One GameCollection_* call: its `d`, logging in again once on a logged-out answer."""

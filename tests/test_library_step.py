@@ -41,14 +41,14 @@ class FakeXbox:
         self.issued = 0
         self.refreshed_with = []  # the refresh tokens presented, in order
 
-    def own(self, pid, title, gen=("ConsoleGen9",)):
+    def own(self, pid, title, gen=("ConsoleGen9",), price=PRICE):
         """A paid Store purchase with an active Collections licence."""
         oid = f"ORD-{len(self.orders) + 1:04d}-Q"
         self.licences.append({"productId": pid, "productKind": "Game", "status": "Active", "orderId": oid,
                               "acquiredDate": "2025-03-01T00:00:00Z"})
         self.orders.append({"orderId": oid, "orderState": "Purchased", "orderPlacedDate": "2025-03-01T00:00:00Z",
                             "orderLineItems": [{"productId": pid, "title": title, "productType": "Game",
-                                                "totalAmount": PRICE, "billingState": "Charged",
+                                                "totalAmount": price, "billingState": "Charged",
                                                 "fulfillmentState": "Fulfilled"}]})
         self.products[pid] = {"ProductId": pid, "ProductType": "Game", "LocalizedProperties": [{"ProductTitle": title}],
                               "Properties": {"XboxConsoleGenOptimized": list(gen)},
@@ -67,7 +67,8 @@ class FakeXbox:
             if self.reject:
                 return 400, {"error": "invalid_grant"}
             self.issued += 1
-            return 200, {"access_token": f"access-tok-{self.issued}-Qx", "refresh_token": f"rt-rotated-{self.issued}-Zp"}
+            return 200, {"access_token": f"access-tok-{self.issued}-Qx",
+                         "refresh_token": f"rt-rotated-{self.issued}-Zp"}
         if url == xbox.XBL_URL:
             return 200, {"Token": "user-tok-Wk3", "DisplayClaims": {"xui": [{"uhs": "uhs-77"}]}}
         if url == xbox.XSTS_URL:
@@ -192,7 +193,8 @@ def test_dry_run_writes_nothing_and_plans_everything(tmp_path, caplog):
     for n in range(1, 31):
         assert f"library: would fix Example Mending {n:02d} (Owned, Digital)" in said
     assert "library: would add Example Finding (Owned, Digital)" in said
-    assert "library: check by hand (possible-match): Example Arena: possible match in TA: Example Arena: Champions Cup" in said
+    assert ("library: check by hand (possible-match): Example Arena: possible match in TA: "
+            "Example Arena: Champions Cup") in said
     assert "already right 0; would add 1; would fix 30; check by hand 1" in said
     state = load_state(h.cfg.state)
     assert state.library["last_pass"] == "2026-11-01" and not state.library.get("writing")
@@ -214,8 +216,9 @@ def test_live_adds_and_fixes_within_the_budget(tmp_path):
     assert len(run_1) == 25  # 30 actions, library_budget 25
     assert run_1[:4] == [901, 902, 903, 904] and [w for w in h.ta.writes if w[0] == "gc-add"] == [
         ("gc-add", f"Example-Finding-{n}") for n in range(1, 5)]
-    assert h.ta.writes[:3] == [("gc-add", "Example-Finding-1"), ("gc-set", 901, "ownership", "Owned"),
-                               ("gc-set", 901, "media", "Digital")]
+    # a new entry is already Owned on TA: only its media is posted
+    assert h.ta.writes[:2] == [("gc-add", "Example-Finding-1"), ("gc-set", 901, "media", "Digital")]
+    assert ("gc-set", 901, "ownership", "Owned") in h.ta.calls  # asked, compared, not posted
     assert "last_pass" not in library_state(h) and not library_state(h).get("writing")
     assert_paced(h.ta.calls)
     h.ta.writes.clear()
@@ -483,49 +486,145 @@ def test_an_add_interrupted_before_its_field_sets_is_completed_next_run(tmp_path
     h = library_only(tmp_path, dry=False)
     h.xbox.own(pid(1), "Example Finding")
     h.ta.pages["Example-Finding"] = page(901, "Example Finding")
-    on_disk = []
-    h.ta.on_add = lambda slug: on_disk.append(library_state(h).get("writing"))
-    h.ta.fail_set[(901, "ownership")] = Terminated()  # SIGTERM after the add, before its field sets
+    on_disk = {}
+    h.ta.on_add = lambda slug: on_disk.update(before_add=library_state(h).get("writing"))
+
+    def sigterm(game_id, field_name):  # SIGTERM after the add, before its field sets
+        on_disk["after_add"] = library_state(h)["writing"]["901"]
+        raise Terminated()
+
+    h.ta.on_set = sigterm
     assert h.run() == 1
-    assert list(on_disk[0]) == ["901"]  # the write-ahead was saved before the add
-    assert on_disk[0]["901"]["kind"] == "add" and on_disk[0]["901"]["slug"] == "Example-Finding"
+    ahead = on_disk["before_add"]["901"]  # the write-ahead was saved before the add ...
+    assert ahead["kind"] == "add" and ahead["slug"] == "Example-Finding" and not ahead.get("added")
+    assert ahead["expect"] == {"ownership": ["Owned"], "media": [""]}  # TA's defaults for a new entry
+    assert on_disk["after_add"]["added"] is True  # ... and its progress after it
     assert h.ta.writes == [("gc-add", "Example-Finding")]
-    assert list(library_state(h)["writing"]) == ["901"]
-    del h.ta.fail_set[(901, "ownership")]
+    h.ta.on_set = None
     h.ta.calls.clear()
     h.xbox.journal = h.ta.calls
     h.now = NOW + H
     assert h.run() == 0
-    first = [c for c in h.ta.calls if c[0] != "sleep"][:3]
-    assert first == [("gc-add", "Example-Finding"), ("gc-set", 901, "ownership", "Owned"),
-                     ("gc-set", 901, "media", "Digital")]  # completed first, before any read
-    assert h.ta.writes == [("gc-add", "Example-Finding"), ("gc-set", 901, "ownership", "Owned"),
-                           ("gc-set", 901, "media", "Digital")]  # the second add posted nothing
-    assert [c for c in h.ta.calls if c[0] == "gc-add"] == [("gc-add", "Example-Finding")]  # done for the pass
+    first_write = next(i for i, c in enumerate(h.ta.calls) if c[0] == "gc-set")
+    assert ("collection",) not in h.ta.calls  # the pass's stored read
+    assert any(c[0] == "microsoft" for c in h.ta.calls[:first_write])  # completed in the write phase, after the reads
+    assert not [c for c in h.ta.calls if c[0] == "gc-add"]  # already added: not asked again, nor planned again
+    assert h.ta.writes == [("gc-add", "Example-Finding"), ("gc-set", 901, "media", "Digital")]
     assert library_state(h)["writing"] == {} and library_state(h)["last_pass"] == "2026-11-01"
     assert_paced(h.ta.calls)
 
 
-def test_a_ta_write_error_is_an_issue_that_stops_the_writes(tmp_path):
+def test_a_write_that_keeps_failing_never_holds_up_the_step(tmp_path):
+    """The review's probe: a permanent TA error on 501's write."""
     h = library_only(tmp_path, dry=False)
     h.xbox.own(pid(1), "Example Mending 01")
     h.xbox.own(pid(2), "Example Mending 02")
     h.ta.owned_rows = [wrong(501, "Example Mending 01"), wrong(502, "Example Mending 02")]
-    h.ta.fail_set[(501, "media")] = TAError("collection media of 501: TA answered 'Disc', expected 'Digital'")
+    h.ta.fail_set[(501, "ownership")] = TAError("collection ownership of 501: ownership='Owned' matches no option")
     assert h.run() == 1
     issue = h.last_issues()[0]
-    assert "Example Mending 01" in issue and "expected 'Digital'" in issue
-    assert written(h) == [501] and not [w for w in h.ta.writes if w[1] == 502]  # the second isn't started
-    assert list(library_state(h)["writing"]) == ["501"] and "last_pass" not in library_state(h)
-    del h.ta.fail_set[(501, "media")]
-    h.ta.writes.clear()
+    assert "Example Mending 01" in issue and "matches no option" in issue
+    assert f'library override "skip" for product {pid(1)}' in issue  # the product id to put in a skip override
+    assert written(h) == [502]  # the run's other writes go on
+    assert library_state(h)["writing"] == {}  # nothing reached TA: not a leftover
+    microsoft = len(h.xbox.calls)
+    h.ta.calls.clear()
     h.now = NOW + H
-    assert h.run() == 0
-    assert h.ta.writes[:2] == [("gc-set", 501, "ownership", "Owned"), ("gc-set", 501, "media", "Digital")]
-    assert written(h) == [501, 502] and library_state(h)["writing"] == {}
+    assert h.run() == 0  # the pass goes on: read, planned, 501 not tried again today
+    assert len(h.xbox.calls) > microsoft and not [c for c in h.ta.calls if c[0] == "gc-set"]
+    assert library_state(h)["last_pass"] == "2026-11-01"
+    h.xbox.own(pid(3), "Example Mending 03")  # a new purchase
+    h.ta.owned_rows.append(wrong(503, "Example Mending 03"))
+    h.ta.calls.clear()
+    h.now = NOW + DAY  # the next day's pass: read, planned and written; 501 is tried again (an issue again)
+    assert h.run() == 1
+    assert ("gc-set", 501, "ownership", "Owned") in h.ta.calls and written(h) == [502, 503]
+    assert library_state(h)["writing"] == {}
 
 
-def test_an_add_whose_game_ta_already_lists_changes_nothing(tmp_path):
+def test_a_partly_written_entry_is_tried_once_in_each_later_pass(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Finding")
+    h.ta.pages["Example-Finding"] = page(901, "Example Finding")
+    h.ta.fail_set[(901, "media")] = TAError("collection media of 901: TA answered 'Disc', expected 'Digital'")
+    assert h.run() == 1  # added, then the media set failed: partly written
+    entry = library_state(h)["writing"]["901"]
+    assert entry["added"] is True and entry["sets_done"] == ["ownership"] and entry["tried"] == "2026-11-01"
+    assert pid(1) in h.last_issues()[0]
+    h.ta.calls.clear()
+    h.now = NOW + H
+    assert h.run() == 0 and not [c for c in h.ta.calls if c[0] in ("gc-add", "gc-set")]  # not tried every run
+    h.now = NOW + DAY  # the next pass tries it once: still failing, still kept
+    assert h.run() == 1
+    assert [c[1:] for c in h.ta.calls if c[0] == "gc-set"] == [(901, "media", "Digital")]
+    assert library_state(h)["writing"]["901"]["tried"] == "2026-11-02"
+    h.ta.calls.clear()
+    h.now = NOW + DAY + H
+    assert h.run() == 0 and not [c for c in h.ta.calls if c[0] == "gc-set"]
+    del h.ta.fail_set[(901, "media")]
+    h.now = NOW + 2 * DAY
+    assert h.run() == 0 and library_state(h)["writing"] == {}
+    assert h.ta.writes == [("gc-add", "Example-Finding"), ("gc-set", 901, "media", "Digital")]
+
+
+def test_three_write_errors_in_a_row_stop_the_writes(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    for n in range(1, 5):
+        h.xbox.own(pid(n), f"Example Mending {n:02d}")
+        h.ta.owned_rows.append(wrong(500 + n, f"Example Mending {n:02d}"))
+    for n in (1, 2, 3):
+        h.ta.fail_set[(500 + n, "ownership")] = TAError(f"collection ownership of {500 + n}: HTTP 500")
+    assert h.run() == 1
+    assert len(h.last_issues()) == 3 and written(h) == []
+    assert not [c for c in h.ta.calls if c[0] == "gc-set" and c[1] == 504]  # not started
+    h.ta.fail_set.clear()
+    h.now = NOW + H
+    assert h.run() == 0 and written(h) == [504]  # the rest next run; the failed three wait for the next day
+    assert library_state(h)["last_pass"] == "2026-11-01"
+
+
+def test_a_leftover_whose_override_now_names_another_page(tmp_path):
+    """Dropped when nothing of it reached TA; completed when part of it did."""
+    entry = {"kind": "add", "slug": "Example-Finding", "ta_id": 901, "title": "Example Finding",
+             "sets": [["ownership", "Owned"], ["media", "Digital"]], "expect": {"ownership": ["Owned"], "media": [""]},
+             "pids": [pid(1)]}
+    for reached in (False, True):
+        (tmp_path / str(reached)).mkdir()
+        h = library_only(tmp_path / str(reached), dry=False,
+                         overrides={"library": {pid(1): {"ta": "Example-Finding-Reforged"}}})
+        h.xbox.own(pid(1), "Example Finding")
+        h.ta.pages["Example-Finding"] = page(901, "Example Finding")
+        h.ta.pages["Example-Finding-Reforged"] = page(905, "Example Finding Reforged")
+        if reached:
+            h.ta.owned_rows = [OwnedRow(901, "Example Finding", SX, "Owned", "")]
+        save_state(h.cfg.state, State(library={"writing": {"901": {**entry, "added": reached}}}))
+        assert h.run() == 0
+        assert library_state(h)["writing"] == {}
+        done_901 = [w for w in h.ta.writes if 901 in w or "Example-Finding" in w]
+        assert done_901 == ([("gc-set", 901, "media", "Digital")] if reached else [])
+        assert ("gc-add", "Example-Finding-Reforged") in h.ta.writes  # the override's page, from the plan
+
+
+def test_a_field_changed_by_hand_since_the_read_is_left_as_it_is(tmp_path, caplog):
+    """The review's probe: 502 set to Owned / Disc by hand between two runs of a pass that reuses its read."""
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=False, library_budget=1)
+    h.xbox.own(pid(1), "Example Mending 01")
+    h.xbox.own(pid(2), "Example Mending 02")
+    h.ta.owned_rows = [wrong(501, "Example Mending 01"), wrong(502, "Example Mending 02")]
+    assert h.run() == 0 and written(h) == [501]
+    h.ta.owned_rows[1] = OwnedRow(502, "Example Mending 02", SX, "Owned", "Disc")  # by hand on TA
+    h.cfg.library_budget = 25
+    h.now = NOW + H
+    assert h.run() == 0 and h.reporter.notes == []
+    assert not [w for w in h.ta.writes if w[1] == 502]  # nothing posted for 502
+    assert h.ta.owned_rows[1].media == "Disc"
+    assert any("Example Mending 02 changed on TrueAchievements since the read; left as is" in m
+               for m in lines(caplog))
+    assert library_state(h)["writing"] == {} and library_state(h)["last_pass"] == "2026-11-01"
+
+
+def test_an_add_whose_game_ta_already_lists_changes_nothing(tmp_path, caplog):
     """The page says the game is in the collection although the collection read didn't list it (TA's own import
     just added it, or the read can't see it): the plan was made without its entry, so nothing is set on it."""
     h = library_only(tmp_path, dry=False)
@@ -534,17 +633,13 @@ def test_an_add_whose_game_ta_already_lists_changes_nothing(tmp_path):
     h.ta.owned_rows = [wrong(501, "Example Mending 01")]
     h.ta.pages["Example-Finding"] = page(901, "Example Finding")
     h.ta.unlisted = {901}
-    assert h.run() == 1
-    assert h.ta.writes == []  # no field set on it, and the writes stopped
-    assert "already has Example Finding in the collection, though the collection read didn't list it" in (
-        h.last_issues()[0])
+    caplog.set_level(logging.INFO)
+    assert h.run() == 0 and h.reporter.notes == []  # a warning, never an issue
+    assert any("already lists Example Finding" in m for m in lines(caplog))
+    assert not [w for w in h.ta.writes if 901 in w or "Example-Finding" in w]  # no field set on it
+    assert written(h) == [501]  # the other write goes on
     assert library_state(h)["writing"] == {}  # not a write to complete next run
-    pings = len(h.reporter.notes)
-    h.ta.calls.clear()
-    h.now = NOW + H
-    assert h.run() == 0  # the pass goes on: the game is done for today, the other write is made
-    assert ("gc-add", "Example-Finding") not in h.ta.calls and written(h) == [501]
-    assert len(h.reporter.notes) == pings
+    assert library_state(h)["last_pass"] == "2026-11-01"  # the next day's pass plans it from a fresh read
 
 
 def test_an_add_ta_listed_since_the_pass_read_the_collection_is_left_alone_quietly(tmp_path, caplog):
@@ -562,8 +657,36 @@ def test_an_add_ta_listed_since_the_pass_read_the_collection_is_left_alone_quiet
     h.now = NOW + H
     assert h.run() == 0 and h.reporter.notes == []
     assert written(h) == [901, 903]  # Example Finding 2 is left as TA has it; the next write goes on
-    assert any("Example Finding 2" in m and "since this pass read the collection" in m for m in lines(caplog))
+    assert any("already lists Example Finding 2" in m for m in lines(caplog))
     assert library_state(h)["last_pass"] == "2026-11-01"
+
+
+def test_a_malformed_price_is_a_read_failure_that_never_quotes_it(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Finding", price="47,31 EUR")
+    assert h.run() == 1
+    issue = h.last_issues()[0]
+    assert "Microsoft" in issue and "ValueError" in issue
+    assert "47,31" not in caplog.text + json.dumps(h.reporter.notes) + json.dumps(library_state(h))
+    assert library_state(h)["failed"]["at"] == NOW.isoformat()  # the 6 h back-off
+
+
+def test_page_not_found_is_no_page_and_any_other_odd_page_caches_nothing(tmp_path):
+    """Through the real client: TA's page-not-found page (HTTP 200) is cached as no page; a page that is neither a
+    game nor that (maintenance, throttling) stops the lookups quietly, nothing cached."""
+    from test_ta import NOT_FOUND, logged_in, resp
+
+    h = library_only(tmp_path, dry=True)
+    h.xbox.own(pid(1), "Example Finding")
+    h.xbox.own(pid(2), "Example Seeking")
+    client, _ = logged_in({("GET", "/game/Example-Finding"): resp(NOT_FOUND),
+                           ("GET", "/game/Example-Seeking"): resp("<html><title>Down for maintenance</title></html>")})
+    h.ta.game_page_or_none = client.game_page_or_none
+    assert h.run() == 0 and h.reporter.notes == []
+    pages = library_state(h)["pages"]
+    assert pages[pid(1)]["pages"] == [] and pid(2) not in pages
+    assert "last_pass" not in library_state(h)
 
 
 def test_cloudflare_or_network_trouble_while_writing_stops_quietly(tmp_path, caplog):

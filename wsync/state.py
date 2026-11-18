@@ -47,8 +47,9 @@ class State:
     #              day's pass read in its first run, and the TA ids it has written since; dropped when it completes;
     #   "lists": {"games-with-gold" | "ea-play": {"fetched": iso, "ids": [TA game id], "tried": iso}};
     #   "pages": {lookup key: {"checked": iso, "slugs": [addresses tried], "pages": [TAGame as dict]}};
-    #   "writing": {TA game id: {"kind", "slug", "ta_id", "sets", "title", "pids", "since"}}  write-ahead:
-    #              saved before a write's first request, removed after its last;
+    #   "writing": {TA game id: {"kind", "slug", "ta_id", "title", "sets", "expect" (the labels the plan saw per
+    #              field), "pids", "since", "added", "sets_done", "tried" (the pass day a write error kept it)}}
+    #              write-ahead: saved before a write's first request and after each, removed after its last;
     #   "seen": [Store product id]  review items already reported (decision A).
     library: dict = field(default_factory=dict)
 

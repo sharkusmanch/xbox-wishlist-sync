@@ -1231,15 +1231,29 @@ def test_property_list_of_exactly_a_full_page_ends_by_its_own_pagination():
 # ---------------------------------------------------------------- library step: page lookups and failure kinds
 
 
+# TA's page-not-found page, served with HTTP 200 for an unknown game address (verified live 2026-11-17)
+NOT_FOUND = ('<html><head><title>Page not found | TrueAchievements</title></head><body class="ta">'
+             '<main id="PageNotFound404"><h1 class="pagetitle">Page not found</h1></main></body></html>')
+
+
 def test_game_page_or_none_reads_a_game_page_and_says_none_where_there_is_none():
     c, http = logged_in({("GET", "/game/Example-Quest"): resp(COLL_GAME),
                          ("GET", "/game/Missing-Quest"): resp("<html>Page not found</html>", status=404),
-                         ("GET", "/game/Not-A-Game"): resp("<html><title>Home | TrueAchievements</title></html>")})
+                         ("GET", "/game/Unknown-Quest"): resp(NOT_FOUND)})
     page = c.game_page_or_none("Example-Quest")
     assert (page.id, page.title, page.slug) == (12345, "Example Quest", "Example-Quest")
     assert c.game_page_or_none("Missing-Quest") is None  # HTTP 404
-    assert c.game_page_or_none("Not-A-Game") is None  # a page that isn't one game's page
-    assert http.urls() == ["/game/Example-Quest", "/game/Missing-Quest", "/game/Not-A-Game"]
+    assert c.game_page_or_none("Unknown-Quest") is None  # TA's page-not-found page
+    assert http.urls() == ["/game/Example-Quest", "/game/Missing-Quest", "/game/Unknown-Quest"]
+
+
+def test_a_page_that_is_neither_a_game_nor_page_not_found_is_unreachable():
+    """A maintenance, throttle or changed page: never "no page", so nothing is cached from it."""
+    for body in ("<html><title>Down for maintenance | TrueAchievements</title></html>",
+                 COLL_GAME + '<div data-game="777"></div>'):  # two game ids
+        c, _ = logged_in({("GET", "/game/Example-Quest"): resp(body)})
+        with pytest.raises(ta.Unreachable, match="Example-Quest"):
+            c.game_page_or_none("Example-Quest")
 
 
 def test_game_page_or_none_raises_every_other_failure():
@@ -1298,3 +1312,35 @@ def test_a_new_collection_add_refuses_a_game_already_in_the_collection():
         c.collection_add("Example-Quest", new=True)
     assert c.collection_add("Example-Quest") == 12345  # without `new`: left as it is, its id returned
     assert http.urls("POST") == []
+
+
+REAL_EDIT_OPTIONS = (  # the markup of a real EditOptions answer (verified 2026-11-17): value first, then selected
+    '<select id="ddlOwnershipStatusID_777"><option value="0"></option><option value="1" selected="selected">Owned'
+    '</option><option value="8">Games with Gold</option></select><select id="ddlGameMediaID_777">'
+    '<option value="0" selected="selected"></option><option value="1">Disc</option><option value="2">Digital'
+    '</option></select>')
+
+
+def test_selected_options_are_read_from_edit_options():
+    assert ta.selected_options(EDIT_OPTIONS, 12345) == {"ownership": "Owned", "media": ""}  # media: none selected
+    assert ta.selected_options(REAL_EDIT_OPTIONS, 777) == {"ownership": "Owned", "media": ""}  # the blank option
+    assert ta.selected_options(EDIT_OPTIONS.replace('value="2">', 'value="2" selected="selected">'),
+                               12345)["media"] == "Digital"
+    assert ta.selected_options(EDIT_OPTIONS, 999) == {}
+
+
+def test_collection_set_compares_before_it_sets():
+    # already the label asked for: nothing posted
+    c, http = logged_in({("POST", EDIT): edit_answer()})
+    assert c.collection_set(12345, "ownership", "Owned", expect={"No longer have"}) is False
+    assert not any(x["url"].endswith("UpdateGame") for x in http.calls) and len(http.calls) == 1
+    # changed on TA since the caller's read: ChangedOnTA, nothing posted
+    c, http = logged_in({("POST", EDIT): edit_answer()})
+    with pytest.raises(ta.ChangedOnTA, match="Owned"):
+        c.collection_set(12345, "ownership", "Games with Gold", expect={"No longer have", "Renting"})
+    assert not any(x["url"].endswith("UpdateGame") for x in http.calls)
+    # what the caller saw: posted as before
+    c, http = logged_in({("POST", EDIT): edit_answer(),
+                         ("POST", UPDATE): ajax((200, {"d": {"UpdateValue": "Digital"}}))})
+    assert c.collection_set(12345, "media", "Digital", expect={""}) is True
+    assert sum(x["url"].endswith("UpdateGame") for x in http.calls) == 1
