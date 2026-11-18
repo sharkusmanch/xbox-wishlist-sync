@@ -505,3 +505,20 @@ def test_collection_360_review_task_upserts_closes_and_survives_the_problem_sync
     assert len(fake.tasks) == 1 and not any(t["done"] for t in fake.tasks.values())
     assert collection_360_review_task(vk_with(fake), None) is False
     assert all(t["done"] for t in fake.tasks.values())
+
+
+def test_library_tasks_survive_the_problem_sync():
+    from wsync.report import (LIBRARY_CHECK_KEY, LIBRARY_CHECK_TITLE, LIBRARY_REVIEW_KEY, LIBRARY_SIGNIN_KEY,
+                              LIBRARY_SIGNIN_TITLE, _REVIEW_KEYS, library_task)
+
+    assert (LIBRARY_REVIEW_KEY, LIBRARY_CHECK_KEY, LIBRARY_SIGNIN_KEY) == (
+        "library-review:dry-run", "library-check", "library-signin")
+    assert {LIBRARY_REVIEW_KEY, LIBRARY_CHECK_KEY, LIBRARY_SIGNIN_KEY} <= _REVIEW_KEYS
+    fake = FakeVikunja()
+    assert library_task(vk_with(fake), LIBRARY_CHECK_KEY, LIBRARY_CHECK_TITLE, "- Example Game") is True
+    assert library_task(vk_with(fake), LIBRARY_CHECK_KEY, LIBRARY_CHECK_TITLE, "- Example Game") is False
+    assert library_task(vk_with(fake), LIBRARY_SIGNIN_KEY, LIBRARY_SIGNIN_TITLE, "fix it") is True
+    sync_problem_tasks(vk_with(fake), [])  # the problem sync closes none of them
+    assert {t["title"] for t in fake.tasks.values() if not t["done"]} == {LIBRARY_CHECK_TITLE, LIBRARY_SIGNIN_TITLE}
+    assert library_task(vk_with(fake), LIBRARY_CHECK_KEY, LIBRARY_CHECK_TITLE, None) is False  # None closes it
+    assert [t["title"] for t in fake.tasks.values() if not t["done"]] == [LIBRARY_SIGNIN_TITLE]

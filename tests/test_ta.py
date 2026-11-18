@@ -1071,3 +1071,348 @@ def test_errors_never_carry_the_gamertag():
     with pytest.raises(TAError) as e:
         c.wishlist()
     assert "Test" not in str(e.value) and "Gamer/" not in str(e.value)
+
+
+# ---------------------------------------------------------------- Game Collection writes
+
+COLL_GAME = fixture("ta_game_collection.html")
+COLL_GAME_IN = fixture("ta_game_collection_in.html")
+EDIT_OPTIONS = fixture("ta_edit_options.html")
+EXAMPLE = "/game/Example-Quest"
+EDIT = "=/ajaxfunctions.aspx/GameCollection_EditOptions"
+UPDATE = "=/ajaxfunctions.aspx/GameCollection_UpdateGame"
+
+
+def test_collection_page_says_whether_the_game_is_in_the_collection():
+    c, _ = logged_in({("GET", EXAMPLE): [resp(COLL_GAME), resp(COLL_GAME_IN)]})
+    game, have = c.collection_page("Example-Quest")
+    assert (game.id, game.title, game.platform, have) == (12345, "Example Quest", "Xbox Series X|S", False)
+    assert c.collection_page("Example-Quest")[1] is True
+    c, _ = logged_in({("GET", EXAMPLE): resp(COLL_GAME.replace("Postback('btnGC_Add'", "Postback('x'"))})
+    with pytest.raises(TAError, match="Game Collection button"):
+        c.collection_page("Example-Quest")
+
+
+def test_collection_add_posts_the_pages_own_postback_and_checks_the_remove_button():
+    c, http = logged_in({("GET", EXAMPLE): resp(COLL_GAME), ("POST", EXAMPLE): resp(COLL_GAME_IN)})
+    assert c.collection_add("Example-Quest") == 12345
+    post = next(x for x in http.calls if x["method"] == "POST")
+    form = parse_qs(post["body"], keep_blank_values=True)
+    assert form["Command"] == ["btnGC_Add"] and form["Argument"] == ["12345"]
+    assert form["__VIEWSTATE"] == ["vs-example&1"] and form["__EVENTVALIDATION"] == ["ev-example"]
+    assert not {"chkSkip", "rdoSkip", "txtPassword", "btnSkip"} & set(form)
+    assert post["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+    assert post["headers"]["Referer"] == BASE + EXAMPLE and post["headers"]["Origin"] == BASE
+    # a page that still offers Add means the postback was not accepted
+    c, _ = logged_in({("GET", EXAMPLE): resp(COLL_GAME), ("POST", EXAMPLE): resp(COLL_GAME)})
+    with pytest.raises(TAError, match="not accepted"):
+        c.collection_add("Example-Quest")
+
+
+def test_collection_add_posts_to_the_page_it_read_after_its_redirects():
+    c, http = logged_in({("GET", "/game/Old-Quest"): resp("", status=301, location="/game/Example-Quest"),
+                         ("GET", EXAMPLE): resp(COLL_GAME), ("POST", EXAMPLE): resp(COLL_GAME_IN)})
+    assert c.collection_add("Old-Quest") == 12345
+    post = next(x for x in http.calls if x["method"] == "POST")
+    assert post["url"] == BASE + EXAMPLE and post["headers"]["Referer"] == BASE + EXAMPLE
+
+
+def test_collection_add_of_a_game_already_listed_posts_nothing():
+    c, http = logged_in({("GET", EXAMPLE): resp(COLL_GAME_IN)})
+    assert c.collection_add("Example-Quest") == 12345
+    assert http.urls("POST") == []
+
+
+def edit_answer(html=EDIT_OPTIONS):
+    return ajax((200, {"d": html}))
+
+
+def test_collection_set_picks_the_option_by_label_and_checks_the_answer():
+    c, http = logged_in({
+        ("POST", EDIT): edit_answer(),
+        ("POST", UPDATE): ajax((200, {"d": {"UpdateValue": "Games with Gold"}}),
+                               (200, {"d": {"UpdateValue": "Digital"}})),
+    })
+    c.collection_set(12345, "ownership", "games with gold")
+    c.collection_set(12345, "media", "Digital")
+    edit = next(x for x in http.calls if x["url"].endswith("EditOptions"))
+    assert json.loads(edit["body"]) == {"GameCollection_Data": {"GameID": 12345, "HashKey": HASH},
+                                        "bDropDownOnly": False}
+    ups = [json.loads(x["body"]) for x in http.calls if x["url"].endswith("UpdateGame")]
+    assert ups[0] == {"GameCollection_Data": {"GameID": 12345, "GamerID": "42", "HashKey": HASH,
+                                              "Field": "ddlOwnershipStatusID_12345", "Value": "8"}}
+    assert ups[1]["GameCollection_Data"]["Field"] == "ddlGameMediaID_12345"
+    assert ups[1]["GameCollection_Data"]["Value"] == "2"
+    h = http.calls[0]["headers"]
+    assert h["X-Requested-With"] == "XMLHttpRequest" and h["Origin"] == BASE
+    assert h["Content-Type"].startswith("application/json")
+    assert h["Referer"] == BASE + "/gamer/Test+Gamer/gamecollection"
+    # the answer must echo the chosen label
+    c, _ = logged_in({("POST", EDIT): edit_answer(),
+                      ("POST", UPDATE): ajax((200, {"d": {"UpdateValue": "Owned"}}))})
+    with pytest.raises(TAError, match="answered 'Owned'"):
+        c.collection_set(12345, "media", "Digital")
+
+
+def test_collection_set_with_an_unknown_label_lists_the_choices():
+    c, http = logged_in({("POST", EDIT): edit_answer()})
+    with pytest.raises(TAError, match="Owned, Games with Gold, Game Pass"):
+        c.collection_set(12345, "ownership", "Borrowed")
+    assert not any(x["url"].endswith("UpdateGame") for x in http.calls)
+    with pytest.raises(TAError, match="field"):
+        c.collection_set(12345, "play", "Played")
+
+
+def test_collection_set_logs_in_again_once_on_a_logged_out_answer():
+    out = ajax((200, {"d": {"success": False, "errors": ["The gamer must be specified."]}}))
+    c, http = logged_in({**login_routes(), ("POST", EDIT): [out[0], edit_answer()[0]],
+                         ("POST", UPDATE): ajax((200, {"d": {"UpdateValue": "Digital"}}))})
+    c.collection_set(12345, "media", "Digital")
+    assert http.urls("POST").count("/login") == 1
+    c, _ = logged_in({**login_routes(), ("POST", EDIT): out})
+    with pytest.raises(AuthError):
+        c.collection_set(12345, "media", "Digital")
+
+
+def test_collection_writes_never_follow_a_redirect():
+    c, http = logged_in({("GET", EXAMPLE): resp(COLL_GAME),
+                         ("POST", EXAMPLE): resp("", status=302, location="/elsewhere")})
+    with pytest.raises(TAError):
+        c.collection_add("Example-Quest")
+    c, http = logged_in({("POST", EDIT): resp("", status=302, location="/login")})
+    with pytest.raises(TAError, match="HTTP 302"):
+        c.collection_set(12345, "media", "Digital")
+    assert http.urls("GET") == []
+
+
+def list_page(ids, slug="xbox-play-anywhere", pages=0):
+    links = "".join(f'<a href="/{slug}/games?page={n}">{n}</a>' for n in range(1, pages + 1))
+    rows = "".join(f'<tr class="{"even" if i % 2 else "odd"}" id="tr{n}"><td>Game {n}</td></tr>'
+                   for i, n in enumerate(ids))
+    return (f'<html><head><link rel="canonical" href="{BASE}/{slug}/games"></head>'
+            f'<body><table>{rows}</table>{links}</body></html>')
+
+
+def test_property_list_reads_every_page_and_refuses_an_empty_or_home_page():
+    p1, p2 = list(range(1, 101)), list(range(101, 131))
+    c, http = logged_in({("GET", "/example-list/games?page=1"): resp(list_page(p1, "example-list", 2)),
+                         ("GET", "/example-list/games?page=2"): resp(list_page(p2, "example-list", 2))})
+    assert c.property_list("example-list") == p1 + p2
+    assert http.urls() == ["/example-list/games?page=1", "/example-list/games?page=2"]
+    # a throttled page: 0 rows is never an empty list
+    c, _ = logged_in({("GET", "/example-list/games"): resp(
+        list_page([], "example-list").replace("<table></table>", "no games that match these criteria"))})
+    with pytest.raises(IncompleteRead):
+        c.property_list("example-list")
+    c, _ = logged_in({("GET", "/example-list/games?page=1"): resp(list_page(p1, "example-list", 2)),
+                      ("GET", "/example-list/games?page=2"): resp(list_page([], "example-list", 2))})
+    with pytest.raises(IncompleteRead):
+        c.property_list("example-list")
+    # a wrong slug answers the home page
+    c, _ = logged_in({("GET", "/nope/games"): resp(list_page(p2, "other"))})
+    with pytest.raises(IncompleteRead, match="canonical"):
+        c.property_list("nope")
+    c, _ = logged_in({("GET", "/nope/games"): resp("<html><body>home</body></html>")})
+    with pytest.raises(IncompleteRead, match="canonical"):
+        c.property_list("nope")
+
+
+def test_property_list_pauses_before_each_page():
+    p1, p2 = list(range(1, 101)), list(range(101, 131))
+    c, http = logged_in({("GET", "/example-list/games?page=1"): resp(list_page(p1, "example-list", 2)),
+                         ("GET", "/example-list/games?page=2"): resp(list_page(p2, "example-list", 2))})
+    before = []
+    assert c.property_list("example-list", pause=lambda: before.append(len(http.calls))) == p1 + p2
+    assert before == [0, 1]  # before the first page's request and before the second's
+
+
+def test_property_list_never_reads_beyond_max_pages():
+    c, http = logged_in({("GET", "/example-list/games"): resp(list_page(range(1, 101), "example-list", 9))})
+    with pytest.raises(IncompleteRead, match="max_pages"):
+        c.property_list("example-list", max_pages=2)
+    assert len(http.urls()) == 2
+
+
+def test_property_list_of_exactly_a_full_page_ends_by_its_own_pagination():
+    c, http = logged_in({("GET", "/example-list/games"): resp(list_page(range(1, 101), "example-list"))})
+    assert c.property_list("example-list") == list(range(1, 101))
+    assert len(http.urls()) == 1
+    c, http = logged_in({
+        ("GET", "/example-list/games?page=1"): resp(list_page(range(1, 101), "example-list", 2)),
+        ("GET", "/example-list/games?page=2"): resp(list_page(range(101, 201), "example-list", 2)),
+    })
+    assert c.property_list("example-list") == list(range(1, 201))
+    assert http.urls() == ["/example-list/games?page=1", "/example-list/games?page=2"]
+
+
+# ---------------------------------------------------------------- library step: page lookups and failure kinds
+
+
+# TA's page-not-found page, served with HTTP 200 for an unknown game address (verified live 2026-11-17)
+NOT_FOUND = ('<html><head><title>Page not found | TrueAchievements</title></head><body class="ta">'
+             '<main id="PageNotFound404"><h1 class="pagetitle">Page not found</h1></main></body></html>')
+
+
+def test_game_page_or_none_reads_a_game_page_and_says_none_where_there_is_none():
+    c, http = logged_in({("GET", "/game/Example-Quest"): resp(COLL_GAME),
+                         ("GET", "/game/Missing-Quest"): resp("<html>Page not found</html>", status=404),
+                         ("GET", "/game/Unknown-Quest"): resp(NOT_FOUND)})
+    page = c.game_page_or_none("Example-Quest")
+    assert (page.id, page.title, page.slug) == (12345, "Example Quest", "Example-Quest")
+    assert c.game_page_or_none("Missing-Quest") is None  # HTTP 404
+    assert c.game_page_or_none("Unknown-Quest") is None  # TA's page-not-found page
+    assert http.urls() == ["/game/Example-Quest", "/game/Missing-Quest", "/game/Unknown-Quest"]
+
+
+def test_a_page_that_is_neither_a_game_nor_page_not_found_is_unreachable():
+    """A maintenance, throttle or challenge page (no game id at all): never "no page", so nothing is cached from it,
+    and every other address would meet it too."""
+    c, _ = logged_in({("GET", "/game/Example-Quest"): resp(
+        "<html><title>Down for maintenance | TrueAchievements</title></html>")})
+    with pytest.raises(ta.Unreachable, match="Example-Quest"):
+        c.game_page_or_none("Example-Quest")
+
+
+def test_a_game_page_that_does_not_parse_is_that_addresses_own_error():
+    """Game ids, but not one game's page (two ids, no title): a TA error of that page, never Unreachable."""
+    for body in (COLL_GAME + '<div data-game="777"></div>',  # two game ids
+                 '<html><body class="ta"><div data-game="777"></div></body></html>'):  # no title
+        c, _ = logged_in({("GET", "/game/Example-Quest"): resp(body)})
+        with pytest.raises(TAError, match="Example-Quest") as e:
+            c.game_page_or_none("Example-Quest")
+        assert not isinstance(e.value, ta.Unreachable)
+
+
+def test_game_page_or_none_raises_every_other_failure():
+    """An HTTP error of one address is that address's TA error; TA unavailable or throttling (429, 502-504,
+    Cloudflare's 52x) or an unpassed challenge would meet every address: Unreachable."""
+    c, _ = logged_in({("GET", "/game/Example-Quest"): resp("Internal Server Error", status=500)})
+    with pytest.raises(TAError, match="500") as e:
+        c.game_page_or_none("Example-Quest")
+    assert not isinstance(e.value, ta.Unreachable)
+    for status in (429, 502, 503, 504, 522):
+        c, _ = logged_in({("GET", "/game/Example-Quest"): resp("Service Unavailable", status=status)})
+        with pytest.raises(ta.Unreachable, match=str(status)):
+            c.game_page_or_none("Example-Quest")
+    c, _ = logged_in({("GET", "/game/Example-Quest"): CHALLENGE})
+    with pytest.raises(ta.Unreachable):
+        c.game_page_or_none("Example-Quest")
+
+
+def test_a_404_is_not_found_and_still_a_ta_error():
+    c, _ = logged_in({("GET", "/game/Missing-Quest"): resp("gone", status=404)})
+    with pytest.raises(ta.NotFound) as e:
+        c.game("Missing-Quest")
+    assert isinstance(e.value, TAError) and "HTTP 404" in str(e.value)
+
+
+def test_network_errors_and_unpassed_challenges_are_unreachable(monkeypatch):
+    import curl_cffi.requests as cr
+
+    def offline(method, url, **kw):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(cr, "request", offline)
+    with pytest.raises(ta.Unreachable, match="network error"):
+        ta.CurlTransport().request("GET", BASE + "/game/X", None, {})
+    c, _ = logged_in({("GET", "/game/X"): CHALLENGE})
+    with pytest.raises(ta.Unreachable, match="Cloudflare challenge"):
+        c.game("X")
+    c, _ = logged_in({("GET", "/game/X"): CHALLENGE}, fs=FakeFS([sol(user_agent="")]))
+    with pytest.raises(ta.Unreachable, match="no user agent"):
+        c.game("X")
+    c, _ = logged_in({("GET", "/game/X"): CHALLENGE}, fs=FakeFS([sol(status=502)]))
+    with pytest.raises(ta.Unreachable, match="HTTP 502"):
+        c.game("X")
+    # TA's own answers stay plain TA errors
+    c, _ = logged_in({("GET", "/game/X"): resp("boom", status=500)})
+    with pytest.raises(TAError) as e:
+        c.game("X")
+    assert not isinstance(e.value, ta.Unreachable)
+
+
+def test_collection_add_with_a_game_id_refuses_another_games_page():
+    c, http = logged_in({("GET", EXAMPLE): resp(COLL_GAME), ("POST", EXAMPLE): resp(COLL_GAME_IN)})
+    with pytest.raises(TAError, match="12345, not 777"):
+        c.collection_add("Example-Quest", game_id=777)
+    assert http.urls("POST") == []  # nothing was posted
+    assert c.collection_add("Example-Quest", game_id=12345) == 12345
+    assert len(http.urls("POST")) == 1
+
+
+def test_a_new_collection_add_refuses_a_game_already_in_the_collection():
+    c, http = logged_in({("GET", EXAMPLE): resp(COLL_GAME_IN)})
+    with pytest.raises(AlreadyListed, match="already in the collection"):
+        c.collection_add("Example-Quest", new=True)
+    assert c.collection_add("Example-Quest") == 12345  # without `new`: left as it is, its id returned
+    assert http.urls("POST") == []
+
+
+REAL_EDIT_OPTIONS = (  # the markup of a real EditOptions answer (verified 2026-11-17): value first, then selected
+    '<select id="ddlOwnershipStatusID_777"><option value="0"></option><option value="1" selected="selected">Owned'
+    '</option><option value="8">Games with Gold</option></select><select id="ddlGameMediaID_777">'
+    '<option value="0" selected="selected"></option><option value="1">Disc</option><option value="2">Digital'
+    '</option></select>')
+
+
+def test_selected_options_are_read_from_edit_options():
+    assert ta.selected_options(EDIT_OPTIONS, 12345) == {"ownership": "Owned", "media": ""}  # media: none selected
+    assert ta.selected_options(REAL_EDIT_OPTIONS, 777) == {"ownership": "Owned", "media": ""}  # the blank option
+    assert ta.selected_options(EDIT_OPTIONS.replace('value="2">', 'value="2" selected="selected">'),
+                               12345)["media"] == "Digital"
+    assert ta.selected_options(EDIT_OPTIONS, 999) == {}
+
+
+def test_collection_set_compares_before_it_sets():
+    # already the label asked for: nothing posted
+    c, http = logged_in({("POST", EDIT): edit_answer()})
+    assert c.collection_set(12345, "ownership", "Owned", expect={"No longer have"}) is False
+    assert not any(x["url"].endswith("UpdateGame") for x in http.calls) and len(http.calls) == 1
+    # changed on TA since the caller's read: ChangedOnTA, nothing posted
+    c, http = logged_in({("POST", EDIT): edit_answer()})
+    with pytest.raises(ta.ChangedOnTA, match="Owned"):
+        c.collection_set(12345, "ownership", "Games with Gold", expect={"No longer have", "Renting"})
+    assert not any(x["url"].endswith("UpdateGame") for x in http.calls)
+    # what the caller saw: posted as before
+    c, http = logged_in({("POST", EDIT): edit_answer(),
+                         ("POST", UPDATE): ajax((200, {"d": {"UpdateValue": "Digital"}}))})
+    assert c.collection_set(12345, "media", "Digital", expect={""}) is True
+    assert sum(x["url"].endswith("UpdateGame") for x in http.calls) == 1
+
+
+def media_select(options):
+    return f'<select id="ddlGameMediaID_12345">{options}</select>'
+
+
+def test_options_are_read_whatever_the_order_of_their_attributes():
+    frag = media_select('<option value="0"></option><option selected="selected" value="1">Disc</option>'
+                        '<option value="2">Digital</option>')
+    assert ta.selected_options(frag, 12345) == {"media": "Disc"}
+    assert ta.edit_options(frag, 12345) == {"media": [("0", ""), ("1", "Disc"), ("2", "Digital")]}
+    bare = frag.replace('selected="selected" value="1"', "value=1 selected")  # unquoted, a bare attribute
+    assert ta.selected_options(bare, 12345) == {"media": "Disc"}
+    assert ta.edit_options(bare, 12345)["media"][1] == ("1", "Disc")
+
+
+def test_only_a_real_selected_attribute_marks_the_current_option():
+    frag = media_select('<option value="0"></option><option value="1" data-selected="selected">Disc</option>'
+                        '<option value="2" class="selected">Digital</option>')
+    assert ta.selected_options(frag, 12345) == {"media": ""}
+
+
+def test_two_selected_options_are_a_parse_failure_and_nothing_is_posted():
+    frag = media_select('<option value="1" selected>Disc</option>'
+                        '<option value="2" selected="selected">Digital</option>')
+    with pytest.raises(TAError, match="2 selected"):
+        ta.selected_options(frag, 12345)
+    c, http = logged_in({("POST", EDIT): ajax((200, {"d": frag}))})
+    with pytest.raises(TAError, match="2 selected"):
+        c.collection_set(12345, "media", "Digital", expect={""})
+    assert not any(x["url"].endswith("UpdateGame") for x in http.calls)
+
+
+def test_edit_options_that_are_not_html_are_a_ta_error():
+    c, http = logged_in({("POST", EDIT): ajax((200, {"d": {"html": "<select></select>"}}))})
+    with pytest.raises(TAError, match="isn't HTML"):
+        c.collection_set(12345, "media", "Digital")
+    assert not any(x["url"].endswith("UpdateGame") for x in http.calls)

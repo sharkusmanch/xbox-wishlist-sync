@@ -21,6 +21,17 @@ TrueAchievements game id (a positive integer, as a string):
 
 `load_overrides` ignores that key; `load_collection_overrides` reads it.
 
+A top-level "library" object holds the library step's overrides, keyed by Store product ID:
+
+    "library": {"9ABCDEF12345": {"ta": "Some-TA-Slug", "note": "TA names it differently"},
+                "9ABCDEF12346": {"ta": "skip"}}
+
+- `ta`: the TrueAchievements game page the product's game is (its slug, as in /game/<slug>), or
+  "skip" to leave the game out of the library step. Required.
+- `note`: free text for humans, ignored.
+
+`load_overrides` ignores that key too; `load_library_overrides` reads it.
+
 A missing file means no overrides. A file that isn't valid is an error: the run must not guess.
 """
 
@@ -33,6 +44,8 @@ SKIP = "skip"
 _KEYS = {"deku", "ta", "ta_dlc", "note"}
 COLLECTION_KEY = "collection"
 _COLLECTION_KEYS = {"deku", "note"}
+LIBRARY_KEY = "library"
+_LIBRARY_KEYS = {"ta", "note"}
 
 
 class OverridesError(Exception):
@@ -66,7 +79,7 @@ def load_overrides(path: Path) -> dict[str, dict]:
     data = _read(path)
     out: dict[str, dict] = {}
     for pid, entry in data.items():
-        if pid == COLLECTION_KEY:
+        if pid in (COLLECTION_KEY, LIBRARY_KEY):
             continue
         if not pid.strip():
             raise OverridesError("override with an empty productId")
@@ -116,4 +129,32 @@ def load_collection_overrides(path: Path) -> dict[int, dict]:
         if int(key) in out:
             raise OverridesError(f"{label}: given more than once")
         out[int(key)] = {"deku": _slug(label, "deku", entry["deku"])}
+    return out
+
+
+def load_library_overrides(path: Path) -> dict[str, dict]:
+    """The "library" object: Store product ID -> {"ta": TA game slug | "skip"}."""
+    section = _read(path).get(LIBRARY_KEY)
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise OverridesError("library overrides must be an object keyed by Store product ID")
+    out: dict[str, dict] = {}
+    for key, entry in section.items():
+        pid = key.strip()
+        if not pid:
+            raise OverridesError("library override with an empty product ID")
+        label = f"library override {pid}"
+        if not isinstance(entry, dict):
+            raise OverridesError(f"{label}: must be an object")
+        unknown = set(entry) - _LIBRARY_KEYS
+        if unknown:
+            raise OverridesError(f"{label}: unknown keys {sorted(unknown)}")
+        if "ta" not in entry:
+            raise OverridesError(f"{label}: ta is required")
+        if "note" in entry and not isinstance(entry["note"], str):
+            raise OverridesError(f"{label}: note must be text")
+        if pid in out:
+            raise OverridesError(f"{label}: given more than once")
+        out[pid] = {"ta": _slug(f"library {pid}", "ta", entry["ta"])}
     return out

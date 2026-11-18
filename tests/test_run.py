@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import replace
 from datetime import datetime, time as dtime, timedelta, timezone
 
 import pytest
@@ -12,7 +13,8 @@ from wsync.match import norm
 from wsync.plan import Entry
 from wsync.run import Config, ConfigError, Deps, config_from, run
 from wsync.state import State, load_state, save_state
-from wsync.ta import AlreadyListed, AuthError as TAAuthError, IncompleteRead, TAGame
+from wsync.ta import AlreadyListed, AuthError as TAAuthError, ChangedOnTA, IncompleteRead, TAGame
+from wsync.ta_coll import OwnedRow
 
 NOW = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
 SERIES, ONE = "Xbox Series X|S", "Xbox One"
@@ -142,12 +144,79 @@ class FakeTA:
         self.owned_rows = []  # the TA Game Collection (OwnedRow)
         self.collection_calls = 0
         self.fail_collection = None
+        # the library step: every request in order (with the run's sleeps, when a test routes them here)
+        self.calls = []
+        self.list_ids = {}  # TA property list slug -> game ids
+        self.list_pages = {}  # TA property list slug -> its number of pages (default 1)
+        self.fail_list = {}  # slug -> exception from property_list()
+        self.fail_page = {}  # slug -> exception from game_page_or_none()
+        self.fail_add = {}  # slug -> exception from collection_add()
+        self.fail_set = {}  # (game id, field) -> exception from collection_set()
+        self.on_add = None  # called with the slug before an add is made
+        self.on_set = None  # called with (game id, field) when a field set is asked for; may raise
+        self.unlisted = set()  # TA game ids in the collection that the collection read doesn't show
 
     def collection(self):
         self.collection_calls += 1
+        self.calls.append(("collection",))
         if self.fail_collection:
             raise self.fail_collection
         return list(self.owned_rows)
+
+    def property_list(self, slug, *, pause=None):
+        """One ("list", slug) request a page, each after `pause()` (as the client calls it)."""
+        for _ in range(self.list_pages.get(slug, 1)):
+            if pause:
+                pause()
+            self.calls.append(("list", slug))
+            if slug in self.fail_list:
+                raise self.fail_list[slug]
+        return list(self.list_ids.get(slug, []))
+
+    def game_page_or_none(self, slug):
+        self.calls.append(("page", slug))
+        if slug in self.fail_page:
+            raise self.fail_page[slug]
+        return self.pages.get(slug)
+
+    def collection_add(self, slug, *, game_id=None, new=False):
+        self.calls.append(("gc-add", slug))
+        if slug in self.fail_add:
+            raise self.fail_add[slug]
+        g = self.pages[slug]
+        assert game_id in (None, g.id)
+        if g.id in self.unlisted or any(r.ta_id == g.id for r in self.owned_rows):
+            if new:
+                raise AlreadyListed(f"collection add of {slug!r}: game {g.id} is already in the collection")
+            return g.id  # already listed: nothing posted
+        if self.on_add:
+            self.on_add(slug)
+        self.writes.append(("gc-add", slug))
+        self.journal.append(("ta", "gc-add", slug))
+        icon = {"Xbox Series X|S": "xbox-series-x-s", "Xbox One": "xbox-one", "Xbox 360": "xbox-360",
+                "Windows": "windows"}.get(g.platform, "xbox-one")
+        self.owned_rows.append(OwnedRow(g.id, g.title, icon, "Owned", ""))  # TA's defaults for a new entry
+        return g.id
+
+    def collection_set(self, game_id, field_name, label, expect=None):
+        """Compare-and-set, as the client: nothing posted when the entry already shows `label`; ChangedOnTA when it
+        shows something `expect` doesn't hold."""
+        self.calls.append(("gc-set", game_id, field_name, label))
+        if self.on_set:
+            self.on_set(game_id, field_name)
+        if (game_id, field_name) in self.fail_set:
+            raise self.fail_set[(game_id, field_name)]
+        i = next(n for n, r in enumerate(self.owned_rows) if r.ta_id == game_id)
+        r = self.owned_rows[i]
+        current = r.ownership if field_name == "ownership" else r.media
+        if current == label:
+            return False
+        if expect is not None and current not in expect:
+            raise ChangedOnTA(f"collection {field_name} of {game_id}: TA shows {current!r}")
+        self.owned_rows[i] = replace(r, **({"ownership": label} if field_name == "ownership" else {"media": label}))
+        self.writes.append(("gc-set", game_id, field_name, label))
+        self.journal.append(("ta", "gc-set", game_id))
+        return True
 
     def wishlist(self):
         self.wishlist_calls += 1
@@ -201,6 +270,8 @@ class FakeReporter:
         self._collection_body = None
         self.collection_360_reviews = []  # the task text, or None when closed
         self._collection_360_body = None
+        self.library_tasks = []  # (key, title, body)
+        self._library_bodies = {}  # key -> the open task's text
 
     def sync_problems(self, problems, keep_kinds, keep_keys=frozenset()):
         self.problem_syncs.append((list(problems), set(keep_kinds)))
@@ -223,6 +294,12 @@ class FakeReporter:
         self.collection_360_reviews.append(body)
         changed = body is not None and body != self._collection_360_body
         self._collection_360_body = body
+        return changed
+
+    def library_task(self, key, title, body):
+        self.library_tasks.append((key, title, body))
+        changed = body is not None and body != self._library_bodies.get(key)
+        self._library_bodies[key] = body
         return changed
 
     def notify(self, title, body):
@@ -270,11 +347,19 @@ class Harness:
         ov = tmp_path / "overrides.json"
         if overrides is not None:
             ov.write_text(json.dumps(overrides))
+        # The library step is off unless a test opts in (library=True and a FakeXbox in `xbox`).
         self.cfg = Config(feed=feed, state=tmp_path / "state" / "state.json", overrides=ov,
                           flaresolverr_url="http://fs.invalid/v1", vikunja_url="http://vk.invalid",
-                          **{**SECRETS, "collection": False, **cfg})
+                          **{**SECRETS, "collection": False, "library": False,
+                             "xbox_token": tmp_path / "state" / "xbox-token.json", **cfg})
         self.clock = 0.0
         self.now = NOW
+        self.xbox = None
+
+    def make_xbox_http(self):
+        if self.xbox is None:
+            raise AssertionError("a Microsoft request in a test without the library step")
+        return self.xbox
 
     def last_issues(self):
         """The issues of the last failure ping (the ping is deduplicated, so read the latest one)."""
@@ -301,7 +386,7 @@ class Harness:
 
         return Deps(make_deku=make_deku, make_ta=make_ta, make_reporter=lambda cfg: self.reporter,
                     refresh_verdicts=verdicts, now=lambda: self.now, monotonic=mono,
-                    sleep=self.deku.sleep)
+                    sleep=self.deku.sleep, make_xbox_http=self.make_xbox_http)
 
     def run(self):
         return run(self.cfg, self.deps())
@@ -840,7 +925,7 @@ def test_main_turns_sigterm_into_a_clean_failure(monkeypatch):
 
     seen = {}
 
-    def fake_run(cfg):
+    def fake_run(cfg, **kw):
         try:
             signal.raise_signal(signal.SIGTERM)
         except Terminated:
@@ -1033,3 +1118,90 @@ def test_collection_360_dry_run_defaults_on_and_follows_the_other_switches():
     assert config_from(["--apply"], live).collection_360_dry_run is False
     assert config_from(["--apply"], {**live, "COLLECTION_DRY_RUN": "true"}).collection_360_dry_run is True
     assert config_from([], live).collection_360_dry_run is True  # a dry run is dry for 360 games too
+
+
+# --------------------------------------------------------------------------- library step switches
+
+
+def test_config_library_switches():
+    env = {"DEKU_EMAIL": "e", "TA_GAMERTAG": "g"}
+    cfg = config_from([], env)
+    assert cfg.library is True and cfg.library_dry_run is True
+    assert cfg.library_after == dtime(11, 30) and cfg.library_budget == 25 and cfg.library_lookups == 10
+    assert str(cfg.xbox_token) == "/state/xbox-token.json" and cfg.xbox_refresh_token == ""
+    for value in ("false", "0", "no", "off", " FALSE "):
+        assert config_from(["--apply"], {**env, "LIBRARY_DRY_RUN": value}).library_dry_run is False
+    for value in ("true", "", "garbage"):
+        assert config_from(["--apply"], {**env, "LIBRARY_DRY_RUN": value}).library_dry_run is True
+    # a dry run is dry for the library step too
+    assert config_from([], {**env, "LIBRARY_DRY_RUN": "false"}).library_dry_run is True
+    assert config_from(["--dry-run"], {**env, "DRY_RUN": "false", "LIBRARY_DRY_RUN": "false"}).library_dry_run is True
+    only = config_from(["--only", "library"], env)
+    assert only.lists == () and only.collection is False and only.library is True
+    for other in ("deku", "ta", "collection"):
+        assert config_from(["--only", other], env).library is False
+    cfg = config_from([], {**env, "WSYNC_LIBRARY_AFTER": " 9:05 ", "WSYNC_XBOX_TOKEN": "/tmp/x/token.json",
+                           "XBOX_REFRESH_TOKEN": "rt-seed-value"})
+    assert cfg.library_after == dtime(9, 5) and str(cfg.xbox_token) == "/tmp/x/token.json"
+    assert cfg.xbox_refresh_token == "rt-seed-value"
+    for bad in ("11", "24:00", "11:75", "noon"):
+        with pytest.raises(ConfigError, match="WSYNC_LIBRARY_AFTER"):
+            config_from([], {**env, "WSYNC_LIBRARY_AFTER": bad})
+
+
+def test_config_library_budgets_from_the_environment():
+    env = {"DEKU_EMAIL": "e", "TA_GAMERTAG": "g"}
+    cfg = config_from([], env)
+    assert (cfg.library_lookups, cfg.library_lookups_per_day, cfg.library_budget) == (10, 40, 25)
+    cfg = config_from([], {**env, "WSYNC_LIBRARY_LOOKUPS": " 4 ", "WSYNC_LIBRARY_LOOKUPS_PER_DAY": "60",
+                           "WSYNC_LIBRARY_BUDGET": "0"})
+    assert (cfg.library_lookups, cfg.library_lookups_per_day, cfg.library_budget) == (4, 60, 0)
+    assert config_from([], {**env, "WSYNC_LIBRARY_BUDGET": ""}).library_budget == 25  # empty: the default
+    for name in ("WSYNC_LIBRARY_LOOKUPS", "WSYNC_LIBRARY_LOOKUPS_PER_DAY", "WSYNC_LIBRARY_BUDGET"):
+        for bad in ("-1", "ten", "2.5"):
+            with pytest.raises(ConfigError, match=name):
+                config_from([], {**env, name: bad})
+
+
+def test_the_xbox_seed_is_a_secret_but_never_required():
+    cfg = Config(**SECRETS, xbox_refresh_token="rt seed/+value")
+    assert {"rt seed/+value", "rt+seed%2F%2Bvalue", "rt%20seed%2F%2Bvalue", "rt+seed/+value"} <= set(cfg.secrets())
+    assert "rt seed" not in repr(cfg)
+    only = Config(lists=(), collection=False, library=True, flaresolverr_url="http://fs", report=False)
+    assert only.missing() == ["TA_GAMERTAG", "TA_PASSWORD"]  # no Deku login, no XBOX_REFRESH_TOKEN
+
+
+def test_the_scrubber_learns_secrets_during_the_run():
+    from wsync.run import RedactingFilter, Scrubber
+
+    scrub = Scrubber(["known-secret"])
+    assert scrub("a known-secret b") == "a <redacted> b"
+    scrub.add("tok en/1", "", None)
+    assert scrub("x tok en/1 tok+en%2F1 tok%20en%2F1 TOK+EN/1 y") == "x <redacted> <redacted> <redacted> <redacted> y"
+    record = logging.LogRecord("wsync", logging.INFO, __file__, 1, "said %s and %s", ("known-secret", "late-tok"), None)
+    log_filter = RedactingFilter(scrub)
+    scrub.add("late-tok")  # added after the filter was made: the filter sees it
+    assert log_filter.filter(record) and record.getMessage() == "said <redacted> and <redacted>"
+
+
+def test_main_shares_one_live_scrubber_between_the_run_and_the_log_filter(monkeypatch, capsys):
+    import wsync.__main__ as main_mod
+
+    def fake_run(cfg, *, scrub):
+        scrub.add("tok-found-mid-run")
+        logging.getLogger("wsync").warning("seed %s, token %s", cfg.xbox_refresh_token, "tok-found-mid-run")
+        return 0
+
+    monkeypatch.setattr(main_mod, "run", fake_run)
+    monkeypatch.setattr(main_mod.os, "environ", {"DEKU_EMAIL": "me@example.invalid", "TA_GAMERTAG": "Fake Gamer",
+                                                 "XBOX_REFRESH_TOKEN": "rt-seed-Kq7"})
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    try:
+        assert main_mod.main(["--no-report"]) == 0
+    finally:
+        root.handlers[:] = handlers
+        root.setLevel(level)
+    err = capsys.readouterr().err
+    assert "seed <redacted>, token <redacted>" in err
+    assert "rt-seed-Kq7" not in err and "tok-found-mid-run" not in err

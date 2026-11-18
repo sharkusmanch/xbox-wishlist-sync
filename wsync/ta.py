@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote, quote_plus, urlencode, urljoin, urlsplit
 
+from wsync.d2d import ta_last_page
 from wsync.errors import TAError
 from wsync.flaresolverr import FlareSolverr
 from wsync.plan import Entry
@@ -53,10 +54,38 @@ ONE = "Xbox One"
 _LOGGED_OUT = "the gamer must be specified"
 _ALREADY_LISTED = "already on your wishlist"
 _SKIP_INPUT_TYPES = {"checkbox", "radio", "password"}
+_POSTBACK_SKIP_TYPES = _SKIP_INPUT_TYPES | {"submit", "button", "image"}
+COLLECTION_FIELDS = {"ownership": "ddlOwnershipStatusID", "media": "ddlGameMediaID"}
 
 
 class AuthError(TAError):
     """Not logged in, and logging in again didn't help."""
+
+
+class HttpError(TAError):
+    """TrueAchievements answered an HTTP error status (`status`) for a page."""
+
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
+class NotFound(HttpError):
+    """TrueAchievements answered HTTP 404: there is no page at that address."""
+
+    def __init__(self, message: str):
+        super().__init__(message, 404)
+
+
+class Unreachable(TAError):
+    """No answer from TrueAchievements itself: a network error, a Cloudflare challenge that a fresh clearance didn't
+    pass, no usable clearance from FlareSolverr, or (for a game page lookup) TA unavailable or throttling: an HTTP
+    429, 502-504 or Cloudflare 52x answer, or a page with no game id that isn't TA's page-not-found page
+    (maintenance, a throttle page). Every other address would meet it too; a later run may get through."""
+
+
+class ChangedOnTA(TAError):
+    """A collection entry no longer shows what the caller planned from (it was changed on TA since): nothing posted."""
 
 
 class IncompleteRead(TAError):
@@ -64,7 +93,8 @@ class IncompleteRead(TAError):
 
 
 class AlreadyListed(TAError):
-    """An add found the entry already on the wishlist: our read of the list was wrong or stale."""
+    """An add found the entry already on the wishlist (or, for a new collection add, in the Game Collection): our
+    read of the list was wrong or stale."""
 
 
 @dataclass(frozen=True)
@@ -139,7 +169,7 @@ class CurlTransport:
             r = cr.request(method, url, data=body, headers=headers, impersonate="chrome",
                            timeout=HTTP_TIMEOUT, allow_redirects=False)
         except OSError as e:  # curl_cffi's errors are OSErrors
-            raise TAError(f"network error: {type(e).__name__}") from None
+            raise Unreachable(f"network error: {type(e).__name__}") from None
         return HttpResponse(r.status_code, r.text, tuple((k.lower(), v) for k, v in r.headers.multi_items()))
 
 
@@ -206,8 +236,8 @@ def gated(page: str, need_login: bool) -> bool:
     return "Please log in" in page or (need_login and not logged_in(page))
 
 
-def login_form(page: str) -> dict[str, str]:
-    """The `#frm` fields a browser would post, minus checkboxes, radios and the password box."""
+def login_form(page: str, skip: set[str] = _SKIP_INPUT_TYPES) -> dict[str, str]:
+    """The `#frm` fields a browser would post, minus the input types in `skip` (default: checkboxes, radios and the password box)."""
     m = re.search(r'<form[^>]*\bid="frm"[^>]*>(.*?)</form>', page, re.S)
     if not m:
         raise TAError("login page has no form (layout changed?)")
@@ -215,13 +245,87 @@ def login_form(page: str) -> dict[str, str]:
     for tag in re.findall(r"<input\b[^>]*>", m.group(1)):
         name = re.search(r'\bname="([^"]+)"', tag)
         kind = re.search(r'\btype="([^"]+)"', tag)
-        if not name or (kind and kind.group(1).lower() in _SKIP_INPUT_TYPES):
+        if not name or (kind and kind.group(1).lower() in skip):
             continue
         value = re.search(r'\bvalue="([^"]*)"', tag)
         data[html.unescape(name.group(1))] = html.unescape(value.group(1)) if value else ""
     if "__VIEWSTATE" not in data:
         raise TAError("login form has no __VIEWSTATE (layout changed?)")
     return data
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+_GC_BUTTON = re.compile(r"Postback\('btnGC_(Add|Remove)','(\d+)'\)")
+_GAME_ID = re.compile(r'data-game="(-?\d+)"')
+_OPTION = re.compile(r"<option\b([^>]*)>(.*?)</option>", re.S | re.I)
+_ATTR = re.compile(r"""([^\s"'=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?""")
+NOT_FOUND_MARK = "PageNotFound404"  # in TA's page-not-found page, served with HTTP 200 for an unknown game address
+_LIST_ROW = re.compile(r'<tr\b[^>]*\bid="tr(\d+)"')
+_CANONICAL = re.compile(r'<link\b[^>]*\brel="canonical"[^>]*\bhref="([^"]*)"')
+
+
+def parse_collection_page(page: str, slug: str) -> tuple[TAGame, bool]:
+    """(game, in the collection) from a logged-in game page's Add / Remove postback."""
+    game = parse_game(page, slug)
+    m = _GC_BUTTON.search(page)
+    if not m or int(m.group(2)) != game.id:
+        raise TAError(f"game page {slug!r} has no Game Collection button (layout changed?)")
+    return game, m.group(1) == "Remove"
+
+
+def _attrs(tag: str) -> dict[str, str]:
+    """A tag's attributes by lower-case name, in any order, quoted or not; a bare one (`selected`) has the value ""."""
+    out: dict[str, str] = {}
+    for name, double, single, bare in _ATTR.findall(tag):
+        out.setdefault(name.lower(), html.unescape(double or single or bare))
+    return out
+
+
+def _selects(fragment: str, game_id: int) -> dict[str, list[tuple[str, bool, str]]]:
+    """{field: [(value, selected, label)]} for each collection dropdown in an EditOptions HTML fragment."""
+    if not isinstance(fragment, str):
+        raise TAError("GameCollection_EditOptions answered something that isn't HTML")
+    out: dict[str, list[tuple[str, bool, str]]] = {}
+    for field_name, prefix in COLLECTION_FIELDS.items():
+        m = re.search(r'<select[^>]*\bid="%s_%d"[^>]*>(.*?)</select>' % (prefix, game_id), fragment, re.S)
+        if m:
+            opts = []
+            for tag, inner in _OPTION.findall(m.group(1)):
+                a, label = _attrs(tag), _text(inner)
+                opts.append((a.get("value", label), "selected" in a, label))
+            out[field_name] = opts
+    return out
+
+
+def edit_options(fragment: str, game_id: int) -> dict[str, list[tuple[str, str]]]:
+    """{field: [(value, label)]} from a GameCollection_EditOptions HTML fragment."""
+    return {field_name: [(v, t) for v, _, t in opts] for field_name, opts in _selects(fragment, game_id).items()}
+
+
+def selected_options(fragment: str, game_id: int) -> dict[str, str]:
+    """{field: the label of its selected option} from an EditOptions fragment (`<option value="1"
+    selected="selected">Owned</option>`, attributes in any order): blank when none is selected or the blank option
+    (value "" or "0") is. A dropdown with several selected options raises TAError rather than guess."""
+    out: dict[str, str] = {}
+    for field_name, opts in _selects(fragment, game_id).items():
+        chosen = [(v, t) for v, selected, t in opts if selected]
+        if len(chosen) > 1:
+            raise TAError(f"the EditOptions {field_name} dropdown has {len(chosen)} selected options")
+        value, label = chosen[0] if chosen else ("", "")
+        out[field_name] = "" if value in ("", "0") else label
+    return out
+
+
+def pick_option(options: list[tuple[str, str]], field_name: str, wanted: str) -> tuple[str, str]:
+    """The (value, label) whose label matches `wanted`, ignoring case and punctuation."""
+    hits = [(v, t) for v, t in options if _norm(t) == _norm(wanted)]
+    if len(hits) != 1:
+        how = "matches no option" if not hits else f"matches {len(hits)} options"
+        raise TAError(f"{field_name}={wanted!r} {how}; choose one of: " + ", ".join(t or "none" for _, t in options))
+    return hits[0]
 
 
 _ROW_LINK = re.compile(
@@ -410,7 +514,7 @@ def _fields(page: str) -> dict[str, str]:
 
 def parse_game(page: str, slug: str) -> TAGame:
     # Unreleased games have a negative placeholder id (verified 2026-11-01, Persona 6 = -7827).
-    ids = set(re.findall(r'data-game="(-?\d+)"', page))
+    ids = set(_GAME_ID.findall(page))
     if len(ids) != 1:
         raise TAError(f"game page {slug!r} has {len(ids)} game ids")
     title = page_title(page)
@@ -532,9 +636,9 @@ class TAClient:
         """A fresh cf_clearance and user agent from an anonymous FlareSolverr GET (no cookies, no body)."""
         s = self._fs.get(CLEARANCE_URL)
         if s.status >= 400:
-            raise TAError(f"FlareSolverr's clearance fetch answered HTTP {s.status}")
+            raise Unreachable(f"FlareSolverr's clearance fetch answered HTTP {s.status}")
         if not s.user_agent:
-            raise TAError("FlareSolverr returned no user agent")
+            raise Unreachable("FlareSolverr returned no user agent")
         self._clearance = (s.cookies.get("cf_clearance", ""), s.user_agent)
 
     def _headers(self, extra: dict[str, str] | None) -> dict[str, str]:
@@ -591,14 +695,16 @@ class TAClient:
             self._refresh_clearance()
             r, final = self._once(method, url, body, headers, follow)
             if challenged(r):
-                raise TAError(f"{self._label(method, url)} answered HTTP {r.status} "
-                              "(Cloudflare challenge, after a fresh clearance)")
+                raise Unreachable(f"{self._label(method, url)} answered HTTP {r.status} "
+                                  "(Cloudflare challenge, after a fresh clearance)")
         return r, final
 
     def _page(self, method: str, url: str, body: str | None = None, headers: dict[str, str] | None = None) -> Page:
         r, final = self._send(method, url, body, headers)
+        if r.status == 404:
+            raise NotFound(f"{self._label(method, url)} answered HTTP 404")
         if r.status >= 400:
-            raise TAError(f"{self._label(method, url)} answered HTTP {r.status}")
+            raise HttpError(f"{self._label(method, url)} answered HTTP {r.status}", r.status)
         if r.status in _REDIRECTS:
             raise TAError(f"{self._label(method, url)} answered a redirect without a location")
         return Page(r.status, r.text, final)
@@ -741,6 +847,26 @@ class TAClient:
         p = self._get(BASE + "/game/" + quote(slug, safe=""), need_login=False)
         return parse_game(p.html, slug)
 
+    def game_page_or_none(self, slug: str) -> TAGame | None:
+        """The game page at /game/<slug>, or None when there is none there: HTTP 404, or TA's page-not-found page.
+        What every other address would meet too is Unreachable, never "no page": TA unavailable or throttling (HTTP
+        429, 502-504, Cloudflare's 52x) or a page with no game id at all (maintenance, a throttle page). An error of
+        this address alone stays a plain TAError: another HTTP error, or a page with game ids that isn't one game's
+        page (several ids, no title)."""
+        try:
+            p = self._get(BASE + "/game/" + quote(slug, safe=""), need_login=False)
+        except NotFound:
+            return None
+        except HttpError as e:
+            if e.status == 429 or 502 <= e.status <= 504 or 520 <= e.status <= 530:
+                raise Unreachable(f"{e} (TrueAchievements unavailable or throttling)") from None
+            raise
+        if NOT_FOUND_MARK in p.html:
+            return None
+        if not _GAME_ID.search(p.html):
+            raise Unreachable(f"game page {slug!r} is neither a game page nor TA's page-not-found page (no game id)")
+        return parse_game(p.html, slug)
+
     def dlc(self, game: int | str) -> list[tuple[str, int]]:
         """(title, DLC id) pairs from `/game/<slug>/dlc`; a game id is resolved to its slug first."""
         if isinstance(game, int) and not isinstance(game, bool):
@@ -752,6 +878,122 @@ class TAClient:
         else:
             slug = quote(str(game), safe="")
         return parse_dlc(self._get(f"{BASE}/game/{slug}/dlc", need_login=True).html)
+
+    def property_list(self, slug: str, max_pages: int = 20, *, pause=None) -> list[int]:
+        """TA game ids of the public `/<slug>/games` list. Never a partial list: IncompleteRead on a
+        page with no rows (TA's throttle answer), a page that isn't that list (a wrong slug serves the
+        home page), or a list longer than `max_pages`. The list's end is the highest page its own pagination links.
+        `pause`, when given, is called before each page's request (the caller's pacing)."""
+        path = f"/{slug}/games"
+        ids: list[int] = []
+        last = 1
+        for number in range(1, max_pages + 1):
+            if pause is not None:
+                pause()
+            body = self._get(f"{BASE}{path}?page={number}", need_login=False).html
+            canon = _CANONICAL.search(body)
+            if not canon or canon.group(1).split("?")[0].rstrip("/") != BASE + path:
+                raise IncompleteRead(f"{slug} list page {number} has no canonical link to the list (wrong slug?)")
+            rows = [int(n) for n in _LIST_ROW.findall(body)]
+            if not rows:
+                raise IncompleteRead(f"{slug} list page {number} has no rows (throttled?)")
+            ids += rows
+            last = max(last, ta_last_page(body, path))
+            if number >= last:
+                return ids
+        raise IncompleteRead(f"{slug} list has more than max_pages={max_pages} pages")
+
+    # ---- collection writes
+
+    def collection_page(self, slug: str) -> tuple[TAGame, bool]:
+        """The logged-in game page, and whether the game is in the Game Collection."""
+        return parse_collection_page(self._get(BASE + "/game/" + quote(slug, safe=""), need_login=True).html, slug)
+
+    def collection_add(self, slug: str, *, game_id: int | None = None, new: bool = False) -> int:
+        """Add the game to the Game Collection with the page's own postback; returns its TA id. A game already in
+        the collection is left as it is (its id returned), or with `new` raises AlreadyListed. With `game_id`, the
+        page must be that game's. Both checks come before a request is posted."""
+        url = BASE + "/game/" + quote(slug, safe="")
+        p = self._get(url, need_login=True)
+        game, have = parse_collection_page(p.html, slug)
+        if game_id is not None and game.id != game_id:
+            raise TAError(f"collection add of {slug!r}: the page is game {game.id}, not {game_id}")
+        if have:
+            if new:
+                raise AlreadyListed(f"collection add of {slug!r}: game {game.id} is already in the collection")
+            return game.id
+        form = login_form(p.html, _POSTBACK_SKIP_TYPES)
+        form.update({"Command": "btnGC_Add", "Argument": str(game.id)})
+        # the postback goes back to the page that was read: its final address, after TA's redirects
+        r, _ = self._send("POST", p.url, urlencode(form), {
+            "Content-Type": "application/x-www-form-urlencoded", "Origin": BASE, "Referer": p.url,
+        }, follow=False)
+        if r.status >= 300:
+            raise TAError(f"collection add of {slug!r} answered HTTP {r.status}")
+        if f"Postback('btnGC_Remove','{game.id}')" not in r.text:
+            raise TAError(f"collection add of {slug!r} was not accepted (no Remove button afterwards)")
+        return game.id
+
+    def collection_set(self, game_id: int, field_name: str, label: str, expect=None) -> bool:
+        """Set a Game Collection entry's ownership or media to the option labelled `label`; True when it posted.
+        Compare-and-set on the one EditOptions read: an entry that already shows `label` is left as it is, and with
+        `expect` (the labels the caller planned from) one that shows anything else raises ChangedOnTA; neither
+        posts anything."""
+        _check_id(game_id, zero_ok=False)
+        if field_name not in COLLECTION_FIELDS:
+            raise TAError(f"collection field must be one of: {', '.join(COLLECTION_FIELDS)}")
+        what = f"collection {field_name} of {game_id}"
+        fragment = self._collection_ajax(what, "GameCollection_EditOptions", game_id, {"bDropDownOnly": False})
+        options = edit_options(fragment, game_id)
+        if field_name not in options:
+            raise TAError(f"{what}: TA offers no {field_name} dropdown (is the game in the collection?)")
+        value, chosen = pick_option(options[field_name], field_name, label)
+        current = selected_options(fragment, game_id).get(field_name, "")
+        if _norm(current) == _norm(chosen):
+            return False
+        if expect is not None and _norm(current) not in {_norm(e) for e in expect}:
+            raise ChangedOnTA(f"{what}: TA shows {current or 'none'!r}, the plan saw "
+                              + " or ".join(repr(e or "none") for e in sorted(expect)))
+        d = self._collection_ajax(what, "GameCollection_UpdateGame", game_id, {}, {
+            "Field": f"{COLLECTION_FIELDS[field_name]}_{game_id}", "Value": value})
+        got = d.get("UpdateValue") if isinstance(d, dict) else None
+        if _norm(got or "") != _norm(chosen):
+            raise TAError(f"{what}: TA answered {got!r}, expected {chosen!r}")
+        return True
+
+    def _collection_ajax(self, what: str, method: str, game_id: int, extra: dict, data: dict | None = None):
+        """One GameCollection_* call: its `d`, logging in again once on a logged-out answer."""
+        relogged = False
+        while True:
+            hash_key, gamer_id = self._cookies.get("HashKey"), self._cookies.get("GamerID")
+            if hash_key and gamer_id:
+                payload = {"GameID": game_id, **({"GamerID": gamer_id} if data else {}), "HashKey": hash_key,
+                           **(data or {})}
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": BASE,
+                    "Referer": BASE + self._gamer + "/gamecollection",
+                }
+                r, _ = self._send("POST", AJAX + method, json.dumps({"GameCollection_Data": payload, **extra}),
+                                  headers, follow=False)
+                if r.status >= 300:
+                    raise TAError(f"{what} answered HTTP {r.status}")
+                try:
+                    d = json.loads(r.text)["d"]
+                except (ValueError, KeyError, TypeError):
+                    raise TAError(f"{what} answered something that isn't the expected JSON") from None
+                if isinstance(d, dict) and d.get("errors") and not d.get("UpdateValue"):
+                    text = "; ".join(str(e) for e in (d["errors"] if isinstance(d["errors"], list) else [d["errors"]]))
+                    if _LOGGED_OUT not in text.lower():
+                        raise TAError(f"{what} failed: {text[:200]}")
+                elif isinstance(d, (dict, str)) and not (isinstance(d, str) and _LOGGED_OUT in d.lower()):
+                    return d
+            if relogged:
+                raise AuthError(f"{what}: TrueAchievements session not accepted after a fresh login")
+            relogged = True
+            self.login()
 
     # ---- writes
 

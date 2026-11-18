@@ -42,8 +42,15 @@ COLLECTION_REVIEW_KEY = "collection-review:dry-run"
 COLLECTION_REVIEW_TITLE = "Review the Deku collection plan"
 COLLECTION_360_REVIEW_KEY = "collection-360-review"
 COLLECTION_360_REVIEW_TITLE = "Review the Xbox 360 collection plan"
+LIBRARY_REVIEW_KEY = "library-review:dry-run"
+LIBRARY_REVIEW_TITLE = "Review the library sync plan"
+LIBRARY_CHECK_KEY = "library-check"
+LIBRARY_CHECK_TITLE = "Library sync: check by hand"
+LIBRARY_SIGNIN_KEY = "library-signin"
+LIBRARY_SIGNIN_TITLE = "Library sync: Microsoft sign-in needed"
 # Tasks that aren't problem tasks: the problem sync never closes them.
-_REVIEW_KEYS = frozenset({PLAN_REVIEW_KEY, COLLECTION_REVIEW_KEY, COLLECTION_360_REVIEW_KEY})
+_REVIEW_KEYS = frozenset({PLAN_REVIEW_KEY, COLLECTION_REVIEW_KEY, COLLECTION_360_REVIEW_KEY, LIBRARY_REVIEW_KEY,
+                          LIBRARY_CHECK_KEY, LIBRARY_SIGNIN_KEY})
 _MARKER = re.compile(r"^wsync-key:\s*(\S+)\s*$", re.MULTILINE)
 _HINT = ("add an override in the xbox-wishlist-sync overrides ConfigMap (overrides.json): "
          "`\"{pid}\": {{\"{field}\": \"<slug>\"}}`, or `\"skip\"` as the value to stop mirroring it there")
@@ -388,6 +395,16 @@ def collection_360_review_task(vk: Vikunja, body: str | None) -> bool:
         return False
     changed = vk.upsert(COLLECTION_360_REVIEW_KEY, COLLECTION_360_REVIEW_TITLE, body)
     vk.close_duplicates(COLLECTION_360_REVIEW_KEY)
+    return changed
+
+
+def library_task(vk: Vikunja, key: str, title: str, body: str | None) -> bool:
+    """Keep one of the library step's tasks current, or close it (body None). True when its text changed."""
+    if body is None:
+        vk.close(key)
+        return False
+    changed = vk.upsert(key, title, body)
+    vk.close_duplicates(key)
     return changed
 
 

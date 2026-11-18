@@ -9,9 +9,12 @@ Order (each list is handled independently; a failure on one never blocks the oth
      then search plus a confident pick;
   5. plan; 6. apply (dry run: nothing) adds, then updates, then removes, none started past the
      write deadline; 7. save state, report. SIGTERM stops the run, saves state and exits 1.
-  8. the Deku collection step (`wsync.collection`), after the wishlist step has finished and saved
-     its state: TrueAchievements "Owned" Xbox games -> Deku collection, add-only. Its failures
-     are issues of their own; nothing in it can change what the wishlist step did.
+  8. the library step (`wsync.library`), once a day: Microsoft licences and orders -> TrueAchievements
+     Game Collection adds and ownership fixes (its own dry run, LIBRARY_DRY_RUN);
+  9. the Deku collection step (`wsync.collection`): TrueAchievements "Owned" Xbox games -> Deku
+     collection, add-only.
+  Steps 8 and 9 start after the wishlist step has finished and saved its state; their failures are
+  issues of their own, and nothing in them can change what an earlier step did.
 
 Safety rules beyond the planner's:
   - every Xbox item gets a Match on every list it is mirrored to; a failed lookup is
@@ -44,18 +47,22 @@ from wsync.deku import AuthError as DekuAuthError
 from wsync.deku import DekuClient, DekuItem
 from wsync.feed import FeedError, XboxItem, check_count, is_dlc, load_feed
 from wsync.flaresolverr import FlareSolverr
+from wsync.library import run_library_step
 from wsync.match import Match, base_title, norm, pick, strip_edition_noise
-from wsync.overrides import SKIP, OverridesError, load_collection_overrides, load_overrides
+from wsync.overrides import SKIP, OverridesError, load_collection_overrides, load_library_overrides, load_overrides
 from wsync.plan import XBOX_PLATFORMS, Entry, ListPlan, Plan, Problem, build_plan, is_transient, transient
 from wsync.state import State, load_state, save_state
 from wsync.ta import AlreadyListed
 from wsync.ta import AuthError as TAAuthError
 from wsync.ta import TAClient, TAGame, choose_ta_page, excluded_page
+from wsync.xbox import Http, UrllibHttp
 
 log = logging.getLogger("wsync")
 
 LISTS = ("deku", "ta")
 COLLECTION = "collection"  # `--only collection`: the Deku collection step alone
+LIBRARY = "library"  # `--only library`: the library step alone
+LIBRARY_AFTER = dtime(11, 30)  # WSYNC_LIBRARY_AFTER's default (UTC)
 LABEL = {"deku": "Deku Deals", "ta": "TrueAchievements"}
 KIND = {"deku": "unmatched-deku", "ta": "unmatched-ta"}
 MAX_LOOKUP_ERRORS = 3  # consecutive failed lookups on a list before the rest are skipped
@@ -105,6 +112,14 @@ class Config:
     # WSYNC_TA_READ_AFTER (UTC): read the TA collection at the first run past this time each day
     # (just after TA's own daily purchase import); unset = at most once every 24 h.
     ta_read_after: dtime | None = None
+    library: bool = True  # run the library step (off with --only deku|ta|collection)
+    library_dry_run: bool = True  # LIBRARY_DRY_RUN; a dry run is always dry here too
+    library_after: dtime = LIBRARY_AFTER  # WSYNC_LIBRARY_AFTER (UTC): the daily pass starts at the first run past it
+    xbox_refresh_token: str = field(default="", repr=False)  # XBOX_REFRESH_TOKEN: the Microsoft sign-in seed
+    xbox_token: Path = Path("/state/xbox-token.json")  # WSYNC_XBOX_TOKEN: the rotating refresh token's file
+    library_budget: int = 25  # WSYNC_LIBRARY_BUDGET: games written on TrueAchievements per run
+    library_lookups: int = 10  # WSYNC_LIBRARY_LOOKUPS: games whose TrueAchievements pages are looked up per run
+    library_lookups_per_day: int = 40  # WSYNC_LIBRARY_LOOKUPS_PER_DAY: the same per UTC day, across its runs
 
     @property
     def state_dir(self) -> Path:
@@ -114,9 +129,8 @@ class Config:
         """Every configured secret, in the forms it might take in a URL or message."""
         out: set[str] = set()
         for value in (self.deku_email, self.deku_password, self.deku_wishlist_id, self.ta_gamertag,
-                      self.ta_password, self.vikunja_token, self.apprise_url):
-            if value:
-                out |= {value, quote(value, safe=""), quote_plus(value), value.replace(" ", "+")}
+                      self.ta_password, self.vikunja_token, self.apprise_url, self.xbox_refresh_token):
+            out |= secret_forms(value)
         return sorted(out, key=len, reverse=True)
 
     def missing(self) -> list[str]:
@@ -124,13 +138,30 @@ class Config:
         if "deku" in self.lists or self.collection:
             need += [("DEKU_EMAIL", self.deku_email), ("DEKU_PASSWORD", self.deku_password),
                      ("DEKU_WISHLIST_ID", self.deku_wishlist_id)]
-        if "ta" in self.lists or self.collection:
+        if "ta" in self.lists or self.collection or self.library:
             need += [("TA_GAMERTAG", self.ta_gamertag), ("TA_PASSWORD", self.ta_password)]
         need.append(("FLARESOLVERR_URL", self.flaresolverr_url))
         if self.report:
             need += [("VIKUNJA_URL", self.vikunja_url), ("VIKUNJA_TOKEN", self.vikunja_token),
                      ("APPRISE_URL", self.apprise_url)]
         return [name for name, value in need if not value]
+
+
+def secret_forms(value: str) -> set[str]:
+    """A secret as it may appear in a URL or a message: as is, URL-quoted, form-quoted, spaces as '+'."""
+    if not value:
+        return set()
+    return {value, quote(value, safe=""), quote_plus(value), value.replace(" ", "+")}
+
+
+def _utc_time(env, name: str) -> dtime | None:
+    raw = (env.get(name) or "").strip()
+    if not raw:
+        return None
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", raw)
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        raise ConfigError(f"{name} must be HH:MM (UTC)")
+    return dtime(int(m.group(1)), int(m.group(2)))
 
 
 def _int_env(env, name: str) -> int | None:
@@ -143,13 +174,23 @@ def _int_env(env, name: str) -> int | None:
         raise ConfigError(f"{name} must be a whole number") from None
 
 
+def _count_env(env, name: str, default: int) -> int:
+    """A count (0 or more) from the environment; `default` when unset or empty."""
+    value = _int_env(env, name)
+    if value is None:
+        return default
+    if value < 0:
+        raise ConfigError(f"{name} must be 0 or more")
+    return value
+
+
 def config_from(argv: list[str], env) -> Config:
     p = argparse.ArgumentParser(
         prog="python -m wsync",
         description="Mirror the Xbox wishlist feed onto Deku Deals and TrueAchievements.",
     )
-    p.add_argument("--only", choices=(*LISTS, COLLECTION),
-                   help="sync one list only, or run only the Deku collection step")
+    p.add_argument("--only", choices=(*LISTS, COLLECTION, LIBRARY),
+                   help="sync one list only, or run only the Deku collection step or the library step")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", dest="mode", action="store_const", const="dry",
                       help="plan only, write nothing (overrides DRY_RUN)")
@@ -167,19 +208,14 @@ def config_from(argv: list[str], env) -> Config:
         dry = (env.get("DRY_RUN") or "true").strip().lower() not in _FALSE
     collection_dry = dry or (env.get("COLLECTION_DRY_RUN") or "true").strip().lower() not in _FALSE
     collection_360_dry = collection_dry or (env.get("COLLECTION_360_DRY_RUN") or "true").strip().lower() not in _FALSE
+    library_dry = dry or (env.get("LIBRARY_DRY_RUN") or "true").strip().lower() not in _FALSE
+    library_after = _utc_time(env, "WSYNC_LIBRARY_AFTER")
     accept = a.accept_feed_count if a.accept_feed_count is not None else _int_env(env, "WSYNC_ACCEPT_FEED_COUNT")
     hours = (env.get("WSYNC_FEED_MAX_AGE_HOURS") or "").strip()
     try:
         max_age = timedelta(hours=float(hours)) if hours else timedelta(hours=6)
     except ValueError:
         raise ConfigError("WSYNC_FEED_MAX_AGE_HOURS must be a number") from None
-    read_after = (env.get("WSYNC_TA_READ_AFTER") or "").strip()
-    ta_read_after = None
-    if read_after:
-        m = re.fullmatch(r"(\d{1,2}):(\d{2})", read_after)
-        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
-            raise ConfigError("WSYNC_TA_READ_AFTER must be HH:MM (UTC)")
-        ta_read_after = dtime(int(m.group(1)), int(m.group(2)))
     return Config(
         feed=Path(env.get("WSYNC_FEED") or "/feed/wishlist.json"),
         state=Path(env.get("WSYNC_STATE") or "/state/state.json"),
@@ -194,14 +230,22 @@ def config_from(argv: list[str], env) -> Config:
         vikunja_token=env.get("VIKUNJA_TOKEN", ""),
         apprise_url=env.get("APPRISE_URL", ""),
         dry_run=dry,
-        lists=() if a.only == COLLECTION else (a.only,) if a.only else LISTS,
+        lists=() if a.only in (COLLECTION, LIBRARY) else (a.only,) if a.only else LISTS,
         collection=a.only in (None, COLLECTION),
         collection_dry_run=collection_dry,
         collection_360_dry_run=collection_360_dry,
         report=not a.no_report,
         accept_feed_count=accept,
         feed_max_age=max_age,
-        ta_read_after=ta_read_after,
+        ta_read_after=_utc_time(env, "WSYNC_TA_READ_AFTER"),
+        library=a.only in (None, LIBRARY),
+        library_dry_run=library_dry,
+        library_after=library_after if library_after is not None else LIBRARY_AFTER,
+        xbox_refresh_token=(env.get("XBOX_REFRESH_TOKEN") or "").strip(),
+        xbox_token=Path(env.get("WSYNC_XBOX_TOKEN") or "/state/xbox-token.json"),
+        library_budget=_count_env(env, "WSYNC_LIBRARY_BUDGET", Config.library_budget),
+        library_lookups=_count_env(env, "WSYNC_LIBRARY_LOOKUPS", Config.library_lookups),
+        library_lookups_per_day=_count_env(env, "WSYNC_LIBRARY_LOOKUPS_PER_DAY", Config.library_lookups_per_day),
     )
 
 
@@ -209,8 +253,24 @@ def config_from(argv: list[str], env) -> Config:
 
 
 class Scrubber:
-    def __init__(self, secrets: list[str]):
-        self._re = re.compile("|".join(re.escape(s) for s in secrets), re.I) if secrets else None
+    """Replaces every known secret in a text with <redacted>. `add` takes the secrets met during the run (the
+    Microsoft tokens the moment they exist, the XUID), in the forms `Config.secrets()` lists."""
+
+    def __init__(self, secrets=()):
+        self._secrets: set[str] = {s for s in secrets if s}
+        self._compile()
+
+    def add(self, *values: str) -> None:
+        new: set[str] = set()
+        for value in values:
+            new |= secret_forms(value)
+        if new - self._secrets:
+            self._secrets |= new
+            self._compile()
+
+    def _compile(self) -> None:
+        longest_first = sorted(self._secrets, key=len, reverse=True)
+        self._re = re.compile("|".join(re.escape(s) for s in longest_first), re.I) if longest_first else None
 
     def __call__(self, text) -> str:
         text = str(text)
@@ -218,11 +278,12 @@ class Scrubber:
 
 
 class RedactingFilter(logging.Filter):
-    """Handler filter: scrub configured secrets from every formatted record (defence in depth)."""
+    """Handler filter: scrub known secrets from every formatted record (defence in depth). Given the run's
+    Scrubber, it also redacts the secrets the run adds to it."""
 
-    def __init__(self, secrets: list[str]):
+    def __init__(self, secrets: Scrubber | list[str]):
         super().__init__()
-        self._scrub = Scrubber(secrets)
+        self._scrub = secrets if isinstance(secrets, Scrubber) else Scrubber(secrets)
 
     def filter(self, record: logging.LogRecord) -> bool:
         record.msg, record.args = self._scrub(record.getMessage()), None
@@ -247,6 +308,9 @@ class NullReporter:
     def collection_360_review(self, body) -> bool:
         return False
 
+    def library_task(self, key, title, body) -> bool:
+        return False
+
     def notify(self, title, body) -> None:
         pass
 
@@ -267,6 +331,9 @@ class LiveReporter:
 
     def collection_360_review(self, body) -> bool:
         return report.collection_360_review_task(self._vk, body)
+
+    def library_task(self, key, title, body) -> bool:
+        return report.library_task(self._vk, key, title, body)
 
     def notify(self, title, body) -> None:
         report.notify(self._apprise, title, body)
@@ -297,8 +364,9 @@ class Deps:
     http_get: Callable | None = None  # XCT transport; None = d2d's default
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
     monotonic: Callable[[], float] = time.monotonic
-    sleep: Callable[[float], None] = time.sleep  # the collection step's pacing
+    sleep: Callable[[float], None] = time.sleep  # the collection and library steps' pacing
     d2d_pause: float = 1.0
+    make_xbox_http: Callable[[], Http] = UrllibHttp  # the library step's Microsoft transport
 
 
 # --------------------------------------------------------------------------- title helpers
@@ -453,9 +521,9 @@ class Terminated(BaseException):
 
 
 class _Run:
-    def __init__(self, cfg: Config, deps: Deps):
+    def __init__(self, cfg: Config, deps: Deps, scrub: Scrubber | None = None):
         self.cfg, self.deps = cfg, deps
-        self.scrub = Scrubber(cfg.secrets())
+        self.scrub = scrub if scrub is not None else Scrubber(cfg.secrets())
         self.issues: list[str] = []
         self.reporter: Any = NullReporter()
         self.start = deps.monotonic()
@@ -511,6 +579,10 @@ class _Run:
         """Xbox 360 games are listed, never added (COLLECTION_360_DRY_RUN, or the whole step dry)."""
         return self.collection_dry or self.cfg.collection_360_dry_run
 
+    @property
+    def library_dry(self) -> bool:
+        return self.cfg.dry_run or self.cfg.library_dry_run
+
     def _finish(self) -> int:
         """Exit code; the failure ping goes out only when the set of issues changed since last run."""
         digest = failure_digest(self.issues) if self.issues else None
@@ -564,8 +636,9 @@ class _Run:
         cfg = self.cfg
         step = ("off" if not cfg.collection else "DRY RUN" if self.collection_dry
                 else "APPLY, Xbox 360 games DRY RUN" if self.collection_360_dry else "APPLY")
+        library = "off" if not cfg.library else "DRY RUN" if self.library_dry else "APPLY"
         self.say(f"wsync starting: {'DRY RUN (no writes)' if cfg.dry_run else 'APPLY'}, "
-                 f"lists: {', '.join(cfg.lists) or 'none'}; Deku collection step: {step}")
+                 f"lists: {', '.join(cfg.lists) or 'none'}; library step: {library}; Deku collection step: {step}")
         missing = cfg.missing()
         if missing:
             self.issue(f"missing configuration: {', '.join(missing)}")
@@ -579,6 +652,8 @@ class _Run:
             return self.fail()
         if cfg.lists:
             self._wishlist()
+        if cfg.library:
+            self._library()
         if cfg.collection:
             self._collection()
         return self._finish()
@@ -661,7 +736,36 @@ class _Run:
             keep.add("d2d-disputed")
         self._report(plan, applied, keep)
 
-    # ---- 8. the Deku collection step
+    # ---- 8. the library step
+
+    def _library(self) -> None:
+        """Runs after the wishlist step finished and saved its state; whatever happens here is an issue of its
+        own (or a quiet stop), never a change to another step's results."""
+        cfg = self.cfg
+        if self.past_deadline():
+            self.say("library: step not started, past the write deadline; next run", logging.WARNING)
+            return
+        try:
+            overrides = load_library_overrides(cfg.overrides)
+        except OverridesError as e:
+            self.issue(f"library step skipped: library overrides rejected: {e}")
+            return
+        try:
+            ta = self.ta_client or self.deps.make_ta(cfg, dict(self.state.ta_game_ids))
+            http = self.deps.make_xbox_http()
+        except Exception as e:  # noqa: BLE001
+            self.issue(f"library step: client setup failed ({type(e).__name__})")
+            return
+        try:
+            run_library_step(self, ta, http, self.state, overrides, self.deps.now())
+        except Exception as e:  # noqa: BLE001 - never let the step take the run down
+            self.issue(f"library step aborted by an unexpected error: {_err(e)}")
+        try:
+            save_state(cfg.state, self.state)
+        except Exception as e:  # noqa: BLE001
+            self.issue(f"state not saved after the library step ({type(e).__name__})")
+
+    # ---- 9. the Deku collection step
 
     def _collection(self) -> None:
         """Runs after the wishlist step finished and saved its state; whatever happens here is an
@@ -1269,6 +1373,7 @@ class _Run:
                 self.notify("Wishlist sync", text)
 
 
-def run(cfg: Config, deps: Deps | None = None) -> int:
-    """One sync run; returns the process exit code (0 ok, 1 any failure)."""
-    return _Run(cfg, deps or Deps()).go()
+def run(cfg: Config, deps: Deps | None = None, *, scrub: Scrubber | None = None) -> int:
+    """One sync run; returns the process exit code (0 ok, 1 any failure). `scrub`: the scrubber the log handler
+    filters with, so the secrets the run meets are redacted in every log record too."""
+    return _Run(cfg, deps or Deps(), scrub).go()
