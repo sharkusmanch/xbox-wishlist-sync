@@ -698,6 +698,10 @@ def test_any_exception_from_a_lookup_is_that_games_failure(tmp_path, caplog):
     assert "Example Bravo" in tasks(h, "library-review:dry-run")[-1]
     # nothing else waits for a lookup in this pass: the dry-run plan is complete and pinged
     assert [t for t, _ in h.reporter.notes] == ["Library sync plan ready", "Wishlist sync failed"]
+    h.ta.calls.clear()
+    h.now = NOW + H
+    assert h.run() == 0 and looked_up(h.ta.calls) == []  # not tried again this pass
+    assert library_state(h)["last_pass"] == "2026-11-01"  # the pass is complete
 
 
 def test_after_three_lookup_errors_in_a_row_the_passs_lookups_wait_for_the_next_day(tmp_path, caplog):
