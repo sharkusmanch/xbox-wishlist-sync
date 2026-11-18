@@ -135,6 +135,29 @@ def test_no_longer_have_is_fixed_on_any_active_licence():
     assert writes(plan([owned("Example Max", evidence="unknown-order")], renting)) == [("fix", 105)]
 
 
+def test_any_other_ta_status_is_left_alone_whatever_the_licence():
+    """Only a subscription status (with a paid order or a claim) and No longer have / Renting are ever fixed."""
+    others = ("Looking to trade/sell", "Loaned out", "Ordered", "Unable to play", "Borrowing", "Trial",
+              "Some Status TA Adds Later", "")
+    for status in others:
+        for ev in ("paid", "claim"):
+            p = plan([owned("Example Knight", evidence=ev)], [row(100, "Example Knight", status)])
+            assert (p.actions, p.review, p.lookups) == ([], [], []), (status, ev)  # no fix, no review item
+    # several entries of the game, none of them fixable: left alone too
+    rows = [row(100, "Example Knight", "Loaned out"), row(101, "Example Knight (Xbox One)", "Trial", platform="xbox-one")]
+    p = plan([owned("Example Knight", gen=(GEN8, GEN9))], rows)
+    assert (p.actions, p.review) == ([], [])
+    # a looked-up page whose entry is listed under another title: the same rule
+    g = owned("Example Odd Name")
+    p = plan([g], [row(111, "Example Proper Name", "Loaned out")], found(g, page(111, "Example Odd Name")))
+    assert (p.actions, p.review) == ([], [])
+    # a fixable entry beside a left-alone one is still several entries: a hand check, never a write
+    rows = [row(100, "Example Knight", "Loaned out"), row(101, "Example Knight (Xbox One)", "No longer have",
+                                                         platform="xbox-one")]
+    p = plan([owned("Example Knight", gen=(GEN8, GEN9))], rows)
+    assert p.actions == [] and kinds(p) == ["versions"]
+
+
 def test_a_pre_2016_licence_for_an_ea_play_game_goes_to_review():
     g = owned("Example Field 4", evidence="legacy")
     pages = found(g, page(400, "Example Field 4"))

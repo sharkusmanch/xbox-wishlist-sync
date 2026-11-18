@@ -213,10 +213,12 @@ compared with the TA collection rows:
 - **Adds.** A game with no TA entry gets its own TA page's entry: ownership **Owned** (**Games with
   Gold** for a free claim that is on TA's Games with Gold list), media **Digital**.
 - **Fixes.** An entry that exists with a wrong ownership becomes **Owned** (media Digital when it
-  has none). A subscription status (Game Pass, EA Play, Ubisoft+ ...) is only changed on
-  **evidence**: a paid order or a claim. A licence alone, which a subscription also grants, is
-  not enough, and the same holds for pre-2016 licences of EA Play games (they may be vault
-  licences).
+  has none): "No longer have" or "Renting" on any active licence. A subscription status (Game
+  Pass, EA Play, Ubisoft+ ...) is only changed on **evidence**: a paid order or a claim. A licence
+  alone, which a subscription also grants, is not enough, and the same holds for pre-2016 licences
+  of EA Play games (they may be vault licences). Any other status (Loaned out, Looking to
+  trade/sell, Ordered, Unable to play, Borrowing, Trial, or one the step doesn't know) is the
+  owner's own: left alone, with no fix and no check-by-hand item.
 - **Never.** Nothing is removed. An entry already Owned or Games with Gold is never changed, no
   other ownership is ever written on a fix, and an entry that has media (Disc, Disc to Digital ...)
   never has it changed.

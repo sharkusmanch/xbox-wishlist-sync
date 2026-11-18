@@ -9,7 +9,8 @@ The plan is ported from the games repo's scripts/xbox-library.py (`reconcile`) a
 - `reconcile`: each owned game against the TA collection: ok (in TA as Owned or Games with Gold, or a free
   game in TA at all), wrong (in TA with another status) or missing (with a possible-match hint);
 - `plan_library`: the TA writes and the items to check by hand. A wrong ownership becomes Owned (media Digital
-  when TA has none); a subscription status only with a paid order or a claim. A missing game's own TA page is
+  when TA has none): No longer have or Renting on any licence, a subscription status only with a paid order or a
+  claim; any other status (Loaned out, Trial, ...) is the owner's and left alone. A missing game's own TA page is
   added as Owned (Games with Gold for a free claim on TA's Games with Gold list), media Digital. A possible
   match, an uncertain version or ownership, or no page: a Review, never a write. The step looks up a missing
   game's pages (`candidate_slugs`, keyed by `lookup_key`); a game not looked up yet is a lookup.
@@ -31,8 +32,9 @@ among the pages that fit.
   override whose page the lookup didn't find is a review of its own kind, "override", never "no-page" (which
   the live check task leaves out), so a mistyped override doesn't stay silent.
 
-Never planned: a removal, a change to an Owned or Games with Gold entry, any ownership but Owned on a fix, or
-a media change on an entry that has media.
+Never planned: a removal, a change to an Owned or Games with Gold entry or to an ownership other than a
+subscription, No longer have or Renting, any ownership but Owned on a fix, or a media change on an entry that has
+media.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ OWNED_TA = frozenset({OWNED, GWG})
 SUBSCRIPTIONS = frozenset({"Xbox Game Pass (deprecated)", "Xbox Game Pass Ultimate", "Xbox Game Pass Premium",
                            "Xbox Game Pass Essential", "PC Game Pass", "EA Play", "Ubisoft+"})
 PAID = frozenset({"paid", "claim"})  # the evidence that may turn a subscription status into Owned
+FIXABLE = frozenset({"No longer have", "Renting"})  # turned into Owned on any active licence
 WINDOWS = "Windows"
 LAST_GEN = frozenset({"Xbox 360", "Xbox"})  # TA platform names of Xbox 360 and original Xbox games
 MODERN = frozenset({SERIES, ONE, WINDOWS})
@@ -284,6 +287,13 @@ def _subscription(status: str) -> bool:
     return status in SUBSCRIPTIONS or "game pass" in status.lower()
 
 
+def _fixable(status: str) -> bool:
+    """A TA ownership a licence may turn into Owned: a subscription status (only with a paid order or a claim) or
+    No longer have / Renting. Any other one (Loaned out, Looking to trade/sell, Ordered, Trial, a blank or unknown
+    one) is the owner's own: never fixed, never a review item."""
+    return _subscription(status) or status in FIXABLE
+
+
 # ---------------------------------------------------------------- the plan
 
 def _review(game: OwnedGame, kind: str, reason: str) -> Review:
@@ -334,6 +344,9 @@ class _Planner:
         if m.status == "ok":
             self.plan.ok += 1
         elif m.status == "wrong":
+            if not any(_fixable(r.ownership) for r in m.rows):
+                self._settle([])  # only statuses the owner set: left alone
+                return
             old = [_row_last_gen(r) for r in m.rows]  # only a `_last_gen_ok` game matches a 360 / Xbox entry
             if any(old) and not all(old):
                 self._settle([_review(g, "versions", "TA has Xbox 360 / Xbox and newer entries: " + _rows(m.rows))])
@@ -392,7 +405,7 @@ class _Planner:
         return [self._fix(g, self.by_id[p.id], p.slug) if p.id in self.by_id else self._add(g, p) for p in chosen]
 
     def _fix(self, g: OwnedGame, row: OwnedRow, slug: str = "") -> Action | Review | None:
-        if row.ownership in OWNED_TA or g.acquisition == "free":
+        if row.ownership in OWNED_TA or g.acquisition == "free" or not _fixable(row.ownership):
             return None
         if _subscription(row.ownership) and g.evidence not in PAID:
             return _review(g, "subscription", f"no paid order on record: TA says {row.ownership}; Microsoft has an "
