@@ -63,14 +63,26 @@ class AuthError(TAError):
     """Not logged in, and logging in again didn't help."""
 
 
-class NotFound(TAError):
+class HttpError(TAError):
+    """TrueAchievements answered an HTTP error status (`status`) for a page."""
+
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
+class NotFound(HttpError):
     """TrueAchievements answered HTTP 404: there is no page at that address."""
+
+    def __init__(self, message: str):
+        super().__init__(message, 404)
 
 
 class Unreachable(TAError):
     """No answer from TrueAchievements itself: a network error, a Cloudflare challenge that a fresh clearance didn't
-    pass, no usable clearance from FlareSolverr, or a page that is neither a game page nor TA's page-not-found page
-    (maintenance, throttling). A later run may get through."""
+    pass, no usable clearance from FlareSolverr, or (for a game page lookup) TA unavailable or throttling: an HTTP
+    429, 502-504 or Cloudflare 52x answer, or a page with no game id that isn't TA's page-not-found page
+    (maintenance, a throttle page). Every other address would meet it too; a later run may get through."""
 
 
 class ChangedOnTA(TAError):
@@ -248,6 +260,7 @@ def _norm(s: str) -> str:
 
 
 _GC_BUTTON = re.compile(r"Postback\('btnGC_(Add|Remove)','(\d+)'\)")
+_GAME_ID = re.compile(r'data-game="(-?\d+)"')
 _OPTION = re.compile(r"<option\b([^>]*)>(.*?)</option>", re.S | re.I)
 _ATTR = re.compile(r"""([^\s"'=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?""")
 NOT_FOUND_MARK = "PageNotFound404"  # in TA's page-not-found page, served with HTTP 200 for an unknown game address
@@ -502,7 +515,7 @@ def _fields(page: str) -> dict[str, str]:
 
 def parse_game(page: str, slug: str) -> TAGame:
     # Unreleased games have a negative placeholder id (verified 2026-11-01, Persona 6 = -7827).
-    ids = set(re.findall(r'data-game="(-?\d+)"', page))
+    ids = set(_GAME_ID.findall(page))
     if len(ids) != 1:
         raise TAError(f"game page {slug!r} has {len(ids)} game ids")
     title = page_title(page)
@@ -692,7 +705,7 @@ class TAClient:
         if r.status == 404:
             raise NotFound(f"{self._label(method, url)} answered HTTP 404")
         if r.status >= 400:
-            raise TAError(f"{self._label(method, url)} answered HTTP {r.status}")
+            raise HttpError(f"{self._label(method, url)} answered HTTP {r.status}", r.status)
         if r.status in _REDIRECTS:
             raise TAError(f"{self._label(method, url)} answered a redirect without a location")
         return Page(r.status, r.text, final)
@@ -837,18 +850,23 @@ class TAClient:
 
     def game_page_or_none(self, slug: str) -> TAGame | None:
         """The game page at /game/<slug>, or None when there is none there: HTTP 404, or TA's page-not-found page.
-        Any other page that isn't one game's page is Unreachable (maintenance, throttling), never "no page"; other
-        failures raise as usual."""
+        What every other address would meet too is Unreachable, never "no page": TA unavailable or throttling (HTTP
+        429, 502-504, Cloudflare's 52x) or a page with no game id at all (maintenance, a throttle page). An error of
+        this address alone stays a plain TAError: another HTTP error, or a page with game ids that isn't one game's
+        page (several ids, no title)."""
         try:
             p = self._get(BASE + "/game/" + quote(slug, safe=""), need_login=False)
         except NotFound:
             return None
+        except HttpError as e:
+            if e.status == 429 or 502 <= e.status <= 504 or 520 <= e.status <= 530:
+                raise Unreachable(f"{e} (TrueAchievements unavailable or throttling)") from None
+            raise
         if NOT_FOUND_MARK in p.html:
             return None
-        try:
-            return parse_game(p.html, slug)
-        except TAError as e:
-            raise Unreachable(f"game page {slug!r} is neither a game page nor TA's page-not-found page ({e})") from None
+        if not _GAME_ID.search(p.html):
+            raise Unreachable(f"game page {slug!r} is neither a game page nor TA's page-not-found page (no game id)")
+        return parse_game(p.html, slug)
 
     def dlc(self, game: int | str) -> list[tuple[str, int]]:
         """(title, DLC id) pairs from `/game/<slug>/dlc`; a game id is resolved to its slug first."""

@@ -43,8 +43,10 @@ class State:
     #   "failed": {"at": iso, "issue": str}  a failed Microsoft or TA read: no new read for 6 h (a warning);
     #   "signin_failed": {"day": "YYYY-MM-DD", "seed": SHA-256 of XBOX_REFRESH_TOKEN}  a sign-in that needed a new
     #              token: not tried again that day with the same seed; removed by a working sign-in;
-    #   "pass": {"day": "YYYY-MM-DD", "rows": [OwnedRow as dict], "done": [TA game id]}  the TA collection the
-    #              day's pass read in its first run, and the TA ids it has written since; dropped when it completes;
+    #   "pass": {"day": "YYYY-MM-DD", "rows": [OwnedRow as dict], "done": [TA game id], "errors": n,
+    #            "lookup_failed": [lookup key], "lookup_errors": n}  the TA collection the day's pass read in its
+    #              first run, the TA ids it has written since, the write-error streak, the games whose page lookup
+    #              failed in the pass and the lookup-error streak; dropped when it completes;
     #   "lists": {"games-with-gold" | "ea-play": {"fetched": iso, "ids": [TA game id], "tried": iso}};
     #   "pages": {lookup key: {"checked": iso, "slugs": [addresses tried], "pages": [TAGame as dict]}};
     #   "writing": {TA game id: {"kind", "slug", "ta_id", "title", "sets", "expect" (the labels the plan saw per

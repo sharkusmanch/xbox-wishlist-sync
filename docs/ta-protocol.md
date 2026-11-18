@@ -213,8 +213,10 @@ Used by the library step (`TAClient.collection_page`, `collection_add`, `collect
 An unknown `/game/<slug>` is answered with HTTP 200 and TA's page-not-found page: `<h1
 class="pagetitle">Page not found</h1>` and the marker `PageNotFound404`, with no game id and no
 canonical link (verified 2026-11-17). A real 404 is possible as well. "No page" is therefore HTTP
-404 *or* the marker; any other page without exactly one game id (throttling, maintenance, a
-challenge) is *not* "no page" and must be retried later.
+404 *or* the marker. Anything else is *not* "no page": `game_page_or_none` raises `Unreachable` for
+what every address would meet (a page with no game id at all: throttling, maintenance, a challenge;
+HTTP 429, 502-504 or Cloudflare's 52x), and a plain `TAError` for an error of that address alone (any
+other HTTP error; a page with game ids that isn't one game's page: several ids, no title).
 
 ## Property lists
 

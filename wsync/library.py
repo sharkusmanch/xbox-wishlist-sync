@@ -49,7 +49,7 @@ from .flaresolverr import FlareSolverrError
 from .overrides import SKIP
 from .owned import (BARE_PLATFORM, PLATFORM_SUFFIX, PLATFORM_TAG, TIER_PLAIN, OwnedGame, game_key, hint, match_keys,
                     owned_games, same_game)
-from .ta import ONE, SERIES, AlreadyListed, ChangedOnTA, TAGame, Unreachable
+from .ta import ONE, SERIES, AlreadyListed, AuthError, ChangedOnTA, TAGame, Unreachable
 from .ta_coll import OwnedRow
 from .xbox import SignInNeeded, TokenStore, XboxError, catalog_lookup, fetch_collections, fetch_orders, open_session
 
@@ -438,6 +438,7 @@ PAGES_FRESH = timedelta(days=7)  # a game's looked-up pages are reused this long
 PAGES_FRESH_LONG = timedelta(days=30)  # or this long for a game with no page or a seen product
 LISTS_FRESH = timedelta(days=7)  # TA's Games with Gold and EA Play lists are read at most weekly
 MAX_WRITE_ERRORS = 3  # TA write errors without a successful write between them: the pass's writes stop
+MAX_LOOKUP_ERRORS = 3  # failed page lookups without a successful one between them: the pass's lookups stop
 GWG_LIST, EA_LIST = "games-with-gold", "ea-play"
 
 
@@ -451,6 +452,7 @@ class LibraryResult:
     pending: int = 0  # games still waiting for a page lookup
     left: int = 0  # live: planned writes left for the next run
     failed: list[str] = field(default_factory=list)  # titles whose TA write failed this run (each an issue)
+    lookup_failed: list[str] = field(default_factory=list)  # titles whose page lookup failed this run (each an issue)
     stopped: str | None = None  # why the pass ended early this run
     complete: bool = False  # the day's pass is done: state.library["last_pass"] is today
 
@@ -486,6 +488,12 @@ def _unreachable(e: BaseException) -> bool:
     return isinstance(e, (Unreachable, FlareSolverrError))
 
 
+def _everywhere(e: BaseException) -> bool:
+    """A lookup failure every TA request would meet: the network, Cloudflare, TA unavailable or throttling
+    (`Unreachable`), FlareSolverr, or the TA login."""
+    return _unreachable(e) or isinstance(e, AuthError)
+
+
 def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: datetime) -> LibraryResult:
     """One run of the library step. `run` is the wishlist run (`wsync.run._Run`): its `cfg`, `say`, `issue`,
     `scrub`, `sleep`, `past_deadline()`, `checkpoint()` (save the state now) and `library_dry`. `ta` is the
@@ -497,8 +505,8 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
     failed write) goes on at the next run, with the TA collection its first run read and without the writes it has
     made. A failed Microsoft or TA read is an issue; the runs within 6 h of it make no new read and only warn. A
     Microsoft sign-in that needs a new token is not an issue: it isn't tried again before the next day's pass unless
-    XBOX_REFRESH_TOKEN changes. A TA write error is an issue about that game only; Cloudflare or network trouble
-    and the write deadline stop the writes quietly. Other exceptions propagate.
+    XBOX_REFRESH_TOKEN changes. A TA write or page-lookup error is an issue about that game only; Cloudflare or
+    network trouble and the write deadline stop the lookups and writes quietly. Other exceptions propagate.
     """
     if now.tzinfo is None:
         raise ValueError("run_library_step needs a timezone-aware `now`")
@@ -553,7 +561,8 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
     _look_up(run, ta, lib, plan, overrides, now, res)
     plan = _without(done, plan_library(games, rows, _cached_pages(lib, games, overrides, now), overrides, gwg,
                                        ea_play))
-    res.plan, res.pending = plan, len(plan.lookups)
+    failed = set(lib["pass"].get("lookup_failed") or ())
+    res.plan, res.pending = plan, sum(lookup_key(g) not in failed for g in plan.lookups)
     _log_plan(run, res, len(games), len(rows), plan)
     library_report.baseline(lib, plan, dry=res.dry_run)  # decision A: before any write, so a stop can't skip it
     if not res.dry_run:
@@ -581,13 +590,15 @@ def _backing_off(run, lib: dict, now: datetime, res: LibraryResult) -> bool:
 def _end(run, res: LibraryResult, lib: dict, today: str) -> LibraryResult:
     """The run's summary; the day's pass is complete when nothing stopped or failed and no lookup or write is left.
     Its stored TA collection read goes with it."""
-    res.complete = res.stopped is None and not res.failed and not res.pending and not res.left
+    res.complete = (res.stopped is None and not res.failed and not res.lookup_failed and not res.pending
+                    and not res.left)
     if res.complete:
         lib["last_pass"] = today
         lib.pop("pass", None)
     run.say(f"library: this run: looked up {res.looked_up}, written {len(res.written)}"
             + (f", {res.left} writes left" if res.left else "")
             + (f", {len(res.failed)} failed" if res.failed else "")
+            + (f", {len(res.lookup_failed)} lookups failed" if res.lookup_failed else "")
             + (f", {res.pending} games waiting for a lookup" if res.pending else "")
             + (f"; stopped: {res.stopped}" if res.stopped else "")
             + ("; today's pass is complete" if res.complete else "; the pass goes on next run"))
@@ -726,41 +737,80 @@ def _cached_pages(lib: dict, games: list[OwnedGame], overrides: dict[str, dict],
 def _look_up(run, ta, lib: dict, plan: LibraryPlan, overrides: dict[str, dict], now: datetime,
              res: LibraryResult) -> None:
     """The TA pages of the games the plan waits for, at most cfg.library_lookups games, every candidate address of
-    each. No page there (HTTP 404, or not a game page) goes on to the next address; any other failure stops the
-    lookups quietly for this run, the game not looked up. Each game's result goes into the cache."""
+    each; each game's result goes into the cache. No page there (HTTP 404, or TA's page-not-found page) goes on to
+    the next address.
+
+    Failures: what every request would meet (`_everywhere`: the network, Cloudflare, TA unavailable or throttling,
+    the login) stops the lookups quietly for this run, the game not looked up. Anything else (an HTTP error of one
+    address, a page that doesn't parse, any other exception) fails that game's lookup for the pass: an issue naming
+    it and its product ids, the game out of the pass's lookups (`pass["lookup_failed"]`, tried again in the next
+    day's pass), and the next game goes on, until MAX_LOOKUP_ERRORS failures come without a successful lookup between
+    them (`pass["lookup_errors"]`): then the pass looks nothing more up."""
+    stored = lib["pass"]  # today's pass: read or made by _pass_rows before any lookup
+    failed = stored.setdefault("lookup_failed", [])
+    if stored.get("lookup_errors", 0) >= MAX_LOOKUP_ERRORS:
+        _lookups_stopped(run, res)
+        return
     cache = lib.setdefault("pages", {})
-    for g in plan.lookups[:max(run.cfg.library_lookups, 0)]:
+    queue = [g for g in plan.lookups if lookup_key(g) not in failed]
+    for g in queue[:max(run.cfg.library_lookups, 0)]:
         if run.past_deadline():
             res.stopped = "write deadline"
             run.say("library: lookups stopped at the write deadline; the rest next run", logging.WARNING)
             return
-        slugs = candidate_slugs(g, override_for(g, overrides))
         found: list[TAGame] = []
         try:
+            slugs = candidate_slugs(g, override_for(g, overrides))
             for slug in slugs:
                 run.sleep(PACE)
                 page = ta.game_page_or_none(slug)
                 if page is not None:
                     found.append(page)
-        except TAError as e:
-            res.stopped = f"TrueAchievements lookup failed ({type(e).__name__})"
-            run.say(f"library: looking up {g.title} failed ({_err(e)}); lookups stopped, the rest next run",
-                    logging.WARNING)
-            return
+        except Exception as e:  # noqa: BLE001 - whatever stops one game's lookup is that game's, unless it's TA's
+            if _everywhere(e):
+                res.stopped = f"TrueAchievements lookup failed ({type(e).__name__})"
+                run.say(f"library: looking up {g.title} failed ({_err(e)}); lookups stopped, the rest next run",
+                        logging.WARNING)
+                return
+            _lookup_failed(run, res, stored, g, e)
+            if stored["lookup_errors"] >= MAX_LOOKUP_ERRORS:
+                _lookups_stopped(run, res)
+                return
+            continue
+        stored["lookup_errors"] = 0
         cache[lookup_key(g)] = {"checked": now.isoformat(), "slugs": slugs, "pages": [asdict(p) for p in found]}
         res.looked_up += 1
         run.say(f"library: looked up {g.title}: "
                 + ("; ".join(f"{p.title} [{p.platform or 'no platform'}]" for p in found) or "no TA page"))
 
 
+def _lookup_failed(run, res: LibraryResult, stored: dict, g: OwnedGame, e: Exception) -> None:
+    """One game's failed lookup: an issue naming it and its products, with the message of a TA error (the job's own
+    text) or the exception type alone; the game waits for the next day's pass."""
+    stored.setdefault("lookup_failed", []).append(lookup_key(g))
+    stored["lookup_errors"] = stored.get("lookup_errors", 0) + 1
+    res.lookup_failed.append(g.title)
+    detail = _err(e) if isinstance(e, TAError) else type(e).__name__
+    run.issue(f"library step: TrueAchievements page lookup failed for {g.title}: {detail}; tried again in the "
+              f"next day's pass. To leave the game out, add a library override \"skip\" for product "
+              f"{', '.join(g.pids)}")
+
+
+def _lookups_stopped(run, res: LibraryResult) -> None:
+    res.stopped = f"lookups stopped for today's pass ({MAX_LOOKUP_ERRORS} lookup errors in a row)"
+    run.say(f"library: lookups stopped for today's pass after {MAX_LOOKUP_ERRORS} TrueAchievements lookup errors "
+            "in a row; the next day's pass tries again", logging.WARNING)
+
+
 def _log_plan(run, res: LibraryResult, owned: int, titles: int, plan: LibraryPlan) -> None:
     """Counts and titles only: never a product ID, order, price or token."""
     adds = sum(a.kind == "add" for a in plan.actions)
     verb = "would" if res.dry_run else "to"
+    failed = len(plan.lookups) - res.pending  # games whose lookup failed in this pass: the next day's pass
     run.say(f"library: {'DRY RUN' if res.dry_run else 'APPLY'}; {owned} games owned on Microsoft, {titles} titles on "
             f"TrueAchievements; already right {plan.ok}; {verb} add {adds}; {verb} fix {len(plan.actions) - adds}; "
             f"check by hand {len(plan.review)}; looked up this run {res.looked_up}; waiting for a lookup "
-            f"{len(plan.lookups)}")
+            f"{res.pending}" + (f"; lookup failed today {failed}" if failed else ""))
     if res.dry_run:
         for a in plan.actions:
             run.say(f"library: would {a.kind} {a.title} ({', '.join(label for _, label in a.sets)})")

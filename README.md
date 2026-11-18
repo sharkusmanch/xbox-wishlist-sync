@@ -246,9 +246,14 @@ trailing tiers stripped; at most **6 candidates** per game; Windows too for a PC
 request, none past the 45-minute write deadline. Results are cached per game: 7 days, 30 days for a
 game with no page or a product already seen at go-live (a changed address set or override is looked
 up again). **No page** means HTTP 404 or TA's page-not-found page (marker `PageNotFound404`).
-Any other page that is not exactly one game's page (a challenge, maintenance or throttling page)
-is *unreachable*: the lookups stop quietly for the run, nothing is cached, so a throttled day never
-turns into a month of "no page".
+What every address would meet stops the lookups quietly for the run, nothing cached, so a throttled
+day never turns into months of "no page": network or Cloudflare trouble, TA unavailable or
+throttling (HTTP 429, 502-504 or Cloudflare's 52x, a page with no game id such as a maintenance
+page), a failed TA login. Anything else fails **that game's** lookup for the day's pass (another
+HTTP error at one address, a game page that doesn't parse, an unexpected exception): an issue naming
+the game and its product id (for a `library` override), and the next game goes on; the game is
+looked up again in the next day's pass. After **3 failed lookups in a row** the pass looks nothing
+more up until the next day's pass, so a TA-wide change is at most 3 issues a day.
 
 ### Writes
 

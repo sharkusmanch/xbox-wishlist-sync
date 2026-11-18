@@ -10,13 +10,17 @@ import stat
 from datetime import time as dtime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
+import pytest
+
 from test_run import NOW, FakeDeku, FakeTA, Harness, basic
 from wsync import xbox
 from wsync.deku import OwnedDetail
 from wsync.errors import TAError
+from wsync.flaresolverr import FlareSolverrError
 from wsync.run import Terminated
 from wsync.state import State, load_state, save_state
 from wsync.ta import ONE, SERIES, IncompleteRead, TAGame, Unreachable
+from wsync.ta import AuthError as TAAuthError
 from wsync.ta_coll import OwnedRow
 
 XUID = "2533270000004242"
@@ -492,13 +496,18 @@ def test_a_new_override_is_looked_up_although_the_game_has_a_cached_result(tmp_p
     assert "library: would add Example Finding Reforged (Owned, Digital)" in lines(caplog)
 
 
-def test_lookups_go_on_past_a_missing_page_and_stop_quietly_on_a_failure(tmp_path, caplog):
+@pytest.mark.parametrize("error", [
+    Unreachable("network error: ConnectionError"),
+    FlareSolverrError("FlareSolverr unreachable (URLError)"),
+    TAAuthError("TrueAchievements login failed (check the gamertag and password)"),
+], ids=["unreachable", "flaresolverr", "auth"])
+def test_lookups_go_on_past_a_missing_page_and_stop_quietly_when_every_request_would_fail(tmp_path, caplog, error):
     caplog.set_level(logging.INFO)
     h = library_only(tmp_path, dry=True)
     h.xbox.own(pid(1), "Example Finding")
     h.xbox.own(pid(2), "Example Seeking")
     h.ta.pages["Example-Finding-Xbox-Series-XS"] = page(901, "Example Finding", SERIES)
-    h.ta.fail_page["Example-Seeking-Xbox-One"] = TAError("GET /game/Example-Seeking-Xbox-One answered HTTP 503")
+    h.ta.fail_page["Example-Seeking-Xbox-One"] = error
     assert h.run() == 0 and not issue_notes(h)
     assert [c[1] for c in h.ta.calls if c[0] == "page"] == [
         "Example-Finding", "Example-Finding-Xbox-One", "Example-Finding-Xbox-Series-XS",  # two missing, one found
@@ -512,6 +521,84 @@ def test_lookups_go_on_past_a_missing_page_and_stop_quietly_on_a_failure(tmp_pat
     h.now = NOW + H
     assert h.run() == 0 and looked_up(h.ta.calls) == ["Example-Seeking"]
     assert library_state(h)["last_pass"] == "2026-11-01"
+
+
+def test_a_lookup_that_keeps_failing_on_one_game_never_holds_up_the_queue(tmp_path):
+    """The review's probe: a persistent HTTP 500 at Example Alpha's address."""
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Alpha")
+    h.xbox.own(pid(2), "Example Bravo")
+    h.ta.pages["Example-Bravo"] = page(902, "Example Bravo")
+    h.ta.fail_page["Example-Alpha"] = TAError("GET /game/Example-Alpha answered HTTP 500")
+    assert h.run() == 1
+    issue = h.last_issues()[0]
+    assert "Example Alpha" in issue and "HTTP 500" in issue
+    assert f'library override "skip" for product {pid(1)}' in issue  # the product id to put in an override
+    assert looked_up(h.ta.calls) == ["Example-Alpha", "Example-Bravo"]  # the queue moved on in the same run
+    assert written(h) == [902]
+    pages = library_state(h)["pages"]
+    assert pid(1) not in pages and pid(2) in pages  # nothing cached for the failed game
+    h.ta.calls.clear()
+    h.now = NOW + H
+    assert h.run() == 0  # not tried again this pass, and nothing else waits: the pass is complete
+    assert looked_up(h.ta.calls) == [] and library_state(h)["last_pass"] == "2026-11-01"
+    h.ta.calls.clear()
+    h.now = NOW + DAY  # the next day's pass tries it again
+    assert h.run() == 1 and looked_up(h.ta.calls) == ["Example-Alpha"]
+
+
+def test_any_exception_from_a_lookup_is_that_games_failure(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    h = library_only(tmp_path, dry=True)
+    h.xbox.own(pid(1), "Example Alpha")
+    h.xbox.own(pid(2), "Example Bravo")
+    h.ta.pages["Example-Bravo"] = page(902, "Example Bravo")
+    h.ta.fail_page["Example-Alpha"] = TypeError("unsupported operand type(s) (47.31)")
+    assert h.run() == 1
+    issue = h.last_issues()[0]
+    assert "Example Alpha" in issue and "TypeError" in issue and pid(1) in issue
+    assert "unsupported operand" not in caplog.text + issue  # the exception type only, never its message
+    assert looked_up(h.ta.calls) == ["Example-Alpha", "Example-Bravo"]
+    assert "Example Bravo" in tasks(h, "library-review:dry-run")[-1]
+    # nothing else waits for a lookup in this pass: the dry-run plan is complete and pinged
+    assert [t for t, _ in h.reporter.notes] == ["Library sync plan ready", "Wishlist sync failed"]
+
+
+def test_after_three_lookup_errors_in_a_row_the_passs_lookups_wait_for_the_next_day(tmp_path, caplog):
+    """A TA-wide parse change (every game page has two game ids): at most 3 issues a day, not one per game."""
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=True)
+    seeking = [f"Example-Seeking-{n:02d}" for n in range(1, 6)]
+    for n, slug in enumerate(seeking, 1):
+        h.xbox.own(pid(n), f"Example Seeking {n:02d}")
+        h.ta.fail_page[slug] = TAError(f"game page {slug!r} has 2 game ids")
+    assert h.run() == 1
+    assert len(h.last_issues()) == 3 and looked_up(h.ta.calls) == seeking[:3]  # the 4th isn't started
+    pings = len(h.reporter.notes)
+    for hour in (13, 14):
+        h.ta.calls.clear()
+        caplog.clear()
+        h.now = NOW.replace(hour=hour)
+        assert h.run() == 0 and looked_up(h.ta.calls) == []  # the pass goes on, its lookups don't: no new issue
+        assert any("lookups stopped for today's pass" in m for m in lines(caplog))
+    assert len(h.reporter.notes) == pings and "last_pass" not in library_state(h)
+    h.ta.fail_page.clear()  # TA works again
+    h.ta.calls.clear()
+    h.now = NOW + DAY  # the next day's pass looks them up again
+    assert h.run() == 0 and looked_up(h.ta.calls) == seeking
+    assert library_state(h)["last_pass"] == "2026-11-02"
+
+
+def test_a_successful_lookup_resets_the_lookup_error_streak(tmp_path):
+    h = library_only(tmp_path, dry=True)
+    seeking = [f"Example-Seeking-{n:02d}" for n in range(1, 6)]
+    for n, slug in enumerate(seeking, 1):
+        h.xbox.own(pid(n), f"Example Seeking {n:02d}")
+    for n in (1, 3, 4):  # three errors, never three in a row
+        h.ta.fail_page[seeking[n - 1]] = TAError(f"GET /game/{seeking[n - 1]} answered HTTP 500")
+    assert h.run() == 1 and len(h.last_issues()) == 3
+    assert looked_up(h.ta.calls) == seeking  # the lookups went on to the last one
+    assert library_state(h)["pass"]["lookup_errors"] == 0
 
 
 # --------------------------------------------------------------------------- write-ahead, write failures

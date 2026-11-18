@@ -1248,18 +1248,35 @@ def test_game_page_or_none_reads_a_game_page_and_says_none_where_there_is_none()
 
 
 def test_a_page_that_is_neither_a_game_nor_page_not_found_is_unreachable():
-    """A maintenance, throttle or changed page: never "no page", so nothing is cached from it."""
-    for body in ("<html><title>Down for maintenance | TrueAchievements</title></html>",
-                 COLL_GAME + '<div data-game="777"></div>'):  # two game ids
+    """A maintenance, throttle or challenge page (no game id at all): never "no page", so nothing is cached from it,
+    and every other address would meet it too."""
+    c, _ = logged_in({("GET", "/game/Example-Quest"): resp(
+        "<html><title>Down for maintenance | TrueAchievements</title></html>")})
+    with pytest.raises(ta.Unreachable, match="Example-Quest"):
+        c.game_page_or_none("Example-Quest")
+
+
+def test_a_game_page_that_does_not_parse_is_that_addresses_own_error():
+    """Game ids, but not one game's page (two ids, no title): a TA error of that page, never Unreachable."""
+    for body in (COLL_GAME + '<div data-game="777"></div>',  # two game ids
+                 '<html><body class="ta"><div data-game="777"></div></body></html>'):  # no title
         c, _ = logged_in({("GET", "/game/Example-Quest"): resp(body)})
-        with pytest.raises(ta.Unreachable, match="Example-Quest"):
+        with pytest.raises(TAError, match="Example-Quest") as e:
             c.game_page_or_none("Example-Quest")
+        assert not isinstance(e.value, ta.Unreachable)
 
 
 def test_game_page_or_none_raises_every_other_failure():
-    c, _ = logged_in({("GET", "/game/Example-Quest"): resp("Service Unavailable", status=503)})
-    with pytest.raises(TAError, match="503"):
+    """An HTTP error of one address is that address's TA error; TA unavailable or throttling (429, 502-504,
+    Cloudflare's 52x) or an unpassed challenge would meet every address: Unreachable."""
+    c, _ = logged_in({("GET", "/game/Example-Quest"): resp("Internal Server Error", status=500)})
+    with pytest.raises(TAError, match="500") as e:
         c.game_page_or_none("Example-Quest")
+    assert not isinstance(e.value, ta.Unreachable)
+    for status in (429, 502, 503, 504, 522):
+        c, _ = logged_in({("GET", "/game/Example-Quest"): resp("Service Unavailable", status=status)})
+        with pytest.raises(ta.Unreachable, match=str(status)):
+            c.game_page_or_none("Example-Quest")
     c, _ = logged_in({("GET", "/game/Example-Quest"): CHALLENGE})
     with pytest.raises(ta.Unreachable):
         c.game_page_or_none("Example-Quest")

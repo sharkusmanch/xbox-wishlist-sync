@@ -126,20 +126,20 @@ def _task(run, key: str, title: str, body: str | None) -> bool | None:
 def report_plan(run, res, lib: dict, plan, rows: list) -> None:
     lists = _lists(lib, plan, {r.ta_id: r for r in rows})
     if res.dry_run:
-        _dry(run, lib, plan, lists)
+        _dry(run, res, lib, plan, lists)
     else:
         _live(run, res, lib, lists)
 
 
-def _dry(run, lib: dict, plan, lists) -> None:
+def _dry(run, res, lib: dict, plan, lists) -> None:
     lib.pop("check_sig", None)
     _task(run, LIBRARY_CHECK_KEY, LIBRARY_CHECK_TITLE, None)
     body, counts = review_body(plan, lists=lists)
     sig = _signature(*lists)
     if _task(run, LIBRARY_REVIEW_KEY, LIBRARY_REVIEW_TITLE, body) is None:
         return
-    if plan.lookups:
-        return  # the pass is still growing the lists: one ping, when the plan is complete
+    if res.pending:
+        return  # the pass is still growing the lists: one ping, when the plan is complete (a failed lookup aside)
     if sig != lib.get("review_sig"):
         lib["review_sig"] = sig
         if counts["would_add"] or counts["would_fix"] or counts["check"]:
