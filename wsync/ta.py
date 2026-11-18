@@ -63,6 +63,15 @@ class AuthError(TAError):
     """Not logged in, and logging in again didn't help."""
 
 
+class NotFound(TAError):
+    """TrueAchievements answered HTTP 404: there is no page at that address."""
+
+
+class Unreachable(TAError):
+    """No answer from TrueAchievements itself: a network error, a Cloudflare challenge that a fresh clearance didn't
+    pass, or no usable clearance from FlareSolverr. A later run may get through."""
+
+
 class IncompleteRead(TAError):
     """The wishlist page couldn't be read completely; never treat it as the whole list."""
 
@@ -143,7 +152,7 @@ class CurlTransport:
             r = cr.request(method, url, data=body, headers=headers, impersonate="chrome",
                            timeout=HTTP_TIMEOUT, allow_redirects=False)
         except OSError as e:  # curl_cffi's errors are OSErrors
-            raise TAError(f"network error: {type(e).__name__}") from None
+            raise Unreachable(f"network error: {type(e).__name__}") from None
         return HttpResponse(r.status_code, r.text, tuple((k.lower(), v) for k, v in r.headers.multi_items()))
 
 
@@ -574,9 +583,9 @@ class TAClient:
         """A fresh cf_clearance and user agent from an anonymous FlareSolverr GET (no cookies, no body)."""
         s = self._fs.get(CLEARANCE_URL)
         if s.status >= 400:
-            raise TAError(f"FlareSolverr's clearance fetch answered HTTP {s.status}")
+            raise Unreachable(f"FlareSolverr's clearance fetch answered HTTP {s.status}")
         if not s.user_agent:
-            raise TAError("FlareSolverr returned no user agent")
+            raise Unreachable("FlareSolverr returned no user agent")
         self._clearance = (s.cookies.get("cf_clearance", ""), s.user_agent)
 
     def _headers(self, extra: dict[str, str] | None) -> dict[str, str]:
@@ -633,12 +642,14 @@ class TAClient:
             self._refresh_clearance()
             r, final = self._once(method, url, body, headers, follow)
             if challenged(r):
-                raise TAError(f"{self._label(method, url)} answered HTTP {r.status} "
-                              "(Cloudflare challenge, after a fresh clearance)")
+                raise Unreachable(f"{self._label(method, url)} answered HTTP {r.status} "
+                                  "(Cloudflare challenge, after a fresh clearance)")
         return r, final
 
     def _page(self, method: str, url: str, body: str | None = None, headers: dict[str, str] | None = None) -> Page:
         r, final = self._send(method, url, body, headers)
+        if r.status == 404:
+            raise NotFound(f"{self._label(method, url)} answered HTTP 404")
         if r.status >= 400:
             raise TAError(f"{self._label(method, url)} answered HTTP {r.status}")
         if r.status in _REDIRECTS:
@@ -783,6 +794,18 @@ class TAClient:
         p = self._get(BASE + "/game/" + quote(slug, safe=""), need_login=False)
         return parse_game(p.html, slug)
 
+    def game_page_or_none(self, slug: str) -> TAGame | None:
+        """The game page at /game/<slug>, or None when there is none there: HTTP 404, or a page that isn't one
+        game's page. Any other failure raises (Unreachable for the network or Cloudflare)."""
+        try:
+            p = self._get(BASE + "/game/" + quote(slug, safe=""), need_login=False)
+        except NotFound:
+            return None
+        try:
+            return parse_game(p.html, slug)
+        except TAError:
+            return None
+
     def dlc(self, game: int | str) -> list[tuple[str, int]]:
         """(title, DLC id) pairs from `/game/<slug>/dlc`; a game id is resolved to its slug first."""
         if isinstance(game, int) and not isinstance(game, bool):
@@ -822,11 +845,14 @@ class TAClient:
         """The logged-in game page, and whether the game is in the Game Collection."""
         return parse_collection_page(self._get(BASE + "/game/" + quote(slug, safe=""), need_login=True).html, slug)
 
-    def collection_add(self, slug: str) -> int:
-        """Add the game to the Game Collection with the page's own postback; returns its TA id."""
+    def collection_add(self, slug: str, *, game_id: int | None = None) -> int:
+        """Add the game to the Game Collection with the page's own postback; returns its TA id. With `game_id`,
+        the page must be that game's: anything else raises before a request is posted."""
         url = BASE + "/game/" + quote(slug, safe="")
         p = self._get(url, need_login=True)
         game, have = parse_collection_page(p.html, slug)
+        if game_id is not None and game.id != game_id:
+            raise TAError(f"collection add of {slug!r}: the page is game {game.id}, not {game_id}")
         if have:
             return game.id
         form = login_form(p.html, _POSTBACK_SKIP_TYPES)

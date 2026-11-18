@@ -1226,3 +1226,67 @@ def test_property_list_of_exactly_a_full_page_ends_by_its_own_pagination():
     })
     assert c.property_list("example-list") == list(range(1, 201))
     assert http.urls() == ["/example-list/games?page=1", "/example-list/games?page=2"]
+
+
+# ---------------------------------------------------------------- library step: page lookups and failure kinds
+
+
+def test_game_page_or_none_reads_a_game_page_and_says_none_where_there_is_none():
+    c, http = logged_in({("GET", "/game/Example-Quest"): resp(COLL_GAME),
+                         ("GET", "/game/Missing-Quest"): resp("<html>Page not found</html>", status=404),
+                         ("GET", "/game/Not-A-Game"): resp("<html><title>Home | TrueAchievements</title></html>")})
+    page = c.game_page_or_none("Example-Quest")
+    assert (page.id, page.title, page.slug) == (12345, "Example Quest", "Example-Quest")
+    assert c.game_page_or_none("Missing-Quest") is None  # HTTP 404
+    assert c.game_page_or_none("Not-A-Game") is None  # a page that isn't one game's page
+    assert http.urls() == ["/game/Example-Quest", "/game/Missing-Quest", "/game/Not-A-Game"]
+
+
+def test_game_page_or_none_raises_every_other_failure():
+    c, _ = logged_in({("GET", "/game/Example-Quest"): resp("Service Unavailable", status=503)})
+    with pytest.raises(TAError, match="503"):
+        c.game_page_or_none("Example-Quest")
+    c, _ = logged_in({("GET", "/game/Example-Quest"): CHALLENGE})
+    with pytest.raises(ta.Unreachable):
+        c.game_page_or_none("Example-Quest")
+
+
+def test_a_404_is_not_found_and_still_a_ta_error():
+    c, _ = logged_in({("GET", "/game/Missing-Quest"): resp("gone", status=404)})
+    with pytest.raises(ta.NotFound) as e:
+        c.game("Missing-Quest")
+    assert isinstance(e.value, TAError) and "HTTP 404" in str(e.value)
+
+
+def test_network_errors_and_unpassed_challenges_are_unreachable(monkeypatch):
+    import curl_cffi.requests as cr
+
+    def offline(method, url, **kw):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(cr, "request", offline)
+    with pytest.raises(ta.Unreachable, match="network error"):
+        ta.CurlTransport().request("GET", BASE + "/game/X", None, {})
+    c, _ = logged_in({("GET", "/game/X"): CHALLENGE})
+    with pytest.raises(ta.Unreachable, match="Cloudflare challenge"):
+        c.game("X")
+    c, _ = logged_in({("GET", "/game/X"): CHALLENGE}, fs=FakeFS([sol(user_agent="")]))
+    with pytest.raises(ta.Unreachable, match="no user agent"):
+        c.game("X")
+    c, _ = logged_in({("GET", "/game/X"): CHALLENGE}, fs=FakeFS([sol(status=502)]))
+    with pytest.raises(ta.Unreachable, match="HTTP 502"):
+        c.game("X")
+    # TA's own answers stay plain TA errors
+    c, _ = logged_in({("GET", "/game/X"): resp("boom", status=500)})
+    with pytest.raises(TAError) as e:
+        c.game("X")
+    assert not isinstance(e.value, ta.Unreachable)
+
+
+def test_collection_add_with_a_game_id_refuses_another_games_page():
+    c, http = logged_in({("GET", EXAMPLE): resp(COLL_GAME), ("POST", EXAMPLE): resp(COLL_GAME_IN)})
+    with pytest.raises(TAError, match="12345, not 777"):
+        c.collection_add("Example-Quest", game_id=777)
+    assert http.urls("POST") == []  # nothing was posted
+    assert c.collection_add("Example-Quest", game_id=12345) == 12345
+    assert len(http.urls("POST")) == 1
