@@ -153,8 +153,10 @@ def _live(run, res, lib: dict, plan) -> None:
                    + "\n".join(f"- {t}" for t in sorted(res.written)))
 
 
-def signin_failed(run, *, new: bool) -> None:
-    """The sign-in failed this run: the task (each failing run, unchanged text is no change), one ping per episode."""
+def signin_failed(run, lib: dict, *, new: bool) -> None:
+    """The sign-in failed this run: the task (each failing run, unchanged text is no change), one ping per episode.
+    `lib["signin_task"]` records that the task may be open, until a close succeeds."""
+    lib["signin_task"] = True
     _task(run, LIBRARY_SIGNIN_KEY, LIBRARY_SIGNIN_TITLE, SIGNIN_BODY)
     if new:
         run.notify("Library sync: Microsoft sign-in needed",
@@ -162,5 +164,7 @@ def signin_failed(run, *, new: bool) -> None:
                    "for the fix.")
 
 
-def signin_ok(run) -> None:
-    _task(run, LIBRARY_SIGNIN_KEY, LIBRARY_SIGNIN_TITLE, None)
+def signin_ok(run, lib: dict) -> None:
+    """A working sign-in: close the sign-in task if it may be open; a failed close is retried next run."""
+    if lib.get("signin_task") and _task(run, LIBRARY_SIGNIN_KEY, LIBRARY_SIGNIN_TITLE, None) is not None:
+        lib.pop("signin_task", None)

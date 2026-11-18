@@ -1076,3 +1076,32 @@ def test_a_failing_reporter_is_an_issue_and_never_breaks_the_step(tmp_path):
     assert library_state(h)["last_pass"] == "2026-11-01"
     assert [t for t, _ in h.reporter.notes] == ["Wishlist sync failed"]
     assert "Vikunja library task" in h.reporter.notes[0][1] and "RuntimeError" in h.reporter.notes[0][1]
+
+
+def test_a_failed_close_of_the_sign_in_task_is_retried_until_it_works(tmp_path):
+    h = library_only(tmp_path)
+    h.xbox.reject = True
+    h.now = NOW.replace(hour=12, minute=7)
+    h.run()
+    assert library_state(h)["signin_task"] is True
+    h.xbox.reject = False
+    real, calls = h.reporter.library_task, []
+
+    def down(key, title, body):
+        calls.append(body)
+        raise RuntimeError("vikunja down")
+    h.reporter.library_task = down
+    h.now = NOW.replace(hour=12, minute=7) + DAY
+    assert h.run() == 1  # an issue for the failed close, like other reporting failures
+    assert calls[:1] == [None] and library_state(h)["signin_task"] is True
+    assert "signin_failed" not in library_state(h)
+    h.reporter.library_task = real
+    h.now = NOW.replace(hour=12, minute=7) + 2 * DAY
+    h.run()
+    assert tasks(h, "library-signin")[-1] is None and "signin_task" not in library_state(h)
+
+
+def test_a_working_sign_in_without_the_flag_makes_no_close_call(tmp_path):
+    h = library_only(tmp_path)
+    assert h.run() == 0
+    assert tasks(h, "library-signin") == []

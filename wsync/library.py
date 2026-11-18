@@ -522,18 +522,17 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
         res.stopped = "Microsoft sign-in needed"
         run.say("library: Microsoft sign-in needed (it failed earlier today); next try at tomorrow's pass, or at the "
                 "next run once XBOX_REFRESH_TOKEN changes", logging.WARNING)
-        library_report.signin_failed(run, new=False)
+        library_report.signin_failed(run, lib, new=False)
         return res
     try:
         games = _owned(run, http, lib)
-        if had_signin:
-            library_report.signin_ok(run)
+        library_report.signin_ok(run, lib)
         gwg, ea_play = _lists(run, ta, lib, now)
         rows = _pass_rows(run, ta, lib, today)
     except SignInNeeded as e:
         lib["signin_failed"] = {**signin, "day": today, "seed": seed}
         res.stopped = "Microsoft sign-in needed"
-        library_report.signin_failed(run, new=not had_signin)
+        library_report.signin_failed(run, lib, new=not had_signin)
         run.say(f"library: {e}; next try at tomorrow's pass, or at the next run once XBOX_REFRESH_TOKEN changes",
                 logging.WARNING)
         return res
