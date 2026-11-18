@@ -240,3 +240,45 @@ def test_catalog_reads_the_console_generation():
     assert products["9EXAMPLE0002"].gen == ()  # null: a PC-only app
     assert products["9EXAMPLE0004"].gen == ()
     assert "9EXAMPLE0005" not in products  # not returned by the catalog: absent, not a failure
+
+
+def test_a_page_without_an_items_list_is_a_failed_read_not_the_end():
+    """A truncated Collections read would make modern purchases look orders-only (the only way to a 360 write)."""
+    for page in ({}, {"items": None}, {"continuationToken": "N2"}):
+        http = Pages((200, {"items": [{"productId": "A"}], "continuationToken": "N"}), (200, page))
+        with pytest.raises(XboxError, match="Collections query failed"):
+            xbox.fetch_collections(http, SESSION)
+        http = Pages((200, {"items": [{"orderId": "1"}], "@nextLink": "https://purchase.example/page2"}), (200, page))
+        with pytest.raises(XboxError, match="orders query failed"):
+            xbox.fetch_orders(http, SESSION)
+
+
+class _Answer:
+    def __init__(self, status, raw):
+        self.status, self._raw = status, raw
+
+    def read(self):
+        return self._raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def transport(status, raw):
+    """The real transport with its opener answering `raw` (no network)."""
+    t = xbox.UrllibHttp()
+    t._opener = type("Opener", (), {"open": lambda self, req, timeout=None: _Answer(status, raw)})()
+    return t
+
+
+def test_the_transport_refuses_a_success_whose_body_is_not_a_json_object():
+    for raw in (b"<html>Down for maintenance</html>", b"", b"[1, 2]", b'"text"'):
+        with pytest.raises(XboxError, match="unexpected response") as e:
+            transport(200, raw).request("GET", xbox.ORDERS_URL + "?t=SECRET")
+        assert "SECRET" not in str(e.value) and "purchase" not in str(e.value)  # no URL in the message
+    assert transport(200, b'{"items": []}').request("GET", xbox.ORDERS_URL) == (200, {"items": []})
+    # an error status keeps its body out: the caller's message names the status
+    assert transport(502, b"<html>Bad gateway</html>").request("GET", xbox.ORDERS_URL) == (502, {})

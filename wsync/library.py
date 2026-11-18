@@ -632,13 +632,13 @@ def _end(run, res: LibraryResult, lib: dict, today: str) -> LibraryResult:
 
 
 def _owned(run, http, lib: dict) -> list[OwnedGame]:
-    """Microsoft sign-in, licences, orders and the Store catalog -> the owned games. Every token and the XUID go to
-    the scrubber the moment they exist; a working sign-in clears a recorded failed one. SignInNeeded passes
+    """Microsoft sign-in, licences, orders and the Store catalog -> the owned games. Every token, the XUID and the
+    gamertag go to the scrubber the moment they exist; a working sign-in clears a recorded failed one. SignInNeeded passes
     through; any other failure is a _ReadFailed: nothing is planned from a partial read. Data that can't be
     classified is one too, named by its exception type only: the message could quote a price or an order."""
     try:
         s = open_session(http, TokenStore(run.cfg.xbox_token, run.cfg.xbox_refresh_token), run.scrub.add)
-        run.scrub.add(s.xuid)
+        run.scrub.add(s.xuid, s.gamertag)
         lib.pop("signin_failed", None)
         library_report.signin_ok(run, lib)  # the sign-in works: its task closes now, not after the reads
         items = fetch_collections(http, s)
@@ -891,8 +891,10 @@ class _Writer:
       got to. A `library` override that skips its game drops it, as does one that names another page while nothing
       of it reached TA.
     - Compare-and-set: a field already right isn't posted, and an entry changed on TA since the read (ChangedOnTA)
-      is left as it is (a warning). An add whose game TA already lists is never written either (a warning): the
-      plan was made without that entry, so its ownership may be one only a paid order may change.
+      is left as it is (a warning). A new add whose game TA already lists is never written either (a warning): the
+      plan was made without that entry, so its ownership may be one only a paid order may change. An unfinished add
+      that finds its game listed (its post reached TA before it was recorded) goes on to its field sets, which
+      compare against TA's defaults for a new entry.
     - Any failure of one game's write but Cloudflare or network trouble is that game's write error: an issue naming
       the game and its product ids (for a `skip` override), and the exception type only unless it is a TA error.
       Other writes go on, until MAX_WRITE_ERRORS errors come without a successful write between them (counted in
@@ -1007,7 +1009,9 @@ class _Writer:
             expect = entry.get("expect") or {}
             if entry["kind"] == "add" and not entry.get("added"):
                 run.sleep(PACE)
-                self.ta.collection_add(entry["slug"], game_id=game_id, new=True)
+                # a fresh add refuses a game TA already lists (AlreadyListed); an unfinished one may have reached TA
+                # before it was recorded (a stop during its post): found listed, it goes on to its field sets
+                self.ta.collection_add(entry["slug"], game_id=game_id, new=ahead)
                 entry["added"] = True
                 if not self._save(entry):
                     return False

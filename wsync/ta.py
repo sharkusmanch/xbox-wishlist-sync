@@ -56,7 +56,6 @@ _ALREADY_LISTED = "already on your wishlist"
 _SKIP_INPUT_TYPES = {"checkbox", "radio", "password"}
 _POSTBACK_SKIP_TYPES = _SKIP_INPUT_TYPES | {"submit", "button", "image"}
 COLLECTION_FIELDS = {"ownership": "ddlOwnershipStatusID", "media": "ddlGameMediaID"}
-LIST_PAGE_ROWS = 100  # rows on a full /<slug>/games page
 
 
 class AuthError(TAError):
@@ -922,8 +921,9 @@ class TAClient:
             return game.id
         form = login_form(p.html, _POSTBACK_SKIP_TYPES)
         form.update({"Command": "btnGC_Add", "Argument": str(game.id)})
-        r, _ = self._send("POST", url, urlencode(form), {
-            "Content-Type": "application/x-www-form-urlencoded", "Origin": BASE, "Referer": url,
+        # the postback goes back to the page that was read: its final address, after TA's redirects
+        r, _ = self._send("POST", p.url, urlencode(form), {
+            "Content-Type": "application/x-www-form-urlencoded", "Origin": BASE, "Referer": p.url,
         }, follow=False)
         if r.status >= 300:
             raise TAError(f"collection add of {slug!r} answered HTTP {r.status}")

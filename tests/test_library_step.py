@@ -24,6 +24,7 @@ from wsync.ta import AuthError as TAAuthError
 from wsync.ta_coll import OwnedRow
 
 XUID = "2533270000004242"
+GAMERTAG = "Example Gamer"  # the Microsoft account's, from the XSTS claims
 SEED = "rt-seed-Ab12"
 PRICE = 47.31
 SX = "xbox-series-x-s"
@@ -78,7 +79,7 @@ class FakeXbox:
         if url == xbox.XSTS_URL:
             token = "xsts-live-tok-Hj" if json_body["RelyingParty"] == xbox.RP_LIVE else "xsts-store-tok-Pm"
             return 200, {"Token": token, "DisplayClaims": {"xui": [{"uhs": "uhs-77", "xid": XUID,
-                                                                    "gtg": "Example Gamer"}]}}
+                                                                    "gtg": GAMERTAG}]}}
         if url == xbox.COLLECTIONS_URL:
             return 200, {"items": list(self.licences)}
         if url.startswith(xbox.ORDERS_URL):
@@ -315,6 +316,23 @@ def test_a_failed_orders_page_writes_nothing_and_backs_off_6h(tmp_path, caplog):
     assert any("?page=2" in url for _, url in h.xbox.calls[microsoft:])  # the orders are read again
     assert len(written(h)) == 12
     assert "failed" not in library_state(h) and library_state(h)["last_pass"] == "2026-11-01"
+
+
+def test_a_collections_page_without_its_items_writes_nothing(tmp_path):
+    """A 200 Collections page with no items list (or a body that wasn't JSON) is a failed read, not the end of the
+    licences: read as the end, every purchase would look orders-only."""
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Mending 01")
+    h.ta.owned_rows = [wrong(501, "Example Mending 01")]
+    real = h.xbox.request
+
+    def truncated(method, url, **kw):
+        status, body = real(method, url, **kw)
+        return (status, {}) if url == xbox.COLLECTIONS_URL else (status, body)
+
+    h.xbox.request = truncated
+    assert h.run() == 1 and h.ta.writes == [] and h.ta.calls == []
+    assert "Microsoft read failed" in h.last_issues()[0] and "Collections query failed" in h.last_issues()[0]
 
 
 def test_an_incomplete_ta_read_writes_nothing(tmp_path):
@@ -702,6 +720,29 @@ def test_an_add_interrupted_before_its_field_sets_is_completed_next_run(tmp_path
     assert_paced(h.ta.calls)
 
 
+def test_an_add_interrupted_during_its_post_has_its_fields_set_next_run(tmp_path):
+    """SIGTERM while the add's postback is answered: TA added the game, but "added" never reached the state. The
+    next run completes the add: the game is found listed (no second add) and its fields are set, compare-and-set."""
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Finding")
+    h.ta.pages["Example-Finding"] = page(901, "Example Finding")
+    real_add = h.ta.collection_add
+
+    def add_then_sigterm(slug, **kw):
+        real_add(slug, **kw)  # TA added it ...
+        raise Terminated()  # ... and the job was stopped before the answer was recorded
+
+    h.ta.collection_add = add_then_sigterm
+    assert h.run() == 1
+    entry = library_state(h)["writing"]["901"]
+    assert entry["kind"] == "add" and not entry.get("added")
+    del h.ta.collection_add  # the client's own method again
+    h.now = NOW + H
+    assert h.run() == 0
+    assert h.ta.writes == [("gc-add", "Example-Finding"), ("gc-set", 901, "media", "Digital")]
+    assert library_state(h)["writing"] == {} and library_state(h)["last_pass"] == "2026-11-01"
+
+
 def test_a_write_that_keeps_failing_never_holds_up_the_step(tmp_path):
     """The review's probe: a permanent TA error on 501's write."""
     h = library_only(tmp_path, dry=False)
@@ -1009,7 +1050,7 @@ def test_tokens_xuid_prices_and_order_ids_never_reach_the_logs(tmp_path, caplog)
     assert h.run() == 0  # a whole dry-run pass
     # the next day's run meets the seed (configured), the PVC token, its rotation and the Xbox tokens and XUID
     met = [SEED, "rt-rotated-1-Zp", "rt-rotated-2-Zp", "access-tok-2-Qx", "user-tok-Wk3", "xsts-live-tok-Hj",
-           "xsts-store-tok-Pm", XUID]
+           "xsts-store-tok-Pm", XUID, GAMERTAG]
     h.ta.fail_collection = TAError("boom " + " ".join(met))  # a failure quoting every secret that run met
     h.now += DAY
     assert h.run() == 1

@@ -231,7 +231,8 @@ def _keys(title):
     for ch in "®™©":  # before NFKD, which would turn ™ into "tm"
         t = t.replace(ch, "")
     t = _fold(t)
-    t = PLATFORM_SUFFIX.sub("", BARE_PLATFORM.sub("", PLATFORM_TAG.sub(" ", t).strip()))
+    # " - Xbox One" leaves " -" behind: dropped too, or it would block the tier and separator rules below
+    t = PLATFORM_SUFFIX.sub("", BARE_PLATFORM.sub("", PLATFORM_TAG.sub(" ", t).strip())).rstrip(" -–—:")
     b = TRAILING_TAG.sub("", EPISODE.sub("", t))
     seps = list(SEP.finditer(b))
     if seps:

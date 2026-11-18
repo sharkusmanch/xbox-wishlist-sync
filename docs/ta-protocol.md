@@ -192,7 +192,8 @@ Used by the library step (`TAClient.collection_page`, `collection_add`, `collect
 
 - **Add.** The logged-in game page carries `Postback('btnGC_Add','<id>')` or `btnGC_Remove` (in the
   collection already). Adding posts the page's own form with `Command=btnGC_Add` and
-  `Argument=<game id>`; success is a page containing `Postback('btnGC_Remove','<id>')` afterwards,
+  `Argument=<game id>` back to the page's final address (after TA's redirects, e.g. a renamed slug);
+  success is a page containing `Postback('btnGC_Remove','<id>')` afterwards,
   checked. Both the button's id and, when given, the expected id are checked before posting. A game
   already in the collection is not posted; a *new* add of one raises `AlreadyListed`.
 - **EditOptions.** `GameCollection_EditOptions` (the same AJAX endpoint family as the wishlist

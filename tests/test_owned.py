@@ -145,6 +145,13 @@ def test_a_bare_trailing_platform_phrase_is_stripped():
     assert same_game("Example for Windows 10", "Example")
 
 
+def test_a_separator_left_by_a_platform_phrase_does_not_block_the_tier():
+    assert game_key("Example Quest Premium Edition - Xbox One") == "example quest"
+    assert same_game("Example Quest Premium Edition - Xbox One", "Example Quest")
+    assert same_game("Example Quest Deluxe Edition: Xbox Series X|S", "Example Quest")
+    assert same_game("Example Quest - Xbox One", "Example Quest")
+
+
 def test_a_platform_in_the_middle_or_alone_is_not_mangled():
     assert game_key("Xbox One Racer 2") == "xbox one racer ii"
     assert game_key("Xbox One") == "xbox one"

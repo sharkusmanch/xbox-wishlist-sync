@@ -65,7 +65,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class UrllibHttp:
-    """HTTPS transport that never follows redirects and returns (status, parsed JSON or {})."""
+    """HTTPS transport that never follows redirects and returns (status, the JSON object answered). A success (2xx)
+    whose body isn't a JSON object is an XboxError: every endpoint here answers JSON, so anything else (a
+    maintenance page, a truncated body) must never read as an answer without data. An error status's body is {}
+    when it isn't a JSON object: the caller names the status."""
 
     def __init__(self):
         self._opener = urllib.request.build_opener(_NoRedirect)
@@ -91,10 +94,14 @@ class UrllibHttp:
         except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
             raise XboxError(f"network error: {type(e).__name__}") from None
         try:
-            body = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+            body = json.loads(raw.decode("utf-8", "replace")) if raw else None
         except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            if 200 <= status < 300:
+                raise XboxError(f"unexpected response: HTTP {status} without a JSON object")
             body = {}
-        return status, body if isinstance(body, dict) else {}
+        return status, body
 
 
 def xbl3(uhs: str, token: str) -> str:
@@ -246,14 +253,13 @@ CATALOG_BATCH = 20
 
 
 def _page_items(status: int, body: dict, what: str) -> list:
-    """The `items` of a page; any non-200 or malformed page is a failed read (no URL in the message)."""
+    """The `items` of a page; any non-200 page, or one without an items list, is a failed read (no URL in the
+    message): a page read as empty would end the paging with part of the data."""
     if status != 200:
         raise XboxError(f"{what} failed: HTTP {status}")
     items = body.get("items")
-    if items is None:
-        return []
     if not isinstance(items, list):
-        raise XboxError(f"{what} failed: unexpected response")
+        raise XboxError(f"{what} failed: unexpected response (no items list)")
     return items
 
 

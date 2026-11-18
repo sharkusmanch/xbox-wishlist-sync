@@ -1109,6 +1109,14 @@ def test_collection_add_posts_the_pages_own_postback_and_checks_the_remove_butto
         c.collection_add("Example-Quest")
 
 
+def test_collection_add_posts_to_the_page_it_read_after_its_redirects():
+    c, http = logged_in({("GET", "/game/Old-Quest"): resp("", status=301, location="/game/Example-Quest"),
+                         ("GET", EXAMPLE): resp(COLL_GAME), ("POST", EXAMPLE): resp(COLL_GAME_IN)})
+    assert c.collection_add("Old-Quest") == 12345
+    post = next(x for x in http.calls if x["method"] == "POST")
+    assert post["url"] == BASE + EXAMPLE and post["headers"]["Referer"] == BASE + EXAMPLE
+
+
 def test_collection_add_of_a_game_already_listed_posts_nothing():
     c, http = logged_in({("GET", EXAMPLE): resp(COLL_GAME_IN)})
     assert c.collection_add("Example-Quest") == 12345
