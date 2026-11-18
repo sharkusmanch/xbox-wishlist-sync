@@ -37,6 +37,7 @@ a media change on an entry that has media.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import asdict, dataclass, field
@@ -479,22 +480,24 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
     TAClient, `http` the Microsoft transport, `overrides` the `library` section.
 
     Once a day, at the first run past `cfg.library_after` (UTC), a pass: sign in; read the licences, orders and
-    catalog; TA's subscription lists (weekly) and a fresh TA collection; plan; look up pages; plan again; write
-    (live). A pass that doesn't finish (lookups or writes left, a stop) goes on at the next run. A failed
-    Microsoft or TA read is an issue, repeated without a new read for 6 h; a Microsoft sign-in that needs a new
-    token stops the step quietly for this run. TA write errors are issues; Cloudflare or network trouble and the
-    write deadline stop the step quietly. Exceptions other than these propagate.
+    catalog; TA's subscription lists (weekly) and the TA collection; plan; look up pages; plan again; write
+    (live). A pass that doesn't finish (lookups or writes left, a stop) goes on at the next run, with the TA
+    collection its first run read and without the writes it has made. A failed Microsoft or TA read is an issue,
+    repeated without a new read for 6 h. A Microsoft sign-in that needs a new token is not an issue: it isn't
+    tried again before the next day's pass unless XBOX_REFRESH_TOKEN changes. TA write errors are issues;
+    Cloudflare or network trouble and the write deadline stop the step quietly. Other exceptions propagate.
     """
     if now.tzinfo is None:
         raise ValueError("run_library_step needs a timezone-aware `now`")
     lib = state.library
     res = LibraryResult(dry_run=run.library_dry)
     utc = now.astimezone(timezone.utc)
+    today = utc.date().isoformat()
     after = run.cfg.library_after
     if utc < utc.replace(hour=after.hour, minute=after.minute, second=0, microsecond=0):
         run.say(f"library: the daily pass starts after {after:%H:%M} UTC; not due yet")
         return res
-    if lib.get("last_pass") == utc.date().isoformat():
+    if lib.get("last_pass") == today:
         run.say(f"library: today's pass is complete; the next starts after {after:%H:%M} UTC tomorrow")
         return res
     res.due = True
@@ -509,14 +512,23 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
         if res.dry_run:
             run.say(f"library: {len(lib['writing'])} unfinished TA writes wait for a live run")
         elif not writer.leftovers():
-            return _end(run, res, lib, utc)
-    try:
-        games = _owned(run, http)
-        gwg, ea_play = _lists(run, ta, lib, now)
-        rows = _ta_rows(run, ta)
-    except SignInNeeded as e:
+            return _end(run, res, lib, today)
+    seed = hashlib.sha256(run.cfg.xbox_refresh_token.encode()).hexdigest()  # never the value itself
+    signin = lib.get("signin_failed") if isinstance(lib.get("signin_failed"), dict) else {}
+    if signin.get("day") == today and signin.get("seed") == seed:
         res.stopped = "Microsoft sign-in needed"
-        run.say(f"library: {e}; step stopped for this run", logging.WARNING)
+        run.say("library: Microsoft sign-in needed (it failed earlier today); next try at tomorrow's pass, or at the "
+                "next run once XBOX_REFRESH_TOKEN changes", logging.WARNING)
+        return res
+    try:
+        games = _owned(run, http, lib)
+        gwg, ea_play = _lists(run, ta, lib, now)
+        rows, writer.fresh = _pass_rows(run, ta, lib, today)
+    except SignInNeeded as e:
+        lib["signin_failed"] = {**signin, "day": today, "seed": seed}
+        res.stopped = "Microsoft sign-in needed"
+        run.say(f"library: {e}; next try at tomorrow's pass, or at the next run once XBOX_REFRESH_TOKEN changes",
+                logging.WARNING)
         return res
     except _ReadFailed as e:
         text = run.scrub(str(e))
@@ -525,14 +537,17 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
         run.issue(text)
         return res
     lib.pop("failed", None)
-    plan = plan_library(games, rows, _cached_pages(lib, games, overrides, now), overrides, gwg, ea_play)
+    done = set(lib["pass"].get("done") or ())
+    plan = _without(done, plan_library(games, rows, _cached_pages(lib, games, overrides, now), overrides, gwg,
+                                       ea_play))
     _look_up(run, ta, lib, plan, overrides, now, res)
-    plan = plan_library(games, rows, _cached_pages(lib, games, overrides, now), overrides, gwg, ea_play)
+    plan = _without(done, plan_library(games, rows, _cached_pages(lib, games, overrides, now), overrides, gwg,
+                                       ea_play))
     res.plan, res.pending = plan, len(plan.lookups)
     _log_plan(run, res, len(games), len(rows), plan)
     if not res.dry_run:
         writer.write_all(plan.actions)
-    return _end(run, res, lib, utc)
+    return _end(run, res, lib, today)
 
 
 def _backing_off(run, lib: dict, now: datetime, res: LibraryResult) -> bool:
@@ -547,11 +562,13 @@ def _backing_off(run, lib: dict, now: datetime, res: LibraryResult) -> bool:
     return True
 
 
-def _end(run, res: LibraryResult, lib: dict, utc: datetime) -> LibraryResult:
-    """The run's summary; the day's pass is complete when nothing stopped it and no lookup or write is left."""
+def _end(run, res: LibraryResult, lib: dict, today: str) -> LibraryResult:
+    """The run's summary; the day's pass is complete when nothing stopped it and no lookup or write is left. Its
+    stored TA collection read goes with it."""
     res.complete = res.stopped is None and not res.pending and not res.left
     if res.complete:
-        lib["last_pass"] = utc.date().isoformat()
+        lib["last_pass"] = today
+        lib.pop("pass", None)
     run.say(f"library: this run: looked up {res.looked_up}, written {len(res.written)}"
             + (f", {res.left} writes left" if res.left else "")
             + (f", {res.pending} games waiting for a lookup" if res.pending else "")
@@ -560,13 +577,14 @@ def _end(run, res: LibraryResult, lib: dict, utc: datetime) -> LibraryResult:
     return res
 
 
-def _owned(run, http) -> list[OwnedGame]:
+def _owned(run, http, lib: dict) -> list[OwnedGame]:
     """Microsoft sign-in, licences, orders and the Store catalog -> the owned games. Every token and the XUID go to
-    the scrubber the moment they exist. SignInNeeded passes through; any other failure is a _ReadFailed: nothing
-    is planned from a partial read."""
+    the scrubber the moment they exist; a working sign-in clears a recorded failed one. SignInNeeded passes
+    through; any other failure is a _ReadFailed: nothing is planned from a partial read."""
     try:
         s = open_session(http, TokenStore(run.cfg.xbox_token, run.cfg.xbox_refresh_token), run.scrub.add)
         run.scrub.add(s.xuid)
+        lib.pop("signin_failed", None)
         items = fetch_collections(http, s)
         orders = fetch_orders(http, s)
         pids = [i.get("productId") for i in items if i.get("productId")]
@@ -613,17 +631,39 @@ def _lists(run, ta, lib: dict, now: datetime) -> tuple[set[int], set[int]]:
     return out[0], out[1]
 
 
-def _ta_rows(run, ta) -> list[OwnedRow]:
-    """A fresh read of the TA collection (never the Deku collection step's cache): any failure, an incomplete read
-    included, is a _ReadFailed, so nothing is planned or written from it."""
+def _pass_rows(run, ta, lib: dict, today: str) -> tuple[list[OwnedRow], bool]:
+    """(the TA collection, read this run). A day's pass reads it once, in its first run, never from the Deku
+    collection step's cache, and keeps it in state.library["pass"] = {"day", "rows", "done"}, where "done" lists
+    the TA ids the pass has written since; its later runs reuse it. A new day's pass reads it again. Any failed
+    read, an incomplete one included, is a _ReadFailed, so nothing is planned or written from it."""
+    stored = lib.get("pass")
+    if isinstance(stored, dict) and stored.get("day") == today:
+        try:
+            rows = [OwnedRow(**r) for r in stored["rows"]]
+        except (KeyError, TypeError):
+            rows = None  # unreadable: read again
+        if rows is not None:
+            run.say(f"library: the TrueAchievements collection as this pass read it ({len(rows)} titles)")
+            return rows, False
     try:
         run.sleep(PACE)
         rows = ta.collection()
     except TAError as e:
         raise _ReadFailed(f"library step: TrueAchievements collection read failed, no library writes this run: "
                           f"{_err(e)}; retried after 6 h") from None
+    lib["pass"] = {"day": today, "rows": [asdict(r) for r in rows], "done": []}
     run.say(f"library: read the TrueAchievements collection ({len(rows)} titles)")
-    return rows
+    return rows, True
+
+
+def _without(done: set[int], plan: LibraryPlan) -> LibraryPlan:
+    """The plan without the writes the pass has made since it read the TA collection: a game whose every write is
+    done counts as already right."""
+    if done:
+        kept = [a for a in plan.actions if a.ta_id not in done]
+        plan.ok += len({a.game for a in plan.actions} - {a.game for a in kept})
+        plan.actions = kept
+    return plan
 
 
 def _cached_pages(lib: dict, games: list[OwnedGame], overrides: dict[str, dict],
@@ -705,15 +745,27 @@ class _Writer:
     """Live TA writes: at most cfg.library_budget games a run, PACE seconds before each request, none started past
     the write deadline. Write-ahead: a write goes into state.library["writing"], saved, before its first request,
     and leaves it after its last; one a crash left there is completed first on the next run (adding a game the
-    collection already lists posts nothing). A planned add whose game TA already lists is never written: the plan
-    was made without that entry, so its ownership may be one only a paid order may change."""
+    collection already lists posts nothing). Every write made, and every add found already made, goes into the
+    pass's "done", so the pass never plans it again. A planned add whose game TA already lists is never written:
+    the plan was made without that entry, so its ownership may be one only a paid order may change. That's an
+    issue when the collection was read this run; with the pass's stored read, TA listed it since (its own import),
+    so it is left for the next day's read."""
 
     def __init__(self, run, ta, lib: dict, overrides: dict[str, dict], now: datetime, res: LibraryResult):
         self.run, self.ta, self.lib, self.overrides, self.now, self.res = run, ta, lib, overrides, now, res
+        self.fresh = True  # the TA collection the plan was made from was read this run
 
     @property
     def writing(self) -> dict:
         return self.lib.setdefault("writing", {})
+
+    def _done(self, game_id: int) -> None:
+        """The pass never plans this TA game again (the stored collection read predates the write)."""
+        stored = self.lib.get("pass")
+        if isinstance(stored, dict) and stored.get("day") == self.now.astimezone(timezone.utc).date().isoformat():
+            done = stored.setdefault("done", [])
+            if game_id not in done:
+                done.append(game_id)
 
     def leftovers(self) -> bool:
         """Complete the writes an earlier run left unfinished; False when one couldn't be (the step stops). A game a
@@ -765,7 +817,12 @@ class _Writer:
                 run.sleep(PACE)
                 self.ta.collection_set(game_id, field_name, label)
         except AlreadyListed:
-            self.writing.pop(key, None)  # nothing written: the next pass plans it from a fresh collection read
+            self.writing.pop(key, None)  # nothing written: the next day's pass plans it from a fresh read
+            self._done(game_id)
+            if not self.fresh:
+                run.say(f"library: TrueAchievements has listed {entry['title']} since this pass read the collection: "
+                        "left as it is until the next day's pass", logging.WARNING)
+                return True
             res.stopped = "TrueAchievements collection read out of date"
             run.issue(f"library step: TrueAchievements already has {entry['title']} in the collection, though the "
                       "collection read didn't list it: left as it is, library writes stopped")
@@ -780,6 +837,7 @@ class _Writer:
                           "writes stopped, retried next run (a library override \"skip\" on its product drops it)")
             return False
         self.writing.pop(key, None)
+        self._done(game_id)
         res.written.append(entry["title"])
         run.say(f"library: {'added' if entry['kind'] == 'add' else 'fixed'} {entry['title']} "
                 f"({', '.join(label for _, label in entry['sets'])})")

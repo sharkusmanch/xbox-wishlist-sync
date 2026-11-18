@@ -41,6 +41,10 @@ class State:
     # Library step (Microsoft -> TA, see wsync.library):
     #   "last_pass": "YYYY-MM-DD"  the UTC day of the last complete daily pass;
     #   "failed": {"at": iso, "issue": str}  a failed Microsoft or TA read: repeated, without a read, for 6 h;
+    #   "signin_failed": {"day": "YYYY-MM-DD", "seed": SHA-256 of XBOX_REFRESH_TOKEN}  a sign-in that needed a new
+    #              token: not tried again that day with the same seed; removed by a working sign-in;
+    #   "pass": {"day": "YYYY-MM-DD", "rows": [OwnedRow as dict], "done": [TA game id]}  the TA collection the
+    #              day's pass read in its first run, and the TA ids it has written since; dropped when it completes;
     #   "lists": {"games-with-gold" | "ea-play": {"fetched": iso, "ids": [TA game id], "tried": iso}};
     #   "pages": {lookup key: {"checked": iso, "slugs": [addresses tried], "pages": [TAGame as dict]}};
     #   "writing": {TA game id: {"kind", "slug", "ta_id", "sets", "title", "pids", "since"}}  write-ahead:

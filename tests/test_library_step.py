@@ -2,6 +2,7 @@
 with fakes: a FakeXbox for Microsoft's endpoints and test_run's FakeTA. Every title, product ID, XUID and token
 here is fictional."""
 
+import hashlib
 import json
 import logging
 import os
@@ -113,7 +114,11 @@ def wrong(ta_id, title, ownership="No longer have", media=""):
 
 def written(h):
     """The TA games written, in order: every write ends with the entry's field sets."""
-    return list(dict.fromkeys(w[1] for w in h.ta.writes if w[0] == "gc-set"))
+    return written_in(h.ta.writes)
+
+
+def written_in(writes):
+    return list(dict.fromkeys(w[1] for w in writes if w[0] == "gc-set"))
 
 
 def looked_up(calls):
@@ -223,6 +228,43 @@ def test_live_adds_and_fixes_within_the_budget(tmp_path):
     assert_paced(h.ta.calls)
 
 
+def test_a_pass_spanning_three_runs_reads_the_ta_collection_once(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Finding")  # an add, first in title order: written by run 1
+    h.ta.pages["Example-Finding"] = page(901, "Example Finding")
+    for n in range(1, 55):  # 55 writes, 25 a run: three runs
+        h.xbox.own(pid(100 + n), f"Example Mending {n:02d}")
+        h.ta.owned_rows.append(wrong(500 + n, f"Example Mending {n:02d}"))
+    assert h.run() == 0
+    assert written(h)[0] == 901 and len(written(h)) == 25
+    assert library_state(h)["pass"]["day"] == "2026-11-01"
+    run_1 = list(h.ta.writes)
+    h.ta.calls.clear()
+    h.now = NOW + H
+    assert h.run() == 0
+    # the stored rows still show Example Finding missing: not added, nor any game of run 1 written, again
+    assert not [c for c in h.ta.calls if c[0] == "gc-add" or (c[0] == "gc-set" and c[1] in written_in(run_1))]
+    assert len(written(h)) == 50
+    h.now = NOW + 2 * H
+    assert h.run() == 0
+    assert len(written(h)) == 55 and len(set(written(h))) == 55
+    assert h.ta.collection_calls == 1  # one TA collection read for the whole pass
+    lib = library_state(h)
+    assert lib["last_pass"] == "2026-11-01" and "pass" not in lib  # dropped once the pass is complete
+
+
+def test_a_new_days_pass_reads_the_ta_collection_again(tmp_path):
+    h = library_only(tmp_path, dry=True)
+    for n in range(1, 12):  # 11 lookups: the pass doesn't finish on its last run of the day
+        h.xbox.own(pid(n), f"Example Seeking {n:02d}")
+    h.now = NOW.replace(hour=23, minute=7)
+    assert h.run() == 0 and h.ta.collection_calls == 1
+    assert library_state(h)["pass"]["day"] == "2026-11-01" and "last_pass" not in library_state(h)
+    h.now = NOW.replace(hour=12, minute=7) + DAY
+    assert h.run() == 0 and h.ta.collection_calls == 2  # yesterday's read is not today's
+    assert library_state(h)["last_pass"] == "2026-11-02" and "pass" not in library_state(h)
+
+
 def test_a_rotated_token_is_on_the_pvc_after_the_run(tmp_path):
     h = library_only(tmp_path)
     assert h.run() == 0
@@ -274,16 +316,41 @@ def test_an_incomplete_ta_read_writes_nothing(tmp_path):
     assert "90 of 100" in lib["failed"]["issue"] and "last_pass" not in lib
 
 
-def test_sign_in_needed_is_not_an_issue_and_stops_the_step_for_this_run(tmp_path, caplog):
+def test_a_failed_sign_in_is_not_an_issue_and_waits_for_the_next_days_pass(tmp_path, caplog):
     caplog.set_level(logging.INFO)
     h = library_only(tmp_path)
     h.xbox.reject = True
+    h.now = NOW.replace(hour=12, minute=7)
     assert h.run() == 0
     assert h.reporter.notes == [] and h.ta.calls == []
     assert any("Microsoft sign-in needed" in m for m in lines(caplog))
-    h.now += H
-    assert h.run() == 0 and h.xbox.refreshed_with == [SEED, SEED]  # tried again on the next run
-    assert "last_pass" not in library_state(h) and "failed" not in library_state(h)
+    lib = library_state(h)
+    assert lib["signin_failed"] == {"day": "2026-11-01", "seed": hashlib.sha256(SEED.encode()).hexdigest()}
+    assert SEED not in json.dumps(lib)  # the fingerprint, never the value
+    assert "last_pass" not in lib and "failed" not in lib
+    microsoft = len(h.xbox.calls)
+    caplog.clear()
+    h.now = NOW.replace(hour=13, minute=7)
+    assert h.run() == 0 and len(h.xbox.calls) == microsoft  # not retried the same day
+    assert len(lines(caplog)) == 1 and "XBOX_REFRESH_TOKEN" in lines(caplog)[0]
+    h.xbox.reject = False
+    h.now = NOW.replace(hour=12, minute=7) + DAY
+    assert h.run() == 0 and h.xbox.refreshed_with == [SEED, SEED]  # retried at the next day's pass
+    lib = library_state(h)
+    assert "signin_failed" not in lib and lib["last_pass"] == "2026-11-02"  # a working sign-in clears it
+
+
+def test_a_failed_sign_in_is_retried_at_the_next_run_once_the_seed_changes(tmp_path):
+    h = library_only(tmp_path)
+    h.xbox.reject = True
+    h.now = NOW.replace(hour=12, minute=7)
+    assert h.run() == 0 and h.xbox.refreshed_with == [SEED]
+    h.cfg.xbox_refresh_token = "rt-reseeded-Mn5"  # a new seed in OpenBao
+    h.xbox.reject = False
+    h.now = NOW.replace(hour=13, minute=7)
+    assert h.run() == 0 and h.xbox.refreshed_with == [SEED, "rt-reseeded-Mn5"]
+    lib = library_state(h)
+    assert "signin_failed" not in lib and lib["last_pass"] == "2026-11-01"
 
 
 def test_a_failed_list_refresh_keeps_the_copy_in_state_and_waits_6h(tmp_path, caplog):
@@ -434,6 +501,7 @@ def test_an_add_interrupted_before_its_field_sets_is_completed_next_run(tmp_path
                      ("gc-set", 901, "media", "Digital")]  # completed first, before any read
     assert h.ta.writes == [("gc-add", "Example-Finding"), ("gc-set", 901, "ownership", "Owned"),
                            ("gc-set", 901, "media", "Digital")]  # the second add posted nothing
+    assert [c for c in h.ta.calls if c[0] == "gc-add"] == [("gc-add", "Example-Finding")]  # done for the pass
     assert library_state(h)["writing"] == {} and library_state(h)["last_pass"] == "2026-11-01"
     assert_paced(h.ta.calls)
 
@@ -471,6 +539,31 @@ def test_an_add_whose_game_ta_already_lists_changes_nothing(tmp_path):
     assert "already has Example Finding in the collection, though the collection read didn't list it" in (
         h.last_issues()[0])
     assert library_state(h)["writing"] == {}  # not a write to complete next run
+    pings = len(h.reporter.notes)
+    h.ta.calls.clear()
+    h.now = NOW + H
+    assert h.run() == 0  # the pass goes on: the game is done for today, the other write is made
+    assert ("gc-add", "Example-Finding") not in h.ta.calls and written(h) == [501]
+    assert len(h.reporter.notes) == pings
+
+
+def test_an_add_ta_listed_since_the_pass_read_the_collection_is_left_alone_quietly(tmp_path, caplog):
+    """TA's own import adds a game after the pass's one collection read: the stored rows still show it missing."""
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=False, library_budget=1)
+    h.xbox.own(pid(1), "Example Finding 1")
+    h.xbox.own(pid(2), "Example Finding 2")
+    h.xbox.own(pid(3), "Example Finding 3")
+    for n in (1, 2, 3):
+        h.ta.pages[f"Example-Finding-{n}"] = page(900 + n, f"Example Finding {n}")
+    assert h.run() == 0 and written(h) == [901]
+    h.ta.owned_rows.append(OwnedRow(902, "Example Finding 2", SX, "Xbox Game Pass Ultimate", ""))  # TA's import
+    h.cfg.library_budget = 25
+    h.now = NOW + H
+    assert h.run() == 0 and h.reporter.notes == []
+    assert written(h) == [901, 903]  # Example Finding 2 is left as TA has it; the next write goes on
+    assert any("Example Finding 2" in m and "since this pass read the collection" in m for m in lines(caplog))
+    assert library_state(h)["last_pass"] == "2026-11-01"
 
 
 def test_cloudflare_or_network_trouble_while_writing_stops_quietly(tmp_path, caplog):
