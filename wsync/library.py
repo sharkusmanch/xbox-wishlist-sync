@@ -436,7 +436,7 @@ READ_RETRY = timedelta(hours=6)  # after a failed Microsoft or TA read, no new r
 PAGES_FRESH = timedelta(days=7)  # a game's looked-up pages are reused this long,
 PAGES_FRESH_LONG = timedelta(days=30)  # or this long for a game with no page or a seen product
 LISTS_FRESH = timedelta(days=7)  # TA's Games with Gold and EA Play lists are read at most weekly
-MAX_WRITE_ERRORS = 3  # TA write errors without a successful write between them: the run's writes stop
+MAX_WRITE_ERRORS = 3  # TA write errors without a successful write between them: the pass's writes stop
 GWG_LIST, EA_LIST = "games-with-gold", "ea-play"
 
 
@@ -777,8 +777,10 @@ class _Writer:
     - Compare-and-set: a field already right isn't posted, and an entry changed on TA since the read (ChangedOnTA)
       is left as it is (a warning). An add whose game TA already lists is never written either (a warning): the
       plan was made without that entry, so its ownership may be one only a paid order may change.
-    - A TA write error is an issue naming the game and its product ids (for a `skip` override); the run's other
-      writes go on, until MAX_WRITE_ERRORS errors come without a successful write between them. A failed write
+    - Any failure of one game's write but Cloudflare or network trouble is that game's write error: an issue naming
+      the game and its product ids (for a `skip` override), and the exception type only unless it is a TA error.
+      Other writes go on, until MAX_WRITE_ERRORS errors come without a successful write between them (counted in
+      the pass's state, "errors"): then the pass writes nothing more before the next day's pass. A failed write
       that reached nothing on TA is dropped; a partial one stays for the next pass.
     - Every write made, failed or found already made goes into the pass's "done": the pass never plans it again.
     """
@@ -786,17 +788,18 @@ class _Writer:
     def __init__(self, run, ta, lib: dict, overrides: dict[str, dict], now: datetime, res: LibraryResult):
         self.run, self.ta, self.lib, self.overrides, self.now, self.res = run, ta, lib, overrides, now, res
         self.today = now.astimezone(timezone.utc).date().isoformat()
-        self.errors = 0  # write errors since the last successful write
 
     @property
     def writing(self) -> dict:
         return self.lib.setdefault("writing", {})
 
-    def _done_ids(self) -> list:
+    def _pass(self) -> dict:
+        """Today's pass state (the write phase only runs after it is read or made); a throwaway one otherwise."""
         stored = self.lib.get("pass")
-        if isinstance(stored, dict) and stored.get("day") == self.today:
-            return stored.setdefault("done", [])
-        return []  # no pass of today's to plan from: nothing to keep out of it
+        return stored if isinstance(stored, dict) and stored.get("day") == self.today else {}
+
+    def _done_ids(self) -> list:
+        return self._pass().setdefault("done", [])
 
     def _done(self, game_id: int) -> None:
         """The pass never plans this TA game again (its stored collection read predates the write)."""
@@ -805,6 +808,12 @@ class _Writer:
             done.append(game_id)
 
     def write_phase(self, actions: list[Action], rows: dict[int, OwnedRow]) -> None:
+        if self._pass().get("errors", 0) >= MAX_WRITE_ERRORS:
+            self.res.stopped = f"writes stopped for today's pass ({MAX_WRITE_ERRORS} write errors in a row)"
+            self.res.left = len(actions) + len(self.writing)
+            self.run.say(f"library: writes stopped for today's pass after {MAX_WRITE_ERRORS} TrueAchievements write "
+                         "errors in a row; the next day's pass tries again", logging.WARNING)
+            return
         todo = [(key, entry, False) for key, entry in self._leftovers()]
         todo += [(str(a.ta_id), self._entry(a, rows), True) for a in actions]
         for n, (key, entry, ahead) in enumerate(todo):
@@ -818,6 +827,10 @@ class _Writer:
         """The unfinished writes to complete this pass (each at most once a pass)."""
         out = []
         for key, entry in sorted(self.writing.items()):
+            if not isinstance(entry, dict):
+                self.writing.pop(key)
+                self.run.say("library: dropped an unreadable unfinished TA write", logging.WARNING)
+                continue
             if entry.get("tried") == self.today:
                 continue  # it failed earlier in this pass: the next pass tries it again
             pids = entry.get("pids") or ()
@@ -856,7 +869,7 @@ class _Writer:
             return False
 
     def _write(self, key: str, entry: dict, *, ahead: bool) -> bool:
-        """One game's write; False when the run's writes stop."""
+        """One game's write; False when the run's writes stop. Terminated (SIGTERM) passes through."""
         run, res = self.run, self.res
         if len(res.written) >= run.cfg.library_budget:
             res.stopped = "write budget"
@@ -871,10 +884,11 @@ class _Writer:
                 self.writing.pop(key, None)
                 return False
         else:
-            run.say(f"library: completing the unfinished TA write of {entry['title']}")
-        game_id = int(entry["ta_id"])
-        expect = entry.get("expect") or {}
+            run.say(f"library: completing the unfinished TA write of {entry.get('title')}")
+        game_id = entry.get("ta_id")
         try:
+            game_id = int(game_id)
+            expect = entry.get("expect") or {}
             if entry["kind"] == "add" and not entry.get("added"):
                 run.sleep(PACE)
                 self.ta.collection_add(entry["slug"], game_id=game_id, new=True)
@@ -897,7 +911,7 @@ class _Writer:
         except ChangedOnTA:
             self._left_alone(key, game_id, f"{entry['title']} changed on TrueAchievements since the read; left as is")
             return True
-        except TAError as e:
+        except Exception as e:  # noqa: BLE001 - whatever stops one game's write is that game's
             if _unreachable(e):
                 res.stopped = f"TrueAchievements unreachable ({type(e).__name__})"
                 run.say(f"library: writing {entry['title']} stopped ({_err(e)}); retried next run", logging.WARNING)
@@ -905,7 +919,7 @@ class _Writer:
             return self._failed(key, entry, game_id, e)
         self.writing.pop(key, None)
         self._done(game_id)
-        self.errors = 0
+        self._pass()["errors"] = 0
         res.written.append(entry["title"])
         run.say(f"library: {'added' if entry['kind'] == 'add' else 'fixed'} {entry['title']} "
                 f"({', '.join(label for _, label in entry['sets'])})")
@@ -916,25 +930,28 @@ class _Writer:
         self._done(game_id)
         self.run.say(f"library: {why}", logging.WARNING)
 
-    def _failed(self, key: str, entry: dict, game_id: int, e: TAError) -> bool:
-        """A TA write error: an issue naming the game and its products. The run's other writes go on, unless it is
-        the MAX_WRITE_ERRORS-th error since the last successful write."""
+    def _failed(self, key: str, entry: dict, game_id, e: Exception) -> bool:
+        """A write error: an issue naming the game and its products, with the message of a TA error (the job's own
+        text) or the exception type alone. Other writes go on, unless it is the MAX_WRITE_ERRORS-th error since the
+        last successful write: then nothing more is written in this pass."""
         run, res = self.run, self.res
         self._done(game_id)
-        res.failed.append(entry["title"])
+        res.failed.append(str(entry.get("title")))
         if _reached(entry):
             entry["tried"] = self.today
             what = "partly written: the next day's pass tries the rest again"
         else:
             self.writing.pop(key, None)
             what = "nothing written: the next day's pass plans it again"
-        products = ", ".join(entry.get("pids") or ()) or "unknown"
-        run.issue(f"library step: TrueAchievements write failed for {entry['title']}: {_err(e)}; {what}. To leave "
-                  f"the game out, add a library override \"skip\" for product {products}")
-        self.errors += 1
-        if self.errors < MAX_WRITE_ERRORS:
+        products = ", ".join(str(p) for p in entry.get("pids") or ()) or "unknown"
+        detail = _err(e) if isinstance(e, TAError) else type(e).__name__
+        run.issue(f"library step: TrueAchievements write failed for {entry.get('title')}: {detail}; {what}. To "
+                  f"leave the game out, add a library override \"skip\" for product {products}")
+        stored = self._pass()
+        stored["errors"] = stored.get("errors", 0) + 1
+        if stored["errors"] < MAX_WRITE_ERRORS:
             return True
-        res.stopped = f"{MAX_WRITE_ERRORS} TrueAchievements write errors in a row"
-        run.say(f"library: writes stopped after {MAX_WRITE_ERRORS} write errors in a row; the rest next run",
-                logging.WARNING)
+        res.stopped = f"writes stopped for today's pass ({MAX_WRITE_ERRORS} write errors in a row)"
+        run.say(f"library: writes stopped for today's pass after {MAX_WRITE_ERRORS} TrueAchievements write errors "
+                "in a row; the next day's pass tries again", logging.WARNING)
         return False

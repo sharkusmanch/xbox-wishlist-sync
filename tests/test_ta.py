@@ -1344,3 +1344,41 @@ def test_collection_set_compares_before_it_sets():
                          ("POST", UPDATE): ajax((200, {"d": {"UpdateValue": "Digital"}}))})
     assert c.collection_set(12345, "media", "Digital", expect={""}) is True
     assert sum(x["url"].endswith("UpdateGame") for x in http.calls) == 1
+
+
+def media_select(options):
+    return f'<select id="ddlGameMediaID_12345">{options}</select>'
+
+
+def test_options_are_read_whatever_the_order_of_their_attributes():
+    frag = media_select('<option value="0"></option><option selected="selected" value="1">Disc</option>'
+                        '<option value="2">Digital</option>')
+    assert ta.selected_options(frag, 12345) == {"media": "Disc"}
+    assert ta.edit_options(frag, 12345) == {"media": [("0", ""), ("1", "Disc"), ("2", "Digital")]}
+    bare = frag.replace('selected="selected" value="1"', "value=1 selected")  # unquoted, a bare attribute
+    assert ta.selected_options(bare, 12345) == {"media": "Disc"}
+    assert ta.edit_options(bare, 12345)["media"][1] == ("1", "Disc")
+
+
+def test_only_a_real_selected_attribute_marks_the_current_option():
+    frag = media_select('<option value="0"></option><option value="1" data-selected="selected">Disc</option>'
+                        '<option value="2" class="selected">Digital</option>')
+    assert ta.selected_options(frag, 12345) == {"media": ""}
+
+
+def test_two_selected_options_are_a_parse_failure_and_nothing_is_posted():
+    frag = media_select('<option value="1" selected>Disc</option>'
+                        '<option value="2" selected="selected">Digital</option>')
+    with pytest.raises(TAError, match="2 selected"):
+        ta.selected_options(frag, 12345)
+    c, http = logged_in({("POST", EDIT): ajax((200, {"d": frag}))})
+    with pytest.raises(TAError, match="2 selected"):
+        c.collection_set(12345, "media", "Digital", expect={""})
+    assert not any(x["url"].endswith("UpdateGame") for x in http.calls)
+
+
+def test_edit_options_that_are_not_html_are_a_ta_error():
+    c, http = logged_in({("POST", EDIT): ajax((200, {"d": {"html": "<select></select>"}}))})
+    with pytest.raises(TAError, match="isn't HTML"):
+        c.collection_set(12345, "media", "Digital")
+    assert not any(x["url"].endswith("UpdateGame") for x in http.calls)

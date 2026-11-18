@@ -248,7 +248,8 @@ def _norm(s: str) -> str:
 
 
 _GC_BUTTON = re.compile(r"Postback\('btnGC_(Add|Remove)','(\d+)'\)")
-_OPTION = re.compile(r'<option value="([^"]*)"([^>]*)>([^<]*)</option>')
+_OPTION = re.compile(r"<option\b([^>]*)>(.*?)</option>", re.S | re.I)
+_ATTR = re.compile(r"""([^\s"'=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?""")
 NOT_FOUND_MARK = "PageNotFound404"  # in TA's page-not-found page, served with HTTP 200 for an unknown game address
 _LIST_ROW = re.compile(r'<tr\b[^>]*\bid="tr(\d+)"')
 _CANONICAL = re.compile(r'<link\b[^>]*\brel="canonical"[^>]*\bhref="([^"]*)"')
@@ -263,27 +264,46 @@ def parse_collection_page(page: str, slug: str) -> tuple[TAGame, bool]:
     return game, m.group(1) == "Remove"
 
 
-def _selects(fragment: str, game_id: int):
-    """(field, [(value, attributes, label)]) for each collection dropdown in an EditOptions HTML fragment."""
+def _attrs(tag: str) -> dict[str, str]:
+    """A tag's attributes by lower-case name, in any order, quoted or not; a bare one (`selected`) has the value ""."""
+    out: dict[str, str] = {}
+    for name, double, single, bare in _ATTR.findall(tag):
+        out.setdefault(name.lower(), html.unescape(double or single or bare))
+    return out
+
+
+def _selects(fragment: str, game_id: int) -> dict[str, list[tuple[str, bool, str]]]:
+    """{field: [(value, selected, label)]} for each collection dropdown in an EditOptions HTML fragment."""
+    if not isinstance(fragment, str):
+        raise TAError("GameCollection_EditOptions answered something that isn't HTML")
+    out: dict[str, list[tuple[str, bool, str]]] = {}
     for field_name, prefix in COLLECTION_FIELDS.items():
         m = re.search(r'<select[^>]*\bid="%s_%d"[^>]*>(.*?)</select>' % (prefix, game_id), fragment, re.S)
         if m:
-            yield field_name, [(html.unescape(v), a, html.unescape(t).strip())
-                               for v, a, t in _OPTION.findall(m.group(1))]
+            opts = []
+            for tag, inner in _OPTION.findall(m.group(1)):
+                a, label = _attrs(tag), _text(inner)
+                opts.append((a.get("value", label), "selected" in a, label))
+            out[field_name] = opts
+    return out
 
 
 def edit_options(fragment: str, game_id: int) -> dict[str, list[tuple[str, str]]]:
     """{field: [(value, label)]} from a GameCollection_EditOptions HTML fragment."""
-    return {field_name: [(v, t) for v, _, t in opts] for field_name, opts in _selects(fragment, game_id)}
+    return {field_name: [(v, t) for v, _, t in opts] for field_name, opts in _selects(fragment, game_id).items()}
 
 
 def selected_options(fragment: str, game_id: int) -> dict[str, str]:
     """{field: the label of its selected option} from an EditOptions fragment (`<option value="1"
-    selected="selected">Owned</option>`): blank when none is selected or the blank option (value "" or "0") is."""
+    selected="selected">Owned</option>`, attributes in any order): blank when none is selected or the blank option
+    (value "" or "0") is. A dropdown with several selected options raises TAError rather than guess."""
     out: dict[str, str] = {}
-    for field_name, opts in _selects(fragment, game_id):
-        chosen = next(((v, t) for v, a, t in opts if re.search(r"\bselected\b", a)), ("", ""))
-        out[field_name] = "" if chosen[0] in ("", "0") else chosen[1]
+    for field_name, opts in _selects(fragment, game_id).items():
+        chosen = [(v, t) for v, selected, t in opts if selected]
+        if len(chosen) > 1:
+            raise TAError(f"the EditOptions {field_name} dropdown has {len(chosen)} selected options")
+        value, label = chosen[0] if chosen else ("", "")
+        out[field_name] = "" if value in ("", "0") else label
     return out
 
 

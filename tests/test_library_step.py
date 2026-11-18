@@ -567,20 +567,93 @@ def test_a_partly_written_entry_is_tried_once_in_each_later_pass(tmp_path):
     assert h.ta.writes == [("gc-add", "Example-Finding"), ("gc-set", 901, "media", "Digital")]
 
 
-def test_three_write_errors_in_a_row_stop_the_writes(tmp_path):
+def test_after_three_write_errors_in_a_row_the_passs_writes_wait_for_the_next_day(tmp_path, caplog):
+    """The review's probe: a TA-wide write failure (every set refused) pings once, not on every run."""
+    caplog.set_level(logging.INFO)
     h = library_only(tmp_path, dry=False)
-    for n in range(1, 5):
+    for n in range(1, 11):
         h.xbox.own(pid(n), f"Example Mending {n:02d}")
         h.ta.owned_rows.append(wrong(500 + n, f"Example Mending {n:02d}"))
-    for n in (1, 2, 3):
-        h.ta.fail_set[(500 + n, "ownership")] = TAError(f"collection ownership of {500 + n}: HTTP 500")
+        h.ta.fail_set[(500 + n, "ownership")] = TAError(
+            f"collection ownership of {500 + n}: TA offers no ownership dropdown (is the game in the collection?)")
     assert h.run() == 1
     assert len(h.last_issues()) == 3 and written(h) == []
-    assert not [c for c in h.ta.calls if c[0] == "gc-set" and c[1] == 504]  # not started
-    h.ta.fail_set.clear()
+    assert len([c for c in h.ta.calls if c[0] == "gc-set"]) == 3  # the 4th isn't started
+    pings = len(h.reporter.notes)
+    for hour in (13, 14, 15):
+        h.ta.calls.clear()
+        caplog.clear()
+        h.now = NOW.replace(hour=hour)
+        assert h.run() == 0  # the pass goes on (reads, plan), its writes don't: no new issue
+        assert not [c for c in h.ta.calls if c[0] in ("gc-add", "gc-set")]
+        assert any("writes stopped for today's pass" in m for m in lines(caplog))
+    assert len(h.reporter.notes) == pings
+    h.ta.fail_set.clear()  # TA works again
+    h.now = NOW + DAY  # the next day's pass tries again
+    assert h.run() == 0 and written(h) == list(range(501, 511))
+
+
+def test_a_successful_write_resets_the_error_streak(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    for n in range(1, 6):
+        h.xbox.own(pid(n), f"Example Mending {n:02d}")
+        h.ta.owned_rows.append(wrong(500 + n, f"Example Mending {n:02d}"))
+    for n in (1, 3, 4):  # three errors, never three in a row
+        h.ta.fail_set[(500 + n, "ownership")] = TAError(f"collection ownership of {500 + n}: HTTP 500")
+    assert h.run() == 1 and len(h.last_issues()) == 3
+    assert written(h) == [502, 505]  # the writes went on to the last one
+    assert library_state(h)["pass"]["errors"] == 0
+
+
+def test_a_partly_written_fix_is_kept_and_its_rest_tried_in_the_next_pass(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Mending 01")
+    h.ta.owned_rows = [wrong(501, "Example Mending 01")]  # a fix: ownership Owned, then media Digital
+    h.ta.fail_set[(501, "media")] = TAError("collection media of 501: TA answered 'Disc', expected 'Digital'")
+    assert h.run() == 1
+    assert "partly written" in h.last_issues()[0]
+    entry = library_state(h)["writing"]["501"]
+    assert entry["kind"] == "fix" and entry["sets_done"] == ["ownership"] and entry["tried"] == "2026-11-01"
+    del h.ta.fail_set[(501, "media")]
+    h.now = NOW + DAY  # the fresh read shows 501 Owned now: only the kept write sets its media
+    assert h.run() == 0
+    assert h.ta.writes == [("gc-set", 501, "ownership", "Owned"), ("gc-set", 501, "media", "Digital")]
+    assert library_state(h)["writing"] == {}
+
+
+def test_the_progress_of_each_field_set_is_on_disk_before_the_next_request(tmp_path):
+    """What a crash right after the first set would leave behind."""
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Mending 01")
+    h.ta.owned_rows = [wrong(501, "Example Mending 01")]
+    on_disk = []
+
+    def before_set(game_id, field_name):
+        on_disk.append((field_name, library_state(h)["writing"]["501"].get("sets_done")))
+
+    h.ta.on_set = before_set
+    assert h.run() == 0
+    assert on_disk == [("ownership", None), ("media", ["ownership"])]
+
+
+def test_any_exception_from_a_write_is_that_games_write_error(tmp_path, caplog):
+    """The review's probe: a TypeError from collection_set (EditOptions' answer was a dict)."""
+    caplog.set_level(logging.DEBUG)
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Mending 01")
+    h.xbox.own(pid(2), "Example Mending 02")
+    h.ta.owned_rows = [wrong(501, "Example Mending 01"), wrong(502, "Example Mending 02")]
+    h.ta.fail_set[(501, "ownership")] = TypeError("string indices must be integers, not 'str' (47.31)")
+    assert h.run() == 1
+    issue = h.last_issues()[0]
+    assert "Example Mending 01" in issue and "TypeError" in issue and pid(1) in issue
+    assert "string indices" not in caplog.text + issue  # the exception type only, never its message
+    assert written(h) == [502] and library_state(h)["writing"] == {}
+    h.ta.calls.clear()
     h.now = NOW + H
-    assert h.run() == 0 and written(h) == [504]  # the rest next run; the failed three wait for the next day
-    assert library_state(h)["last_pass"] == "2026-11-01"
+    assert h.run() == 0 and not [c for c in h.ta.calls if c[0] == "gc-set"]  # not retried this pass
+    h.now = NOW + DAY
+    assert h.run() == 1 and ("gc-set", 501, "ownership", "Owned") in h.ta.calls  # the next pass tries again
 
 
 def test_a_leftover_whose_override_now_names_another_page(tmp_path):
@@ -794,12 +867,11 @@ def test_invalid_library_overrides_fail_only_the_library_step(tmp_path):
 def test_an_unexpected_error_in_the_step_is_an_issue_and_the_state_is_still_saved(tmp_path):
     h = library_only(tmp_path, dry=False)
     h.xbox.own(pid(1), "Example Finding")
-    h.ta.pages["Example-Finding"] = page(901, "Example Finding")
-    h.ta.fail_add["Example-Finding"] = RuntimeError("boom")
+    h.ta.list_ids = {"games-with-gold": [7]}
+    h.ta.fail_collection = RuntimeError("boom")  # not a TA error: a bug, not a failed read
     assert h.run() == 1
     assert "library step aborted by an unexpected error: RuntimeError: boom" in h.last_issues()[0]
-    lib = library_state(h)
-    assert pid(1) in lib["pages"] and list(lib["writing"]) == ["901"]  # what the run learned is kept
+    assert library_state(h)["lists"]["games-with-gold"]["ids"] == [7]  # what the run learned is kept
 
 
 def test_a_failed_write_ahead_save_writes_nothing(tmp_path, monkeypatch):
