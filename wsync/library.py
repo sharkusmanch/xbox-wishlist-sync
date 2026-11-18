@@ -20,7 +20,9 @@ among the pages that fit.
   when only those fit, and is a review when both kinds do.
 - A console licence never fixes TA's separate "(Windows)" entry (its console page is added instead); a PC-only
   licence fixes only a Windows entry.
-- A `library` override slug is the game's page, without the title and generation checks; "skip" drops it.
+- A `library` override slug is the game's page, without the title and generation checks; "skip" drops it. An
+  override whose page the lookup didn't find is a review of its own kind, "override", never "no-page" (which
+  the live check task leaves out), so a mistyped override doesn't stay silent.
 
 Never planned: a removal, a change to an Owned or Games with Gold entry, any ownership but Owned on a fix, or
 a media change on an entry that has media.
@@ -71,7 +73,7 @@ class Action:
 class Review:
     pid: str  # the game's first Store product ID (`lookup_key`): what an override or the seen set is keyed by
     title: str  # the Store title
-    kind: str  # "possible-match" | "versions" | "subscription" | "no-page" | "generation"
+    kind: str  # "possible-match" | "versions" | "subscription" | "no-page" | "generation" | "override"
     reason: str
 
 
@@ -298,12 +300,10 @@ class _Planner:
         found = self._found(g)
         if found is None:
             return
-        if not found:
-            self._settle([_review(g, "no-page", f"no TA page at the library override's address {slug}")])
-            return
         page = next((p for p in found if p.slug.lower() == slug.lower()), None)
-        if page is None:  # pages looked up before the override: look up the override's page
-            self.plan.lookups.append(g)
+        if page is None:  # looked up: nothing at the override's address, or not its page
+            other = f" (found: {'; '.join(p.title for p in found)})" if found else ""
+            self._settle([_review(g, "override", f"the library override's TA page {slug} was not found" + other)])
         else:
             self._settle(self._land(g, [page]))
 

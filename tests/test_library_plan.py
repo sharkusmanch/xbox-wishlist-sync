@@ -343,9 +343,21 @@ def test_overrides_skip_a_product_or_point_it_at_a_page():
     assert writes(plan([g], listed, found(g, proper), pinned)) == [("fix", 800)]
     p = plan([g], [row(800, "Example Proper Name", media="Disc")], found(g, proper), pinned)
     assert p.actions == [] and p.ok == 1
-    stale = found(g, page(801, "Example Odd Name"))  # an earlier lookup of the guessed pages
-    assert plan([g], pages=stale, overrides=pinned).lookups == [g]
-    assert kinds(plan([g], pages=found(g), overrides=pinned)) == ["no-page"]
+
+
+def test_an_override_whose_page_is_missing_is_an_override_review():
+    g = owned("Example Odd Name", pids=(P1, P2))
+    typo = {P2: {"ta": "Example-Proper-Nmae"}}
+    assert plan([g], overrides=typo).lookups == [g]  # not looked up yet
+    p = plan([g], pages=found(g), overrides=typo)  # looked up: nothing at that address
+    assert p.actions == [] and p.lookups == [] and [(r.pid, r.kind) for r in p.review] == [(P1, "override")]
+    assert p.review[0].reason == "the library override's TA page Example-Proper-Nmae was not found"
+    p = plan([g], pages=found(g, page(801, "Example Odd Name")), overrides=typo)  # not the override's page
+    assert p.actions == [] and p.lookups == [] and kinds(p) == ["override"]
+    assert p.review[0].reason == ("the library override's TA page Example-Proper-Nmae was not found "
+                                  "(found: Example Odd Name)")
+    unreleased = page(-7, "Example Proper Name", slug="Example-Proper-Nmae")  # a placeholder id is no page to write
+    assert kinds(plan([g], pages=found(g, unreleased), overrides=typo)) == ["override"]
 
 
 def test_an_override_on_any_product_applies_to_its_game_and_skip_wins():
