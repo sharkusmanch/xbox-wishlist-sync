@@ -241,6 +241,58 @@ def test_an_owned_game_carries_source_generation_and_pc_only():
     assert isinstance(g, OwnedGame) and g.acquisition == "bought" and g.evidence == "paid"
 
 
+def test_an_owned_game_carries_its_latest_acquisition():
+    """The latest acquisition of any of its products: an active, non-trial licence's acquiredDate or a purchased
+    order line's orderPlacedDate, as UTC ISO text whatever form Microsoft wrote it in; None when none is known."""
+    items = [_lic("A1", orderId="O1", acquiredDate="2024-01-02T03:04:05.1234567+00:00"),
+             _lic("A2", acquiredDate="2025-06-01T10:00:00Z"),
+             _lic("A2", status="Revoked", acquiredDate="2026-01-01T00:00:00Z"),  # not an owning licence
+             _lic("A2", isTrial=True, acquiredDate="2026-02-01T00:00:00Z"),  # a trial: not one either
+             _lic("N1"),  # no date at all
+             _lic("B1", acquiredDate="not a date")]
+    orders = [{"orderId": "O1", "orderState": "Purchased", "orderPlacedDate": "2024-01-02T03:00:00+00:00",
+               "orderLineItems": [{"productId": "A1", "totalAmount": 10}]},
+              {"orderId": "O2", "orderState": "Purchased", "orderPlacedDate": "2025-07-04T09:30:00.5+00:00",
+               "orderLineItems": [{"productId": "C1", "productType": "Game", "title": "Order Only",
+                                   "totalAmount": 5}]},
+              {"orderId": "O3", "orderState": "Purchased", "orderPlacedDate": "2026-03-01T00:00:00+00:00",
+               "orderLineItems": [{"productId": "C1", "totalAmount": 5, "billingState": "Refunded",
+                                   "fulfillmentState": "Revoked"}]},  # refunded: not a purchase
+              {"orderId": "O4", "orderState": "Canceled", "orderPlacedDate": "2026-04-01T00:00:00+00:00",
+               "orderLineItems": [{"productId": "N1", "totalAmount": 5}]},
+              {"orderId": "O5", "orderState": "Purchased", "orderPlacedDate": "2025-09-09T09:09:09Z",
+               "orderLineItems": [{"productId": "A1", "totalAmount": 3}]}]  # A1's latest: after its licence
+    catalog = {"A1": prod("A1", "Example Deep"), "A2": prod("A2", "Example Deep - Deluxe Edition"),
+               "N1": prod("N1", "Example Plain"), "B1": prod("B1", "Example Broken")}
+    games = {g.title: g for g in owned_games(items, orders, catalog)}
+    assert games["Example Deep"].pids == ("A1", "A2")
+    assert games["Example Deep"].acquired == "2025-09-09T09:09:09+00:00"
+    assert games["Order Only"].acquired == "2025-07-04T09:30:00.500000+00:00"
+    assert games["Example Plain"].acquired is None and games["Example Broken"].acquired is None
+
+
+def test_owned_game_fields_keep_their_order_and_acquired_defaults_to_none():
+    """Positional construction and stored games from before `acquired` existed keep working."""
+    g = OwnedGame("k", "T", ("P1",), "collections", "bought", "paid", ("ConsoleGen9",), False)
+    assert g.acquired is None
+
+
+def test_a_product_without_platform_data_never_makes_a_game_pc_only():
+    """A bundle's catalog entry lists no platforms (and no generation): it neither proves nor disproves PC-only. A
+    game is PC-only only when a product lists its platforms and none of those includes Xbox."""
+    items = [_lic(p) for p in ("B1", "C1", "B2", "P1", "B3")]
+    catalog = {"B1": prod("B1", "Example Heist V: Premium Edition", platforms=(), gen=()),  # a bundle...
+               "C1": prod("C1", "Example Heist V"),  # ...and a console product of the same game
+               "B2": prod("B2", "Example Lone Bundle", platforms=(), gen=()),  # a bundle alone
+               "P1": prod("P1", "Example Desk Game", platforms=("PC",), gen=()),  # PC-only...
+               "B3": prod("B3", "Example Desk Game - Deluxe Edition", platforms=(), gen=())}  # ...with a bundle
+    games = {g.pids: g for g in owned_games(items, [], catalog)}
+    assert set(games) == {("B1", "C1"), ("B2",), ("B3", "P1")}
+    assert not games[("B1", "C1")].pc_only and games[("B1", "C1")].gen == ("ConsoleGen9",)
+    assert not games[("B2",)].pc_only and games[("B2",)].gen == ()
+    assert games[("B3", "P1")].pc_only
+
+
 def test_pc_only_and_catalog_gaps_and_filtering():
     items = [_lic("PC1"), _lic("NC1"), _lic("G8", orderId="X"), _lic("G9"), _lic("DEMO"), _lic("DLC", productKind="Durable")]
     catalog = {"PC1": prod("PC1", "Desk Only", platforms=("PC",), gen=()),

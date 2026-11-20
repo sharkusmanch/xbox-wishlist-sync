@@ -243,7 +243,15 @@ be a 360 or original Xbox game (backward compatible 360 products report ConsoleG
 both a 360 and a modern page fit, it is a review. **Bundle twin rule:** an orders-only game whose
 title key equals that of a Collections game (a bundled copy of a modern game) never writes an Xbox
 360 / Xbox entry: a review instead. A console licence never fixes TA's separate "(Windows)" entry
-(its console page is added instead); a PC-only licence fixes only a Windows entry.
+(its console page is added instead); a PC-only licence fixes only a Windows entry. **PC-only** means
+that a product of the game lists its platforms in the Store catalog and none of those that do
+includes Xbox: a bundle's catalog entry lists no platforms (and no console generation), which proves
+nothing either way. A game that is not PC-only and has no console generation never takes a
+Windows, Xbox One or Xbox Series X|S page unless a `library` override names it: its entry in TA is
+matched as usual (already right, or fixed by the ownership rules), and when TA has none it ends as a
+`possible-match` or `no-page` review, for an orders-only game as a lone Xbox 360 / Xbox page (as for
+a game the catalog doesn't list; a `versions` review when newer pages fit too), or else as a
+`generation` review.
 
 ### Page lookups
 
@@ -251,20 +259,30 @@ A missing game's TA page is found by guessing addresses from the title (platform
 trailing tiers stripped; at most **6 candidates** per game; Windows too for a PC-only game), or the
 `library` override's slug alone. At most **10 games a run** (`WSYNC_LIBRARY_LOOKUPS`) and **40 a
 UTC day** across the day's runs (`WSYNC_LIBRARY_LOOKUPS_PER_DAY`) are looked up: games never looked
-up first, then the expired re-lookups, the oldest first; **4 s** before every TA request, none past
-the 45-minute write deadline. Results are cached per game, each lifetime with a stable offset per
+up first, the **newest purchase first** (the latest licence or order date of the game's products;
+a game with no known date last), so a game bought today doesn't wait behind the backlog; then the
+expired re-lookups, the oldest first; **4 s** before every TA request, none past the 45-minute
+write deadline. Results are cached per game, each lifetime with a stable offset per
 product (from a hash of its first product id) so that games looked up together don't expire
 together: found pages **30-44 days** for a product seen at go-live and **7-10 days** otherwise (every
 product while the step is dry), no page **90-120 days**; a changed address set or override is looked
 up again. **No page** means HTTP 404 or TA's page-not-found page (marker `PageNotFound404`).
-What every address would meet stops the lookups quietly for the run, nothing cached, so a throttled
-day never turns into months of "no page": network or Cloudflare trouble, TA unavailable or
-throttling (HTTP 429, 502-504 or Cloudflare's 52x, a page with no game id such as a maintenance
-page), a failed TA login. Anything else fails **that game's** lookup for the day's pass (another
-HTTP error at one address, a game page that doesn't parse, an unexpected exception): an issue naming
-the game and its product id (for a `library` override), and the next game goes on; the game is
-looked up again in the next day's pass. After **3 failed lookups in a row** the pass looks nothing
-more up until the next day's pass, so a TA-wide change is at most 3 issues a day.
+What every address would meet stops the lookups quietly for the run, no result cached, so a
+throttled day never turns into months of "no page": network or Cloudflare trouble, a failed TA
+login, and TA unavailable or throttling (HTTP 429, 502-504 or Cloudflare's 52x, a page with no game
+id such as a maintenance page). Network, Cloudflare and login trouble is never held against a game.
+TA unavailable or throttling is the answer at that game's address, though, and can be that address's
+alone, so it also **counts against the game**: the game goes behind the others of its kind (games
+never looked up, or re-lookups) in the next run's queue, so one address never holds up the queue,
+and its **3rd such stop**, counted across runs and passes until its lookup is done, is its failed
+lookup (below). Anything else fails **that game's** lookup for the day's pass (another HTTP error at
+one address, a game page that doesn't parse, an unexpected exception): an issue naming the game and
+its product id (for a `library` override), and the next game goes on; the game is looked up again
+from the next day's pass on. A failed lookup is **stamped in the cache** with the failure's time,
+never read as "no page": the game then waits behind the games never looked up, as a re-lookup by
+that time (so the newest one), and games whose lookups keep failing never hold up the others. After
+**3 failed lookups in a row** the pass looks nothing more up until the next day's pass, so a TA-wide
+change is at most 3 issues a day.
 
 ### Writes
 
@@ -290,17 +308,22 @@ on TA is dropped; a partial one stays for the next pass.
   lookup). It is updated every run; Apprise pings "Library sync plan ready" **once**, when the
   plan is complete (no lookup pending, a game whose lookup failed today aside) and its lists
   changed.
-- **Live:** that task closes. The task "Library sync: check by hand" holds the items needing a
-  look, with the product id to key a `library` override. It holds **only new items**: at the first
-  live run the step records a *seen baseline* (decision A) of every product in the plan's review
-  items and in the games still waiting for a lookup, before any write, so the leftovers a dry run
-  already showed never surface as new. `no-page` items never go in the task; an `override` item
-  always does. Apprise pings when its item set changes (titles and a count, never product ids).
-  "+N TA library" (the titles) is sent when a run added games.
+- **Live:** that task closes. The task "Library sync: check by hand" holds the items needing a look,
+  with the product id to key a `library` override. It holds **only new items**: the first live run
+  starts with a *seen baseline* (decision A) of the products of the review items present then, taken
+  from its plan before its lookups and writes (the plan's items, and those a game waiting for a
+  re-lookup keeps from the dry run), so the items a dry run already showed never surface as new. A
+  game waiting for its **first** lookup is not in it, the ones that run looks up included: a review
+  item such a lookup produces reaches the task, so the backlog's hand checks appear as their lookups
+  come in. `no-page` items never go in the task; an `override` item always does. Apprise pings when
+  its item set changes (titles and a count, never product ids). "+N TA library" (the titles) is sent
+  when a run added games.
 - **Sign-in:** the task above, plus one "Library sync: Microsoft sign-in needed" ping per episode.
 - **Product ids** appear only in issues (a write or lookup error names the products to key a
   `library` override) and in the Vikunja tasks: never in routine log lines or in the step's own
-  pings, which carry titles and counts.
+  pings, which carry titles and counts. A product the Store gives no title (its title falls back
+  to its product id) is "an untitled product" there, and a lookup error at its addresses (which
+  hold the id) is logged by its type only.
 
 ### Failures and back-offs
 
@@ -464,11 +487,12 @@ on Deku first.
 
 The **library step**'s state lives under `library` in the same file. Don't delete it whole; by key:
 
-- **Safe cache resets:** `pages` (the cached page lookups: looked up again, within the lookup
-  limits), `lists` (TA's Games with Gold / EA Play lists: read again), `pass` (today's pass: the TA
-  collection rows and owned games its first run read, the TA ids written since, the error streaks
-  and the day's lookup count; the next run reads Microsoft and TA again, its fresh read shows what
-  was written, and the day's failed lookups and writes and its lookup count start again).
+- **Safe cache resets:** `pages` (the cached page lookups and failed-lookup stamps: looked up
+  again, within the lookup limits), `lists` (TA's Games with Gold / EA Play lists: read again), `pass` (today's pass: the TA
+  collection rows and owned games its first run read, the TA ids written since, the error streaks,
+  the day's lookup count and the quiet stops counted against games; the next run reads Microsoft
+  and TA again, its fresh read shows what was written, and the day's failed lookups and writes, its
+  lookup count and the quiet-stop counts start again).
 - **Not safe:** `seen` (the decision-A baseline): the next live pass takes the baseline again, which
   marks every open check-by-hand item seen and closes the task, hiding them. `writing` (the
   write-ahead entries): an unfinished write's rest is never made, e.g. an add that reached TA keeps
@@ -477,7 +501,9 @@ The **library step**'s state lives under `library` in the same file. Don't delet
   hand).
 - The rest only time the step and its pings: `last_pass` (the day's pass runs again), `failed` (a
   read back-off ends early), `signin_failed` (the sign-in is tried again at the next run, and pings
-  again if it fails), `listed`, `review_sig`, `check_sig` (the report memory: a ping may repeat).
+  again if it fails), `listed`, `review_sig`, `check_sig` (the report memory: a ping may repeat;
+  before the first live pass, `listed` also gives the seen baseline the items of games waiting for
+  a re-lookup, which would otherwise surface as new).
 
 The Microsoft refresh token is a separate file, `WSYNC_XBOX_TOKEN` (`/state/xbox-token.json`, mode
 600), beside it; deleting it falls back to the `XBOX_REFRESH_TOKEN` seed.

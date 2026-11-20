@@ -20,7 +20,7 @@ from wsync.errors import TAError
 from wsync.flaresolverr import FlareSolverrError
 from wsync.run import Terminated
 from wsync.state import State, load_state, save_state
-from wsync.ta import ONE, SERIES, IncompleteRead, TAGame, Unreachable
+from wsync.ta import ONE, SERIES, IncompleteRead, PageUnavailable, TAGame, Unreachable
 from wsync.ta import AuthError as TAAuthError
 from wsync.ta_coll import OwnedRow
 
@@ -47,19 +47,22 @@ class FakeXbox:
         self.issued = 0
         self.refreshed_with = []  # the refresh tokens presented, in order
 
-    def own(self, pid, title, gen=("ConsoleGen9",), price=PRICE):
-        """A paid Store purchase with an active Collections licence."""
+    def own(self, pid, title, gen=("ConsoleGen9",), price=PRICE, acquired="2025-03-01T00:00:00Z",
+            platforms=("Windows.Xbox",)):
+        """A paid Store purchase with an active Collections licence, acquired (and ordered) at `acquired`; None
+        leaves both dates out. `platforms`: the catalog's package platforms (none for a bundle)."""
         oid = f"ORD-{len(self.orders) + 1:04d}-Q"
-        self.licences.append({"productId": pid, "productKind": "Game", "status": "Active", "orderId": oid,
-                              "acquiredDate": "2025-03-01T00:00:00Z"})
-        self.orders.append({"orderId": oid, "orderState": "Purchased", "orderPlacedDate": "2025-03-01T00:00:00Z",
+        dated = {"acquiredDate": acquired} if acquired else {}
+        self.licences.append({"productId": pid, "productKind": "Game", "status": "Active", "orderId": oid, **dated})
+        self.orders.append({"orderId": oid, "orderState": "Purchased",
+                            **({"orderPlacedDate": acquired} if acquired else {}),
                             "orderLineItems": [{"productId": pid, "title": title, "productType": "Game",
                                                 "totalAmount": price, "billingState": "Charged",
                                                 "fulfillmentState": "Fulfilled"}]})
         self.products[pid] = {"ProductId": pid, "ProductType": "Game", "LocalizedProperties": [{"ProductTitle": title}],
                               "Properties": {"XboxConsoleGenOptimized": list(gen)},
                               "DisplaySkuAvailabilities": [{"Sku": {"Properties": {"Packages": [
-                                  {"PlatformDependencies": [{"PlatformName": "Windows.Xbox"}]}]}}}]}
+                                  {"PlatformDependencies": [{"PlatformName": n} for n in platforms]}]}}}]}
 
     def request(self, method, url, *, form=None, json_body=None, headers=None):
         self.calls.append((method, url))
@@ -186,6 +189,42 @@ def test_the_pass_runs_once_a_day_after_library_after(tmp_path, caplog):
 
 
 # --------------------------------------------------------------------------- dry run and writes
+
+
+def test_a_bundle_without_platform_data_never_takes_the_windows_page(tmp_path, caplog):
+    """The dry-run probe ("Example Heist V (Windows)" planned for an Xbox purchase): a bundle's catalog entry lists
+    no platforms and no generation, which made its game PC-only. Never the Windows page now: with no console
+    generation a missing game is a review; with a console product's generation it takes that console's page; with
+    its console entry already in TA it is already right."""
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Heist V: Premium Edition", gen=(), platforms=())  # a bundle alone
+    h.xbox.own(pid(2), "Example Raid II: Premium Edition", gen=(), platforms=())  # a bundle...
+    h.xbox.own(pid(3), "Example Raid II")  # ...and the game's console product (ConsoleGen9)
+    h.xbox.own(pid(4), "Example Siege: Premium Edition", gen=(), platforms=())  # a bundle of a game TA lists
+    h.ta.owned_rows.append(OwnedRow(930, "Example Siege", SX, "Owned", "Digital"))
+    for title, ta_id in (("Example Heist V", 910), ("Example Raid II", 920), ("Example Siege", 930)):
+        slug = "-".join(title.split())
+        h.ta.pages[slug] = page(ta_id, title)  # the console page (Xbox Series X|S)
+        h.ta.pages[f"{slug}-Windows"] = TAGame(ta_id + 1, f"{title} (Windows)", "Windows", f"{slug}-Windows",
+                                               ("Windows",))
+    assert h.run() == 0
+    assert [w for w in h.ta.writes if w[0] == "gc-add"] == [("gc-add", "Example-Raid-II")]
+    assert written(h) == [920]
+    assert not [c for c in h.ta.calls if c[0] == "page" and c[1].endswith("-Windows")]
+    assert "library: check by hand: generation 1" in lines(caplog)  # Example Heist V: no generation to go by
+    assert any("already right 1;" in m for m in lines(caplog))  # Example Siege
+
+
+def test_a_pc_only_purchase_still_takes_the_windows_page(tmp_path):
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Desk Game", gen=(), platforms=("Windows.Desktop",))
+    h.xbox.own(pid(2), "Example Desk Game - Deluxe Edition", gen=(), platforms=())  # a bundle of it
+    h.ta.pages["Example-Desk-Game"] = page(940, "Example Desk Game")  # the console page
+    h.ta.pages["Example-Desk-Game-Windows"] = TAGame(941, "Example Desk Game (Windows)", "Windows",
+                                                     "Example-Desk-Game-Windows", ("Windows",))
+    assert h.run() == 0
+    assert [w for w in h.ta.writes if w[0] == "gc-add"] == [("gc-add", "Example-Desk-Game-Windows")]
 
 
 def test_dry_run_writes_nothing_and_plans_everything(tmp_path, caplog):
@@ -632,6 +671,43 @@ def test_games_never_looked_up_come_before_expired_re_lookups_and_the_oldest_fir
     assert got == ["Example-Newcomer", "Example-Zed", "Example-Aged"]  # new, then the oldest re-lookup first
 
 
+def test_a_purchase_made_today_is_looked_up_before_the_older_backlog(tmp_path):
+    """Games never looked up go newest purchase first (a game with no known purchase date last), so a game bought
+    today doesn't wait days behind a backlog that fills the daily cap: in title order, Example Zed would come last."""
+    h = library_only(tmp_path, dry=True, library_lookups=2, library_lookups_per_day=3)
+    backlog = [f"Example-Backlog-{n:02d}" for n in range(1, 7)]
+    for n in range(1, 7):  # bought long ago, none looked up yet
+        h.xbox.own(pid(n), f"Example Backlog {n:02d}", acquired="2025-03-01T00:00:00Z")
+    got = []
+    for hour in (12, 13):
+        h.ta.calls.clear()
+        h.now = NOW.replace(hour=hour, minute=7)
+        assert h.run() == 0
+        got.append(looked_up(h.ta.calls))
+    assert got == [backlog[:2], backlog[2:3]]  # the day's cap: 3 games
+    h.xbox.own(pid(50), "Example Zed", acquired="2026-11-02T08:15:42.1234567+00:00")  # bought this morning
+    h.xbox.own(pid(51), "Example Undated", acquired=None)  # no purchase date known
+    got = []
+    for day, hour in ((1, 12), (1, 13), (2, 12)):
+        h.ta.calls.clear()
+        h.now = NOW.replace(hour=hour, minute=7) + day * DAY
+        assert h.run() == 0
+        got.append(looked_up(h.ta.calls))
+    assert got == [["Example-Zed", backlog[3]], [backlog[4]], [backlog[5], "Example-Undated"]]
+
+
+def test_a_pass_state_from_before_the_purchase_dates_is_still_reused(tmp_path):
+    """Owned games a pass stored before OwnedGame had `acquired` load as games with no known purchase date: the
+    pass's later runs still make no Microsoft read."""
+    h = library_only(tmp_path, dry=True)
+    old = {"key": "example seeking", "title": "Example Seeking", "pids": [pid(1)], "source": "collections",
+           "acquisition": "bought", "evidence": "paid", "gen": ["ConsoleGen9"], "pc_only": False}
+    save_state(h.cfg.state, State(library={"pass": {"day": "2026-11-01", "rows": [], "owned": [old], "done": []}}))
+    assert h.run() == 0
+    assert h.xbox.calls == [] and looked_up(h.ta.calls) == ["Example-Seeking"]
+    assert library_state(h)["last_pass"] == "2026-11-01"
+
+
 @pytest.mark.parametrize("error", [
     Unreachable("network error: ConnectionError"),
     FlareSolverrError("FlareSolverr unreachable (URLError)"),
@@ -659,6 +735,97 @@ def test_lookups_go_on_past_a_missing_page_and_stop_quietly_when_every_request_w
     assert library_state(h)["last_pass"] == "2026-11-01"
 
 
+def unavailable(slug, status=502):
+    """TA unavailable or throttling at one game page address, as the client raises it."""
+    return PageUnavailable(f"GET /game/{slug} answered HTTP {status} (TrueAchievements unavailable or throttling)")
+
+
+def test_a_game_whose_lookup_keeps_stopping_quietly_never_pins_the_queue(tmp_path, caplog):
+    """The review's probe: TA unavailable at Example Alpha's address on every run. Each stop is quiet and moves the
+    game behind the other games never looked up, so Bravo and Charlie are looked up in the next run; its 3rd quiet
+    stop is its lookup failure (one issue naming it and its product, out of the pending count); the pass completes."""
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=False)
+    for n, name in enumerate(("Alpha", "Bravo", "Charlie"), 1):
+        h.xbox.own(pid(n), f"Example {name}")
+    h.ta.pages["Example-Bravo"] = page(902, "Example Bravo")
+    h.ta.pages["Example-Charlie"] = page(903, "Example Charlie")
+    h.ta.fail_page["Example-Alpha"] = unavailable("Example-Alpha")
+    runs = []
+    for hour in (12, 13, 14, 15):
+        h.ta.calls.clear()
+        h.now = NOW.replace(hour=hour, minute=7)
+        runs.append((h.run(), looked_up(h.ta.calls), len(issue_notes(h))))
+    assert runs == [
+        (0, ["Example-Alpha"], 0),  # a quiet stop: no issue, nothing after it looked up this run
+        (0, ["Example-Bravo", "Example-Charlie", "Example-Alpha"], 0),  # Alpha behind the others: its 2nd stop
+        (1, ["Example-Alpha"], 1),  # its 3rd quiet stop: its lookup failure
+        (0, [], 1),  # nothing left to look up in this pass
+    ]
+    assert written(h) == [902, 903]
+    (issue,) = h.last_issues()
+    assert "Example Alpha" in issue and "HTTP 502" in issue and "3 times" in issue
+    assert "if TA was unavailable everywhere, nothing to do: it is tried again tomorrow" in issue
+    assert f'library override "skip" for product {pid(1)}' in issue
+    lib = library_state(h)
+    assert lib["last_pass"] == "2026-11-01" and lib["pages"][pid(1)]["failed"]  # stamped failed, no result
+    assert sum("lookups stopped" in m for m in lines(caplog)) == 3
+    h.ta.fail_page.clear()
+    h.ta.calls.clear()
+    h.now = NOW + DAY  # the next day's pass looks it up again
+    assert h.run() == 0 and looked_up(h.ta.calls) == ["Example-Alpha"]
+
+
+def test_quiet_stops_at_one_game_count_across_the_days_passes(tmp_path):
+    h = library_only(tmp_path, dry=True)
+    h.xbox.own(pid(1), "Example Alpha")
+    h.ta.fail_page["Example-Alpha"] = unavailable("Example-Alpha", 504)
+    for hour in (22, 23):
+        h.now = NOW.replace(hour=hour, minute=7)
+        assert h.run() == 0 and not issue_notes(h)
+    assert library_state(h)["pass"]["quiet"] == {pid(1): 2}
+    h.now = NOW.replace(hour=12, minute=7) + DAY  # the next day's pass: the 3rd quiet stop at the same game
+    assert h.run() == 1 and len(issue_notes(h)) == 1 and "HTTP 504" in h.last_issues()[0]
+    assert library_state(h)["pass"]["quiet"] == {}  # counted from 0 again after its failure
+
+
+def test_the_quiet_stop_count_ends_with_a_successful_lookup(tmp_path):
+    h = library_only(tmp_path, dry=True)
+    h.xbox.own(pid(1), "Example Alpha")
+    h.xbox.own(pid(2), "Example Bravo")
+    h.ta.fail_page["Example-Alpha"] = unavailable("Example-Alpha")
+    h.ta.fail_page["Example-Bravo"] = unavailable("Example-Bravo")
+    for hour in (12, 13):
+        h.now = NOW.replace(hour=hour, minute=7)
+        assert h.run() == 0
+    assert library_state(h)["pass"]["quiet"] == {pid(1): 1, pid(2): 1}  # TA-wide trouble: the stops take turns
+    del h.ta.fail_page["Example-Alpha"]
+    h.now = NOW.replace(hour=14, minute=7)
+    assert h.run() == 0
+    assert library_state(h)["pass"]["quiet"] == {pid(2): 2}  # Alpha looked up: its count is gone
+
+
+@pytest.mark.parametrize("error", [
+    Unreachable("network error: ConnectionError"),
+    Unreachable("GET /game/Example-Alpha answered HTTP 403 (Cloudflare challenge, after a fresh clearance)"),
+    FlareSolverrError("FlareSolverr unreachable (URLError)"),
+    TAAuthError("TrueAchievements login failed (check the gamertag and password)"),
+], ids=["network", "cloudflare", "flaresolverr", "auth"])
+def test_trouble_every_request_meets_is_never_counted_against_a_game(tmp_path, error):
+    """Network, Cloudflare and login trouble stay a quiet stop of the whole lookup phase, run after run: never a
+    game's failure, and no game is moved for it."""
+    h = library_only(tmp_path, dry=True)
+    h.xbox.own(pid(1), "Example Alpha")
+    h.xbox.own(pid(2), "Example Bravo")
+    h.ta.fail_page["Example-Alpha"] = error
+    for hour in range(12, 18):
+        h.ta.calls.clear()
+        h.now = NOW.replace(hour=hour, minute=7)
+        assert h.run() == 0 and looked_up(h.ta.calls) == ["Example-Alpha"]
+    assert not issue_notes(h) and not library_state(h)["pass"].get("quiet")
+    assert "last_pass" not in library_state(h)
+
+
 def test_a_lookup_that_keeps_failing_on_one_game_never_holds_up_the_queue(tmp_path):
     """The review's probe: a persistent HTTP 500 at Example Alpha's address."""
     h = library_only(tmp_path, dry=False)
@@ -668,12 +835,13 @@ def test_a_lookup_that_keeps_failing_on_one_game_never_holds_up_the_queue(tmp_pa
     h.ta.fail_page["Example-Alpha"] = TAError("GET /game/Example-Alpha answered HTTP 500")
     assert h.run() == 1
     issue = h.last_issues()[0]
-    assert "Example Alpha" in issue and "HTTP 500" in issue
+    assert "Example Alpha" in issue and "HTTP 500" in issue and "unavailable everywhere" not in issue
     assert f'library override "skip" for product {pid(1)}' in issue  # the product id to put in an override
     assert looked_up(h.ta.calls) == ["Example-Alpha", "Example-Bravo"]  # the queue moved on in the same run
     assert written(h) == [902]
     pages = library_state(h)["pages"]
-    assert pid(1) not in pages and pid(2) in pages  # nothing cached for the failed game
+    assert pages[pid(1)]["failed"] and "pages" not in pages[pid(1)]  # only stamped failed: no result cached
+    assert pages[pid(2)]["pages"]
     h.ta.calls.clear()
     h.now = NOW + H
     assert h.run() == 0  # not tried again this pass, and nothing else waits: the pass is complete
@@ -681,6 +849,35 @@ def test_a_lookup_that_keeps_failing_on_one_game_never_holds_up_the_queue(tmp_pa
     h.ta.calls.clear()
     h.now = NOW + DAY  # the next day's pass tries it again
     assert h.run() == 1 and looked_up(h.ta.calls) == ["Example-Alpha"]
+
+
+def test_failed_lookups_wait_behind_the_games_never_looked_up(tmp_path):
+    """The review's probe: Aa, Ab and Ac fail (HTTP 500) at the head of the queue, and their 3 failures in a row stop
+    the day's lookups before Bravo and Charlie. A failed lookup is stamped in the cache with the failure's time, never
+    read as "no page", so the next day's pass looks up Bravo and Charlie first and retries the failed ones after them,
+    as re-lookups."""
+    h = library_only(tmp_path, dry=True)
+    for n, name in enumerate(("Aa", "Ab", "Ac", "Bravo", "Charlie"), 1):
+        h.xbox.own(pid(n), f"Example {name}")
+    for name in ("Aa", "Ab", "Ac"):
+        h.ta.fail_page[f"Example-{name}"] = TAError(f"GET /game/Example-{name} answered HTTP 500")
+    assert h.run() == 1 and looked_up(h.ta.calls) == ["Example-Aa", "Example-Ab", "Example-Ac"]
+    # the stamp keeps its addresses under "failed", not "slugs": an image from before the stamp, which takes any
+    # entry with the game's "slugs" for a result, never reads it as "no page" after a rollback
+    assert library_state(h)["pages"][pid(1)] == {
+        "checked": NOW.isoformat(), "failed": ["Example-Aa", "Example-Aa-Xbox-One", "Example-Aa-Xbox-Series-XS"]}
+    body = tasks(h, "library-review:dry-run")[-1]
+    assert "no-page" not in body and "waiting for a page lookup 5" in body  # not a result: still waiting
+    h.ta.calls.clear()
+    h.now = NOW + DAY
+    assert h.run() == 1
+    assert looked_up(h.ta.calls) == ["Example-Bravo", "Example-Charlie", "Example-Aa", "Example-Ab", "Example-Ac"]
+    h.ta.fail_page.clear()  # TA answers again: a failed lookup is retried at the next day's pass, never reused
+    h.ta.calls.clear()
+    h.now = NOW + 2 * DAY
+    assert h.run() == 0 and looked_up(h.ta.calls) == ["Example-Aa", "Example-Ab", "Example-Ac"]
+    assert library_state(h)["pages"][pid(1)]["pages"] == [] and "failed" not in library_state(h)["pages"][pid(1)]
+    assert library_state(h)["last_pass"] == "2026-11-03"
 
 
 def test_any_exception_from_a_lookup_is_that_games_failure(tmp_path, caplog):
@@ -724,8 +921,8 @@ def test_after_three_lookup_errors_in_a_row_the_passs_lookups_wait_for_the_next_
     assert len(h.reporter.notes) == pings and "last_pass" not in library_state(h)
     h.ta.fail_page.clear()  # TA works again
     h.ta.calls.clear()
-    h.now = NOW + DAY  # the next day's pass looks them up again
-    assert h.run() == 0 and looked_up(h.ta.calls) == seeking
+    h.now = NOW + DAY  # the next day's pass looks them up again, after the two never looked up
+    assert h.run() == 0 and looked_up(h.ta.calls) == seeking[3:] + seeking[:3]
     assert library_state(h)["last_pass"] == "2026-11-02"
 
 
@@ -1115,6 +1312,41 @@ def test_nothing_starts_past_the_write_deadline(tmp_path, caplog):
 # --------------------------------------------------------------------------- secrets
 
 
+def test_an_untitled_product_is_never_named_by_its_product_id_in_a_log_line(tmp_path, caplog):
+    """An untitled catalog product's title falls back to its product ID: log lines call it "an untitled product",
+    and an error whose text holds its address (the ID) gives its type only. Issues and the Vikunja tasks may keep
+    the ID: it keys an override."""
+    caplog.set_level(logging.DEBUG)
+    h = library_only(tmp_path, dry=True)
+    h.xbox.own(pid(1), "")  # no title in the Store catalog or the order
+    h.xbox.own(pid(2), "")
+    h.ta.fail_page[pid(2)] = unavailable(pid(2))  # its first address is its product ID
+    assert h.run() == 0
+    said = lines(caplog)
+    assert "library: looked up an untitled product: no TA page" in said
+    assert "library: check by hand (no-page): an untitled product: no TA page with this title" in said
+    assert any(m.startswith("library: looking up an untitled product failed (PageUnavailable;") for m in said)
+    routine = [r.getMessage() for r in caplog.records if r.levelno < logging.ERROR]
+    assert not [m for m in routine if pid(1) in m or pid(2) in m]
+    assert f"(`{pid(1)}`, no-page)" in tasks(h, "library-review:dry-run")[-1]  # the task keeps the ID
+    h.ta.fail_page[pid(2)] = TAError(f"GET /game/{pid(2)} answered HTTP 500")
+    h.now = NOW + H
+    assert h.run() == 1
+    assert pid(2) in h.last_issues()[0]  # an issue names the product to key a skip override
+    routine = [r.getMessage() for r in caplog.records if r.levelno < logging.ERROR]
+    assert not [m for m in routine if pid(1) in m or pid(2) in m]
+
+
+def test_the_check_ping_names_an_untitled_product_without_its_id(tmp_path):
+    h = library_only(tmp_path, dry=False, overrides={"library": {pid(1): {"ta": "Example-Nowhere"}}})
+    h.xbox.own(pid(1), "")
+    assert h.run() == 0
+    assert f"(`{pid(1)}`)" in tasks(h, "library-check")[-1]  # the task keeps the ID
+    title, body = h.reporter.notes[-1]
+    assert title == "Library sync: 1 to check by hand"
+    assert "- an untitled product" in body and pid(1) not in body
+
+
 def test_tokens_xuid_prices_and_order_ids_never_reach_the_logs(tmp_path, caplog):
     caplog.set_level(logging.DEBUG)
     h = library_only(tmp_path, dry=True)
@@ -1276,19 +1508,69 @@ def test_the_first_live_pass_marks_every_review_item_seen(tmp_path):
     for n in range(1, 4):  # writes beyond the budget of 1
         h.xbox.own(pid(50 + n), f"Example Mending {n}")
         h.ta.owned_rows.append(wrong(500 + n, f"Example Mending {n}"))
-    h.xbox.own(pid(90), "Example Waiting")  # never looked up this run (lookup budget 1 is spent first)
-    h.xbox.own(pid(91), "Example Waiting Too")
-    assert h.run() == 0
+    h.xbox.own(pid(90), "Example Waiting")  # the run's one lookup (no TA page): after the baseline
+    h.xbox.own(pid(91), "Example Waiting Too")  # still waiting for its first lookup at go-live
+    assert h.run() == 0 and looked_up(h.ta.calls) == ["Example-Waiting"]
     lib = library_state(h)
-    assert {pid(1), pid(2), pid(3)} <= set(lib["seen"]) and lib["seen"] == sorted(lib["seen"])
-    assert {pid(90), pid(91)} <= set(lib["seen"])  # games still waiting for a lookup are baselined too
-    assert tasks(h, "library-check") == [None]  # all three are seen: nothing to check
+    assert lib["seen"] == sorted([pid(1), pid(2), pid(3)])  # the review items present before the run's lookups
+    assert tasks(h, "library-check") == [None]  # all three are seen, and a no-page item is never listed
     assert tasks(h, "library-review:dry-run") == [None]
     before = lib["seen"]
     h.xbox.own(pid(95), "Example Later")
     h.now = NOW + H
     h.run()
     assert library_state(h)["seen"] == before  # later runs never change it
+
+
+def test_the_first_live_runs_own_lookups_are_not_baselined(tmp_path):
+    """The review's probe: the first live run looks up the newest purchase first (one lookup a run). The baseline is
+    the plan's before the run's lookups, so the review item that very lookup produces reaches the check task."""
+    h = library_only(tmp_path, dry=False, library_lookups=1)
+    own_checks(h, review_pids(1))  # Example Arena 1: a review item before any lookup
+    h.xbox.own(pid(20), "Example Saga", acquired="2026-11-01T08:00:00+00:00")  # bought today (ConsoleGen9)...
+    h.ta.pages["Example-Saga"] = page(950, "Example Saga", ONE)  # ...and TA has only an Xbox One page
+    h.xbox.own(pid(30), "Example Older")  # bought in 2025: waits
+    assert h.run() == 0 and looked_up(h.ta.calls) == ["Example-Saga"]
+    assert library_state(h)["seen"] == [pid(1)]
+    body = tasks(h, "library-check")[-1]
+    assert body is not None and f"Example Saga (`{pid(20)}`)" in body and "Example Arena 1" not in body
+    assert [t for t, _ in h.reporter.notes if "check by hand" in t] == ["Library sync: 1 to check by hand"]
+
+
+def test_a_game_waiting_for_its_first_lookup_at_go_live_reaches_the_check_task(tmp_path):
+    """The baseline holds the review items present at the first live run, not the games still waiting for their
+    first lookup: a review item such a game's lookup produces later is listed (and pinged) as new."""
+    h = library_only(tmp_path, dry=False, library_lookups=1)
+    own_checks(h, review_pids(1))  # Example Arena 1: a review item at go-live
+    h.xbox.own(pid(10), "Example Finding")  # the first live run's one lookup (title order)
+    h.ta.pages["Example-Finding"] = page(901, "Example Finding")
+    generation_item(h)  # Example Saga: still waiting for its first lookup at go-live
+    assert h.run() == 0
+    lib = library_state(h)
+    assert lib["seen"] == [pid(1)] and tasks(h, "library-check") == [None]
+    h.now = NOW + H
+    assert h.run() == 0  # its lookup: TA has only an Xbox One page for a Series X|S purchase
+    body = tasks(h, "library-check")[-1]
+    assert f"Example Saga (`{pid(20)}`)" in body and "Example Arena 1" not in body
+    assert [t for t, _ in h.reporter.notes if "check by hand" in t] == ["Library sync: 1 to check by hand"]
+
+
+def test_an_item_a_dry_run_listed_stays_seen_while_its_re_lookup_waits_at_go_live(tmp_path):
+    """A game whose re-lookup waits at the first live run still has the check item the dry run listed (the report
+    carries it), and the baseline holds it: the item doesn't surface as new, then or after the re-lookup."""
+    h = library_only(tmp_path, dry=True)
+    generation_item(h)  # Example Saga: a "generation" item of the dry-run plan
+    assert h.run() == 0 and f"(`{pid(20)}`, generation)" in tasks(h, "library-review:dry-run")[-1]
+    h.cfg.dry_run = h.cfg.library_dry_run = False  # go live
+    h.ta.fail_page["Example-Saga"] = Unreachable("network error: ConnectionError")  # its re-lookup waits
+    h.now = NOW + 12 * DAY  # its found page expired (7-10 days)
+    assert h.run() == 0
+    assert library_state(h)["seen"] == [pid(20)] and tasks(h, "library-check")[-1] is None
+    h.ta.fail_page.clear()
+    h.now = NOW + 12 * DAY + H
+    assert h.run() == 0 and looked_up(h.ta.calls)[-1] == "Example-Saga"  # the same item again: still seen
+    assert tasks(h, "library-check")[-1] is None
+    assert not [t for t, _ in h.reporter.notes if "check by hand" in t]
 
 
 def test_only_unseen_items_reach_the_check_task_and_no_page_games_never_do(tmp_path):
@@ -1481,15 +1763,18 @@ def test_the_check_ping_has_titles_and_the_count_but_no_product_ids(tmp_path):
 
 
 def test_a_mistyped_override_on_a_seen_game_is_listed_and_pinged(tmp_path):
-    h = library_only(tmp_path, dry=False)
-    h.xbox.own(pid(1), "Example Lost Game")  # no TA page: a seen review item at go-live
-    assert h.run() == 0 and pid(1) in library_state(h)["seen"]
-    assert tasks(h, "library-check") == [None]
-    h.cfg.overrides.write_text(json.dumps({"library": {pid(1): {"ta": "Example-Nowhere"}}}))
+    h = library_only(tmp_path, dry=True)
+    h.xbox.own(pid(1), "Example Lost Game")  # no TA page, found by the dry run's lookup
+    assert h.run() == 0
+    h.cfg.dry_run = h.cfg.library_dry_run = False  # go live: the no-page item is a seen review item
     h.now = NOW + DAY
+    assert h.run() == 0 and library_state(h)["seen"] == [pid(1)]
+    assert tasks(h, "library-check")[-1] is None
+    h.cfg.overrides.write_text(json.dumps({"library": {pid(1): {"ta": "Example-Nowhere"}}}))
+    h.now = NOW + 2 * DAY
     assert h.run() == 0
     assert f"Example Lost Game (`{pid(1)}`)" in tasks(h, "library-check")[-1]
-    assert [t for t, _ in h.reporter.notes] == ["Library sync: 1 to check by hand"]
+    assert [t for t, _ in h.reporter.notes if "check by hand" in t] == ["Library sync: 1 to check by hand"]
 
 
 def test_the_sign_in_task_closes_as_soon_as_the_sign_in_works(tmp_path):

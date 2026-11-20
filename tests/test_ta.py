@@ -1299,6 +1299,29 @@ def test_game_page_or_none_raises_every_other_failure():
         c.game_page_or_none("Example-Quest")
 
 
+def test_tas_unavailable_answers_at_a_game_page_are_page_unavailable():
+    """TA unavailable or throttling at a game page address (HTTP 429, 502-504, Cloudflare's 52x, a page with no game
+    id): PageUnavailable, still an Unreachable (the lookups stop quietly), but an answer of that address, which the
+    library step counts against its game. A network error or an unpassed challenge is a plain Unreachable: trouble
+    every request meets, never counted against a game."""
+    for status in (429, 502, 503, 504, 522):
+        c, _ = logged_in({("GET", "/game/Example-Quest"): resp("Service Unavailable", status=status)})
+        with pytest.raises(ta.PageUnavailable, match=str(status)) as e:
+            c.game_page_or_none("Example-Quest")
+        assert isinstance(e.value, ta.Unreachable)
+    c, _ = logged_in({("GET", "/game/Example-Quest"): resp("<html><title>Down for maintenance</title></html>")})
+    with pytest.raises(ta.PageUnavailable, match="Example-Quest"):
+        c.game_page_or_none("Example-Quest")
+
+    def offline(url, body, headers):
+        raise ta.Unreachable("network error: ConnectionError")  # as CurlTransport raises it
+    for answer in (CHALLENGE, offline):
+        c, _ = logged_in({("GET", "/game/Example-Quest"): answer})
+        with pytest.raises(ta.Unreachable) as e:
+            c.game_page_or_none("Example-Quest")
+        assert not isinstance(e.value, ta.PageUnavailable)
+
+
 def test_a_404_is_not_found_and_still_a_ta_error():
     c, _ = logged_in({("GET", "/game/Missing-Quest"): resp("gone", status=404)})
     with pytest.raises(ta.NotFound) as e:

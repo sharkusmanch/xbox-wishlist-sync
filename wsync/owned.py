@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .xbox import Product
 
@@ -41,6 +42,7 @@ HINT_WORDS = re.compile(r"\b(?:edition|bundle|collection|expansion|part|pack|sea
 SEQUEL_WORDS = set(ROMAN.values()) | {"x", "remake", "remaster", "remastered", "rebirth", "reborn", "reunion", "re"}
 RANK = {"bought": 0, "claim": 1, "free": 2}
 EVIDENCE_RANK = {"paid": 0, "claim": 1, "unknown-order": 2, "legacy": 3, "free": 4}
+UNTITLED = "an untitled product"  # how a log line or a ping names a product the Store gives no title
 
 
 @dataclass(frozen=True)
@@ -52,7 +54,18 @@ class OwnedGame:
     acquisition: str  # "bought" | "claim" | "free", the strongest across its products
     evidence: str  # "paid" | "claim" | "unknown-order" | "legacy" | "free", the strongest
     gen: tuple[str, ...]  # union of the products' console generations, ConsoleGen8 before ConsoleGen9
-    pc_only: bool  # no product's catalog platforms include Xbox
+    # a product lists its platforms in the catalog and none of those that do includes Xbox; a product without
+    # platform data (a bundle's entry lists none) neither proves nor disproves it
+    pc_only: bool
+    # the latest acquisition of its products, UTC ISO text: an owning licence's acquiredDate or a purchased order
+    # line's orderPlacedDate; None when none is known (and in pass state stored before this field existed)
+    acquired: str | None = None
+
+
+def shown_title(title: str, pids) -> str:
+    """A title for a log line or a ping: an untitled product's title is its product ID (`owned_games` falls back to
+    it), which log lines and pings never carry (issues and the Vikunja tasks may: an override is keyed by it)."""
+    return UNTITLED if title in pids else title
 
 
 # ---------------------------------------------------------------- what is owned
@@ -164,6 +177,38 @@ def evidence(pid, licences, lines, totals, order_amount=None):
     return min(found, key=EVIDENCE_RANK.get)
 
 
+def _when(text) -> datetime | None:
+    """A Microsoft date-time (ISO 8601, UTC when it has no offset); None when there is none or it can't be read."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        when = datetime.fromisoformat(text.strip())
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _latest(licences: dict[str, list], orders) -> dict[str, datetime]:
+    """{product ID: its latest acquisition}: the acquiredDate of its owning (active, non-trial) licences and the
+    orderPlacedDate of the purchased orders with a kept line for it. A date that can't be read is left out."""
+    out: dict[str, datetime] = {}
+
+    def note(pid, text):
+        when = _when(text)
+        if pid and when is not None and (pid not in out or when > out[pid]):
+            out[pid] = when
+    for pid, lics in licences.items():
+        for lic in lics:
+            note(pid, lic.get("acquiredDate"))
+    for o in orders:
+        if o.get("orderState") != "Purchased":
+            continue
+        for li in o.get("orderLineItems") or []:
+            if _line_kept(li):
+                note(li.get("productId"), o.get("orderPlacedDate"))
+    return out
+
+
 def _strongest(e, row):
     """Folds another product of the same game into e: the strongest acquisition and evidence win."""
     if RANK.get(row.get("acquisition"), 9) < RANK.get(e.get("acquisition"), 9):
@@ -173,12 +218,14 @@ def _strongest(e, row):
 
 
 def owned_games(items, orders, catalog: dict[str, Product]) -> list[OwnedGame]:
-    """One OwnedGame per game (owned, kind Game, not a demo/beta/extra), strongest evidence kept."""
+    """One OwnedGame per game (owned, kind Game, not a demo/beta/extra), strongest evidence kept, with the latest
+    acquisition of its products."""
     lines, totals = order_line_amounts(orders), order_totals(orders)
     licences: dict[str, list] = {}
     for it in items:
         if (it.get("status") or "Active") == "Active" and not it.get("isTrial") and it.get("skuType") != "Trial":
             licences.setdefault(it.get("productId"), []).append(it)
+    latest = _latest(licences, orders)
     paid: dict[str, float] = {}
     for (_, pid), amt in lines.items():
         paid[pid] = max(paid.get(pid, 0.0), amt)
@@ -194,7 +241,7 @@ def owned_games(items, orders, catalog: dict[str, Product]) -> list[OwnedGame]:
         if e is None:
             groups[key] = {"title": r["title"] or pid, "pids": [pid], "collections": r["source"] == "collections",
                            "acquisition": row["acquisition"], "evidence": row["evidence"], "gen": set(),
-                           "known": [], "xbox": False}
+                           "platforms_known": False, "xbox": False, "acquired": None}
             e = groups[key]
         else:
             e["pids"].append(pid)
@@ -202,15 +249,21 @@ def owned_games(items, orders, catalog: dict[str, Product]) -> list[OwnedGame]:
             if r["title"] and len(r["title"]) < len(e["title"]):
                 e["title"] = r["title"]
             _strongest(e, row)
+        when = latest.get(pid)
+        if when is not None and (e["acquired"] is None or when > e["acquired"]):
+            e["acquired"] = when
         c = catalog.get(pid)
         if c:
-            e["known"].append(c)
             e["gen"].update(c.gen)
-            e["xbox"] = e["xbox"] or "Xbox" in c.platforms
+            if c.platforms:  # a bundle's entry lists none: no evidence either way
+                e["platforms_known"] = True
+                e["xbox"] = e["xbox"] or "Xbox" in c.platforms
     out = [OwnedGame(key=game_key(e["title"]) or e["pids"][0], title=e["title"], pids=tuple(sorted(e["pids"])),
                      source="collections" if e["collections"] else "orders", acquisition=e["acquisition"],
                      evidence=e["evidence"], gen=tuple(sorted(e["gen"])),
-                     pc_only=bool(e["known"]) and not e["xbox"]) for e in groups.values()]
+                     pc_only=e["platforms_known"] and not e["xbox"],
+                     acquired=e["acquired"].astimezone(timezone.utc).isoformat() if e["acquired"] else None)
+           for e in groups.values()]
     return sorted(out, key=lambda g: g.title.lower())
 
 

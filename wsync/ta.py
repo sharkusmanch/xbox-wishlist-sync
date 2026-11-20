@@ -84,6 +84,13 @@ class Unreachable(TAError):
     (maintenance, a throttle page). Every other address would meet it too; a later run may get through."""
 
 
+class PageUnavailable(Unreachable):
+    """A game page lookup's answer at its address said TA is unavailable or throttling: an HTTP 429, 502-504 or
+    Cloudflare 52x answer, or a page with no game id that isn't TA's page-not-found page. Usually every address meets
+    it too (it is an Unreachable), but unlike a network error or an unpassed challenge it is that address's answer,
+    so it can be that address's own trouble: the library step counts it against the game."""
+
+
 class ChangedOnTA(TAError):
     """A collection entry no longer shows what the caller planned from (it was changed on TA since): nothing posted."""
 
@@ -849,22 +856,24 @@ class TAClient:
 
     def game_page_or_none(self, slug: str) -> TAGame | None:
         """The game page at /game/<slug>, or None when there is none there: HTTP 404, or TA's page-not-found page.
-        What every other address would meet too is Unreachable, never "no page": TA unavailable or throttling (HTTP
-        429, 502-504, Cloudflare's 52x) or a page with no game id at all (maintenance, a throttle page). An error of
-        this address alone stays a plain TAError: another HTTP error, or a page with game ids that isn't one game's
-        page (several ids, no title)."""
+        What every other address would meet too is Unreachable, never "no page": a network error or an unpassed
+        challenge, and, as PageUnavailable (the address's own answer), TA unavailable or throttling (HTTP 429,
+        502-504, Cloudflare's 52x) or a page with no game id at all (maintenance, a throttle page). An error of this
+        address alone stays a plain TAError: another HTTP error, or a page with game ids that isn't one game's page
+        (several ids, no title)."""
         try:
             p = self._get(BASE + "/game/" + quote(slug, safe=""), need_login=False)
         except NotFound:
             return None
         except HttpError as e:
             if e.status == 429 or 502 <= e.status <= 504 or 520 <= e.status <= 530:
-                raise Unreachable(f"{e} (TrueAchievements unavailable or throttling)") from None
+                raise PageUnavailable(f"{e} (TrueAchievements unavailable or throttling)") from None
             raise
         if NOT_FOUND_MARK in p.html:
             return None
         if not _GAME_ID.search(p.html):
-            raise Unreachable(f"game page {slug!r} is neither a game page nor TA's page-not-found page (no game id)")
+            raise PageUnavailable(f"game page {slug!r} is neither a game page nor TA's page-not-found page "
+                                  "(no game id)")
         return parse_game(p.html, slug)
 
     def dlc(self, game: int | str) -> list[tuple[str, int]]:
