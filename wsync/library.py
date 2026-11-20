@@ -50,8 +50,8 @@ from . import library_report
 from .flaresolverr import FlareSolverrError
 from .overrides import SKIP
 from .owned import (BARE_PLATFORM, PLATFORM_SUFFIX, PLATFORM_TAG, TIER_PLAIN, OwnedGame, game_key, hint, match_keys,
-                    owned_games, same_game)
-from .ta import ONE, SERIES, AlreadyListed, AuthError, ChangedOnTA, TAGame, Unreachable
+                    owned_games, same_game, shown_title)
+from .ta import ONE, SERIES, AlreadyListed, AuthError, ChangedOnTA, PageUnavailable, TAGame, Unreachable
 from .ta_coll import OwnedRow
 from .xbox import SignInNeeded, TokenStore, XboxError, catalog_lookup, fetch_collections, fetch_orders, open_session
 
@@ -465,6 +465,7 @@ PAGES_KEEP = timedelta(days=180)  # a cached lookup older than this is dropped (
 LISTS_FRESH = timedelta(days=7)  # TA's Games with Gold and EA Play lists are read at most weekly
 MAX_WRITE_ERRORS = 3  # TA write errors without a successful write between them: the pass's writes stop
 MAX_LOOKUP_ERRORS = 3  # failed page lookups without a successful one between them: the pass's lookups stop
+QUIET_STOPS = 3  # quiet stops at one game (TA unavailable at its address), across runs and passes: its lookup failure
 NEW_ENTRY = {"ownership": [OWNED], "media": [""]}  # what TA shows for an entry just added (compare-and-set)
 GWG_LIST, EA_LIST = "games-with-gold", "ea-play"
 
@@ -515,6 +516,17 @@ def _unreachable(e: BaseException) -> bool:
     return isinstance(e, (Unreachable, FlareSolverrError))
 
 
+def _name(g: OwnedGame) -> str:
+    """The game as a log line names it: never by its product ID (`shown_title`)."""
+    return shown_title(g.title, g.pids)
+
+
+def _said(g: OwnedGame, e: BaseException) -> str:
+    """An error for a log line about the game: its type only for an untitled product, whose addresses (and so the
+    error's text) hold its product ID."""
+    return _err(e) if _name(g) == g.title else type(e).__name__
+
+
 def _everywhere(e: BaseException) -> bool:
     """A lookup failure every TA request would meet: the network, Cloudflare, TA unavailable or throttling
     (`Unreachable`), FlareSolverr, or the TA login."""
@@ -533,7 +545,8 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
     made. A failed Microsoft or TA read is an issue; the runs within 6 h of it make no new read and only warn. A
     Microsoft sign-in that needs a new token is not an issue: it isn't tried again before the next day's pass unless
     XBOX_REFRESH_TOKEN changes. A TA write or page-lookup error is an issue about that game only; Cloudflare or
-    network trouble and the write deadline stop the lookups and writes quietly. Other exceptions propagate.
+    network trouble and the write deadline stop the lookups and writes quietly, as TA unavailable at a game's
+    address does (its QUIET_STOPS-th time at that game is that game's lookup error). Other exceptions propagate.
     """
     if now.tzinfo is None:
         raise ValueError("run_library_step needs a timezone-aware `now`")
@@ -586,13 +599,14 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
     done = set(lib["pass"].get("done") or ())
     plan = _without(done, plan_library(games, rows, _cached_pages(lib, games, overrides, now), overrides, gwg,
                                        ea_play))
+    # decision A, from the plan before this run's lookups (a review item they produce is new) and before any write
+    library_report.baseline(lib, plan, dry=res.dry_run)
     _look_up(run, ta, lib, plan, overrides, now, res)
     plan = _without(done, plan_library(games, rows, _cached_pages(lib, games, overrides, now), overrides, gwg,
                                        ea_play))
     failed = set(lib["pass"].get("lookup_failed") or ())
     res.plan, res.pending = plan, sum(lookup_key(g) not in failed for g in plan.lookups)
     _log_plan(run, res, len(games), len(rows), plan)
-    library_report.baseline(lib, plan, dry=res.dry_run)  # decision A: before any write, so a stop can't skip it
     if not res.dry_run:
         _Writer(run, ta, lib, overrides, now, res).write_phase(plan.actions, {r.ta_id: r for r in rows})
     elif lib.get("writing"):
@@ -723,8 +737,9 @@ def _pass_rows(run, ta, lib: dict, today: str) -> list[OwnedRow]:
     """The TA collection for today's pass. A day's pass reads it once, in its first run, never from the Deku
     collection step's cache, and keeps it in state.library["pass"] = {"day", "rows", "done"}, where "done" lists
     the TA ids the pass has since written, found already written or changed, or failed to write: never planned
-    again in the pass. Its later runs reuse it; a new day's pass reads it again. Any failed read, an incomplete one
-    included, is a _ReadFailed, so nothing is planned or written from it."""
+    again in the pass. Its later runs reuse it; a new day's pass reads it again, and takes over the quiet stops
+    ("quiet") of an earlier pass that didn't complete. Any failed read, an incomplete one included, is a
+    _ReadFailed, so nothing is planned or written from it."""
     stored = lib.get("pass")
     if isinstance(stored, dict) and stored.get("day") == today:
         try:
@@ -741,6 +756,8 @@ def _pass_rows(run, ta, lib: dict, today: str) -> list[OwnedRow]:
         raise _ReadFailed(f"library step: TrueAchievements collection read failed, no library writes this run: "
                           f"{_err(e)}; retried after 6 h") from None
     lib["pass"] = {"day": today, "rows": [asdict(r) for r in rows], "done": []}
+    if isinstance(stored, dict) and isinstance(stored.get("quiet"), dict) and stored["quiet"]:
+        lib["pass"]["quiet"] = dict(stored["quiet"])  # they count across passes until the game's lookup is done
     run.say(f"library: read the TrueAchievements collection ({len(rows)} titles)")
     return rows
 
@@ -759,7 +776,8 @@ def _cached_pages(lib: dict, games: list[OwnedGame], overrides: dict[str, dict],
                   now: datetime) -> dict[str, list[TAGame]]:
     """The cached lookups that still hold for the games as they are now, by lookup key: within their lifetime
     (`lookup_lifetime`: "no-page" without a page, "seen" for a product seen at go-live, else "found") and made at
-    the addresses the game has now, so a new or changed override is looked up again. Entries older than PAGES_KEEP
+    the addresses the game has now, so a new or changed override is looked up again. A failed lookup's stamp
+    ({"checked", "failed": [addresses]}) is never a result: its game waits for a lookup. Entries older than PAGES_KEEP
     are dropped."""
     cache = lib.setdefault("pages", {})
     for key in [k for k, e in cache.items()
@@ -770,7 +788,7 @@ def _cached_pages(lib: dict, games: list[OwnedGame], overrides: dict[str, dict],
     for g in games:
         key = lookup_key(g)
         entry = cache.get(key)
-        if not entry or entry.get("slugs") != candidate_slugs(g, override_for(g, overrides)):
+        if not entry or entry.get("failed") or entry.get("slugs") != candidate_slugs(g, override_for(g, overrides)):
             continue
         try:
             pages = [TAGame(**{**p, "platforms": tuple(p.get("platforms") or ())}) for p in entry.get("pages") or ()]
@@ -782,17 +800,37 @@ def _cached_pages(lib: dict, games: list[OwnedGame], overrides: dict[str, dict],
     return out
 
 
-def _queue(lib: dict, lookups: list[OwnedGame], overrides: dict[str, dict], skip) -> list[OwnedGame]:
-    """The games to look up, in order: those never looked up at the addresses they have now first (in title order),
-    then the expired re-lookups, the oldest first; none whose key is in `skip`."""
+def _queue(lib: dict, lookups: list[OwnedGame], overrides: dict[str, dict], skip,
+           quiet: dict[str, int] | None = None) -> list[OwnedGame]:
+    """The games to look up, in order: those never looked up at the addresses they have now first, the newest
+    purchase first (`OwnedGame.acquired`; one with no known date last, title order between equals), then the
+    expired re-lookups and the failed lookups (stamped in the cache), the oldest first; none whose key is in `skip`
+    (the lookups failed in this pass: tried again from the next day's pass). Within each, a game with fewer quiet stops
+    (`quiet`, by lookup key) comes first: one that stopped the lookups goes behind the others of its kind."""
     cache = lib.get("pages") or {}
+    quiet = quiet or {}
 
-    def order(g: OwnedGame) -> tuple[int, float]:
+    def order(g: OwnedGame) -> tuple[int, int, bool, float]:
         entry = cache.get(lookup_key(g))
-        same = isinstance(entry, dict) and entry.get("slugs") == candidate_slugs(g, override_for(g, overrides))
+        tried = (entry.get("failed") or entry.get("slugs")) if isinstance(entry, dict) else None  # its addresses
+        same = tried == candidate_slugs(g, override_for(g, overrides))
         when = _when(entry.get("checked")) if same else None
-        return (0, 0.0) if when is None else (1, when.timestamp())
+        stops = quiet.get(lookup_key(g), 0)
+        if when is None:
+            bought = _when(g.acquired)
+            return (0, stops, bought is None, -bought.timestamp() if bought else 0.0)
+        return (1, stops, False, when.timestamp())
     return sorted((g for g in lookups if lookup_key(g) not in skip), key=order)
+
+
+def _quiet(stored: dict, plan: LibraryPlan) -> dict[str, int]:
+    """The pass's quiet stops per game (`stored["quiet"]`, {lookup key: count}), kept only for the games still
+    waiting for a lookup; an unreadable count is dropped."""
+    raw = stored.get("quiet") if isinstance(stored.get("quiet"), dict) else {}
+    waiting = {lookup_key(g) for g in plan.lookups}
+    stored["quiet"] = {k: n for k, n in raw.items()
+                       if k in waiting and isinstance(n, int) and not isinstance(n, bool) and n > 0}
+    return stored["quiet"]
 
 
 def _look_up(run, ta, lib: dict, plan: LibraryPlan, overrides: dict[str, dict], now: datetime,
@@ -801,23 +839,28 @@ def _look_up(run, ta, lib: dict, plan: LibraryPlan, overrides: dict[str, dict], 
     each; each game's result goes into the cache. No page there (HTTP 404, or TA's page-not-found page) goes on to
     the next address.
 
-    Failures: what every request would meet (`_everywhere`: the network, Cloudflare, TA unavailable or throttling,
-    the login) stops the lookups quietly for this run, the game not looked up. Anything else (an HTTP error of one
-    address, a page that doesn't parse, any other exception) fails that game's lookup for the pass: an issue naming
-    it and its product ids, the game out of the pass's lookups (`pass["lookup_failed"]`, tried again in the next
-    day's pass), and the next game goes on, until MAX_LOOKUP_ERRORS failures come without a successful lookup between
-    them (`pass["lookup_errors"]`): then the pass looks nothing more up.
+    Failures: what every request would meet stops the lookups quietly for this run, the game not looked up:
+    network, Cloudflare or login trouble (`_everywhere`) as it is, and TA unavailable or throttling at the game's
+    address (`PageUnavailable`: HTTP 429, 502-504, 52x, a page with no game id) counted against the game too
+    (`pass["quiet"]`, carried into the next day's pass while it waits): it goes behind the others of its kind in the
+    next run's queue, and its QUIET_STOPS-th stop is its lookup failure, so one address never pins the queue.
+    Anything else (an HTTP error of one address, a page that doesn't parse, any other exception) fails that game's
+    lookup for the pass: an issue naming it and its product ids, the game out of the pass's lookups
+    (`pass["lookup_failed"]`, tried again from the next day's pass), and the next game goes on, until
+    MAX_LOOKUP_ERRORS failures come without a successful lookup between them (`pass["lookup_errors"]`): then the pass
+    looks nothing more up.
 
-    Order and limits: games never looked up first, then the expired re-lookups, the oldest first (`_queue`); at
-    most cfg.library_lookups games a run and cfg.library_lookups_per_day a UTC day across its runs (every lookup
-    started counts, kept in the pass's "lookups")."""
+    Order and limits: games never looked up first, the newest purchase first, then the expired re-lookups, the
+    oldest first (`_queue`); at most cfg.library_lookups games a run and cfg.library_lookups_per_day a UTC day across
+    its runs (every lookup started counts, kept in the pass's "lookups")."""
     stored = lib["pass"]  # today's pass: read or made by _pass_rows before any lookup
     failed = stored.setdefault("lookup_failed", [])
+    quiet = _quiet(stored, plan)
     if stored.get("lookup_errors", 0) >= MAX_LOOKUP_ERRORS:
         _lookups_stopped(run, res)
         return
     cache = lib.setdefault("pages", {})
-    queue = _queue(lib, plan.lookups, overrides, set(failed))
+    queue = _queue(lib, plan.lookups, overrides, set(failed), quiet)
     per_day = max(run.cfg.library_lookups_per_day, 0)
     for g in queue[:max(run.cfg.library_lookups, 0)]:
         if stored.get("lookups", 0) >= per_day:
@@ -831,6 +874,7 @@ def _look_up(run, ta, lib: dict, plan: LibraryPlan, overrides: dict[str, dict], 
             return
         stored["lookups"] = stored.get("lookups", 0) + 1
         found: list[TAGame] = []
+        slugs: list[str] = []
         try:
             slugs = candidate_slugs(g, override_for(g, overrides))
             for slug in slugs:
@@ -839,33 +883,69 @@ def _look_up(run, ta, lib: dict, plan: LibraryPlan, overrides: dict[str, dict], 
                 if page is not None:
                     found.append(page)
         except Exception as e:  # noqa: BLE001 - whatever stops one game's lookup is that game's, unless it's TA's
+            if isinstance(e, PageUnavailable):
+                _quiet_stop(run, res, lib, quiet, g, e, slugs, now)
+                return
             if _everywhere(e):
                 res.stopped = f"TrueAchievements lookup failed ({type(e).__name__})"
-                run.say(f"library: looking up {g.title} failed ({_err(e)}); lookups stopped, the rest next run",
+                run.say(f"library: looking up {_name(g)} failed ({_said(g, e)}); lookups stopped, the rest next run",
                         logging.WARNING)
                 return
-            _lookup_failed(run, res, stored, g, e)
+            _lookup_failed(run, res, lib, g, e, slugs, now)
             if stored["lookup_errors"] >= MAX_LOOKUP_ERRORS:
                 _lookups_stopped(run, res)
                 return
             continue
         stored["lookup_errors"] = 0
+        quiet.pop(lookup_key(g), None)
         cache[lookup_key(g)] = {"checked": now.isoformat(), "slugs": slugs, "pages": [asdict(p) for p in found]}
         res.looked_up += 1
-        run.say(f"library: looked up {g.title}: "
+        run.say(f"library: looked up {_name(g)}: "
                 + ("; ".join(f"{p.title} [{p.platform or 'no platform'}]" for p in found) or "no TA page"))
 
 
-def _lookup_failed(run, res: LibraryResult, stored: dict, g: OwnedGame, e: Exception) -> None:
+def _quiet_stop(run, res: LibraryResult, lib: dict, quiet: dict[str, int], g: OwnedGame, e: PageUnavailable,
+                slugs: list[str], now: datetime) -> None:
+    """TA unavailable or throttling at the game's address: the lookups stop quietly for this run, and the stop counts
+    against the game, which goes behind the others of its kind next run. Its QUIET_STOPS-th quiet stop, across runs
+    and passes, is its lookup failure (`_lookup_failed`; its count starts again), and the lookups still stop."""
+    key = lookup_key(g)
+    quiet[key] = quiet.get(key, 0) + 1
+    if quiet[key] >= QUIET_STOPS:
+        del quiet[key]
+        _lookup_failed(run, res, lib, g, e, slugs, now, quiet_stops=QUIET_STOPS)
+        if lib["pass"]["lookup_errors"] >= MAX_LOOKUP_ERRORS:
+            _lookups_stopped(run, res)
+            return
+        what = "its lookup failed"
+    else:
+        what = f"quiet stop {quiet[key]} of {QUIET_STOPS} at this game: it waits behind the others"
+    res.stopped = f"TrueAchievements lookup failed ({type(e).__name__})"
+    run.say(f"library: looking up {_name(g)} failed ({_said(g, e)}; {what}); lookups stopped, the rest next run",
+            logging.WARNING)
+
+
+def _lookup_failed(run, res: LibraryResult, lib: dict, g: OwnedGame, e: Exception, slugs: list[str],
+                   now: datetime, *, quiet_stops: int = 0) -> None:
     """One game's failed lookup: an issue naming it and its products, with the message of a TA error (the job's own
-    text) or the exception type alone; the game waits for the next day's pass."""
+    text) or the exception type alone; the game waits at least for the next day's pass. `quiet_stops`: the failure
+    is that many quiet stops at the game (TA unavailable at its address), which TA-wide trouble can cause too, and
+    the issue says so. The cache stamps it failed at its addresses (`slugs`) with the failure's time, never a result:
+    from then on it sorts behind the games never looked up, as a re-lookup by that time (so the newest)."""
+    stored = lib["pass"]
     stored.setdefault("lookup_failed", []).append(lookup_key(g))
     stored["lookup_errors"] = stored.get("lookup_errors", 0) + 1
+    if slugs:  # its addresses under "failed", not "slugs": no image from before the stamp takes it for a result
+        lib.setdefault("pages", {})[lookup_key(g)] = {"checked": now.isoformat(), "failed": list(slugs)}
     res.lookup_failed.append(g.title)
     detail = _err(e) if isinstance(e, TAError) else type(e).__name__
-    run.issue(f"library step: TrueAchievements page lookup failed for {g.title}: {detail}; tried again in the "
-              f"next day's pass. To leave the game out, add a library override \"skip\" for product "
-              f"{', '.join(g.pids)}")
+    skip = f"library override \"skip\" for product {', '.join(g.pids)}"
+    if quiet_stops:
+        what = (f" (its lookup stopped there {quiet_stops} times); if TA was unavailable everywhere, nothing to do: it "
+                f"is tried again tomorrow. If only this game's page fails, to leave the game out, add a {skip}")
+    else:
+        what = f"; tried again from the next day's pass. To leave the game out, add a {skip}"
+    run.issue(f"library step: TrueAchievements page lookup failed for {_name(g)}: {detail}{what}")
 
 
 def _lookups_stopped(run, res: LibraryResult) -> None:
@@ -875,7 +955,7 @@ def _lookups_stopped(run, res: LibraryResult) -> None:
 
 
 def _log_plan(run, res: LibraryResult, owned: int, titles: int, plan: LibraryPlan) -> None:
-    """Counts and titles only: never a product ID, order, price or token."""
+    """Counts and titles only: never a product ID (an untitled product's title is one), order, price or token."""
     adds = sum(a.kind == "add" for a in plan.actions)
     verb = "would" if res.dry_run else "to"
     failed = len(plan.lookups) - res.pending  # games whose lookup failed in this pass: the next day's pass
@@ -887,7 +967,7 @@ def _log_plan(run, res: LibraryResult, owned: int, titles: int, plan: LibraryPla
         for a in plan.actions:
             run.say(f"library: would {a.kind} {a.title} ({', '.join(label for _, label in a.sets)})")
         for r in plan.review:
-            run.say(f"library: check by hand ({r.kind}): {r.title}: {r.reason}")
+            run.say(f"library: check by hand ({r.kind}): {shown_title(r.title, (r.pid,))}: {r.reason}")
     elif plan.review:
         kinds: dict[str, int] = {}
         for r in plan.review:

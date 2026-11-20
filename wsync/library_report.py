@@ -5,6 +5,7 @@ carry counts and titles only. A reporting failure is an issue of its own and nev
 import hashlib
 import json
 
+from wsync.owned import shown_title
 from wsync.report import LIBRARY_CHECK_KEY, LIBRARY_CHECK_TITLE, LIBRARY_REVIEW_KEY, LIBRARY_REVIEW_TITLE, \
     LIBRARY_SIGNIN_KEY, LIBRARY_SIGNIN_TITLE
 
@@ -103,13 +104,18 @@ def check_body(check, seen) -> str | None:
 
 
 def baseline(lib: dict, plan, *, dry: bool) -> None:
-    """Decision A: the first live pass marks every game the plan has not settled as seen, before any write:
-    every review item and every game still waiting for a page lookup. Later runs never change it."""
+    """Decision A: the first live run marks seen the review items present when it starts, from its plan before its
+    lookups and writes: the plan's, and the ones a game waiting for a re-lookup carries from earlier runs (`_lists`),
+    which a dry run already listed. A game waiting for its first lookup is not marked, the ones that run looks up
+    included: a review item such a lookup produces reaches the check task. Later runs never change it."""
     if dry or lib.get("seen") is not None:
         return
     pids = {r.pid for r in plan.review}
+    stored = lib.get("listed") if isinstance(lib.get("listed"), dict) else {}
     for g in plan.lookups:
-        pids.update(g.pids)
+        carried = stored.get(_key(g))
+        if isinstance(carried, dict):
+            pids.update(c[1] for c in carried.get("check") or () if isinstance(c, list) and len(c) > 1)
     lib["seen"] = sorted(pids)
 
 
@@ -164,7 +170,8 @@ def _live(run, res, lib: dict, lists) -> None:
             if sig != lib.get("check_sig"):
                 lib["check_sig"] = sig
                 run.notify(f"Library sync: {len(items)} to check by hand",
-                           "\n".join(f"- {t}" for t, *_ in items) + "\nSee the task in Vikunja (Wishlist Sync).")
+                           "\n".join(f"- {shown_title(t, (p,))}" for t, p, *_ in items)
+                           + "\nSee the task in Vikunja (Wishlist Sync).")
     if res.written:
         run.notify("Library sync", f"+{len(res.written)} TA library\n"
                    + "\n".join(f"- {t}" for t in sorted(res.written)))

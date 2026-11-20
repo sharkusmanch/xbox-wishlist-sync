@@ -44,13 +44,17 @@ class State:
     #   "signin_failed": {"day": "YYYY-MM-DD", "seed": SHA-256 of XBOX_REFRESH_TOKEN}  a sign-in that needed a new
     #              token: not tried again that day with the same seed; removed by a working sign-in;
     #   "pass": {"day": "YYYY-MM-DD", "rows": [OwnedRow as dict], "owned": [OwnedGame as dict], "done": [TA game
-    #            id], "errors": n, "lookups": n, "lookup_failed": [lookup key], "lookup_errors": n}  the TA collection
-    #              and the owned games the day's pass read in its first run, the TA ids it has written since, the
-    #              write-error streak, the page lookups started that day (the daily cap), the games whose lookup
-    #              failed in the pass and the lookup-error streak; dropped when it completes;
+    #            id], "errors": n, "lookups": n, "lookup_failed": [lookup key], "lookup_errors": n, "quiet": {lookup
+    #            key: n}}  the TA collection and the owned games the day's pass read in its first run, the TA ids it
+    #              has written since, the write-error streak, the page lookups started that day (the daily cap), the
+    #              games whose lookup failed in the pass, the lookup-error streak and the quiet stops (TA unavailable
+    #              at a game's address) counted against each game still waiting, which a new day's pass takes over
+    #              from an unfinished one; dropped when it completes;
     #   "lists": {"games-with-gold" | "ea-play": {"fetched": iso, "ids": [TA game id], "tried": iso}};
     #   "pages": {lookup key: {"checked": iso, "slugs": [addresses tried], "pages": [TAGame as dict]}}, each
-    #              reused for its `library.lookup_lifetime`, dropped after 180 days;
+    #              reused for its `library.lookup_lifetime`, dropped after 180 days; a failed lookup is stamped
+    #              {"checked": iso, "failed": [addresses tried]} instead: never a result (no "slugs", so neither
+    #              for an image from before the stamp), it only orders the game behind the games never looked up;
     #   "writing": {TA game id: {"kind", "slug", "ta_id", "title", "sets", "expect" (the labels the plan saw per
     #              field), "pids", "since", "added", "sets_done", "tried" (the pass day a write error kept it)}}
     #              write-ahead: saved before a write's first request and after each, removed after its last;

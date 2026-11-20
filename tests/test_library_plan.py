@@ -363,6 +363,21 @@ def test_a_pc_only_purchase_adds_the_windows_page():
 
 # ------------------------------------------------------------------ lookups, overrides, merging, safety
 
+def test_a_game_with_no_known_generation_is_never_steered_to_the_windows_page():
+    """Not PC-only and no console generation (a bundle's catalog entry lists neither): even with the Windows page
+    found beside the console page, the game is a review; its console entry already in TA is already right; it never
+    matches a Windows entry."""
+    g = owned("Example Heist V: Premium Edition", gen=())
+    console, windows = page(910, "Example Heist V"), page(911, "Example Heist V (Windows)", WIN)
+    p = plan([g], pages=found(g, console, windows))
+    assert p.actions == [] and kinds(p) == ["generation"]
+    p = plan([g], rows=[row(910, "Example Heist V")], pages=found(g, console, windows))
+    assert p.actions == [] and p.review == [] and p.ok == 1 and p.lookups == []
+    p = plan([g], rows=[row(911, "Example Heist V (Windows)", "No longer have", platform="windows")],
+             pages=found(g, console, windows))
+    assert p.actions == [] and kinds(p) == ["generation"]  # the Windows entry isn't this game's: never fixed
+
+
 def test_games_not_looked_up_yet_are_lookups_not_review():
     g = owned("Example Peak")
     p = plan([g])
