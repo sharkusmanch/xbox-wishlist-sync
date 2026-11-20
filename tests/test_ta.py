@@ -1093,28 +1093,54 @@ def test_collection_page_says_whether_the_game_is_in_the_collection():
         c.collection_page("Example-Quest")
 
 
-def test_collection_add_posts_the_pages_own_postback_and_checks_the_remove_button():
-    c, http = logged_in({("GET", EXAMPLE): resp(COLL_GAME), ("POST", EXAMPLE): resp(COLL_GAME_IN)})
+def test_collection_add_uses_the_sites_ajax_add_and_checks_the_remove_button():
+    # TA's own game lists add with GameCollection_UpdateGame and Field "AddGame" (SiteList_AddGame); the game
+    # page's form postback is challenged by Cloudflare for a non-browser client, so it is never posted.
+    c, http = logged_in({("GET", EXAMPLE): [resp(COLL_GAME), resp(COLL_GAME_IN)], ("POST", UPDATE): ajax((200, ok_d()))})
     assert c.collection_add("Example-Quest") == 12345
+    assert http.urls("POST") == ["/ajaxfunctions.aspx/GameCollection_UpdateGame"]
     post = next(x for x in http.calls if x["method"] == "POST")
-    form = parse_qs(post["body"], keep_blank_values=True)
-    assert form["Command"] == ["btnGC_Add"] and form["Argument"] == ["12345"]
-    assert form["__VIEWSTATE"] == ["vs-example&1"] and form["__EVENTVALIDATION"] == ["ev-example"]
-    assert not {"chkSkip", "rdoSkip", "txtPassword", "btnSkip"} & set(form)
-    assert post["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
-    assert post["headers"]["Referer"] == BASE + EXAMPLE and post["headers"]["Origin"] == BASE
-    # a page that still offers Add means the postback was not accepted
-    c, _ = logged_in({("GET", EXAMPLE): resp(COLL_GAME), ("POST", EXAMPLE): resp(COLL_GAME)})
+    assert json.loads(post["body"]) == {"GameCollection_Data": {"GameID": 12345, "GamerID": "42", "HashKey": HASH,
+                                                                "Field": "AddGame"}}
+    assert post["headers"]["X-Requested-With"] == "XMLHttpRequest" and post["headers"]["Origin"] == BASE
+    assert post["headers"]["Content-Type"].startswith("application/json")
+    assert http.urls("GET") == [EXAMPLE, EXAMPLE]  # the page, then the page again to see the add
+    # a page that still offers Add afterwards means the add was not accepted
+    c, _ = logged_in({("GET", EXAMPLE): resp(COLL_GAME), ("POST", UPDATE): ajax((200, ok_d()))})
     with pytest.raises(TAError, match="not accepted"):
         c.collection_add("Example-Quest")
 
 
-def test_collection_add_posts_to_the_page_it_read_after_its_redirects():
+@pytest.mark.parametrize("answer", [{"d": None}, {"d": True}, {"d": ""}, ok_d(), {"d": {"UpdateValue": "Owned"}}])
+def test_collection_add_takes_any_answer_without_errors_and_trusts_the_page(answer):
+    c, http = logged_in({("GET", EXAMPLE): [resp(COLL_GAME), resp(COLL_GAME_IN)], ("POST", UPDATE): ajax((200, answer))})
+    assert c.collection_add("Example-Quest") == 12345
+    assert http.urls("POST") == ["/ajaxfunctions.aspx/GameCollection_UpdateGame"]  # no login round trip
+
+
+def test_collection_add_reports_the_sites_errors():
+    c, http = logged_in({("GET", EXAMPLE): resp(COLL_GAME),
+                         ("POST", UPDATE): ajax((200, {"d": {"success": False, "errors": ["Game not found"]}}))})
+    with pytest.raises(TAError, match="Game not found"):
+        c.collection_add("Example-Quest")
+    assert http.urls("GET") == [EXAMPLE]  # no second read after a refused add
+
+
+def test_collection_add_logs_in_again_once_on_a_logged_out_answer():
+    out = ajax((200, {"d": {"success": False, "errors": ["The gamer must be specified."]}}))
+    c, http = logged_in({**login_routes(), ("GET", EXAMPLE): [resp(COLL_GAME), resp(COLL_GAME_IN)],
+                         ("POST", UPDATE): [out[0], ajax((200, ok_d()))[0]]})
+    assert c.collection_add("Example-Quest") == 12345
+    assert http.urls("POST").count("/login") == 1
+
+
+def test_collection_add_reads_the_page_after_its_redirects_to_check_the_add():
     c, http = logged_in({("GET", "/game/Old-Quest"): resp("", status=301, location="/game/Example-Quest"),
-                         ("GET", EXAMPLE): resp(COLL_GAME), ("POST", EXAMPLE): resp(COLL_GAME_IN)})
+                         ("GET", EXAMPLE): [resp(COLL_GAME), resp(COLL_GAME_IN)], ("POST", UPDATE): ajax((200, ok_d()))})
     assert c.collection_add("Old-Quest") == 12345
+    assert http.urls("GET") == ["/game/Old-Quest", EXAMPLE, EXAMPLE]
     post = next(x for x in http.calls if x["method"] == "POST")
-    assert post["url"] == BASE + EXAMPLE and post["headers"]["Referer"] == BASE + EXAMPLE
+    assert json.loads(post["body"])["GameCollection_Data"]["GameID"] == 12345
 
 
 def test_collection_add_of_a_game_already_listed_posts_nothing():
@@ -1176,9 +1202,10 @@ def test_collection_set_logs_in_again_once_on_a_logged_out_answer():
 
 def test_collection_writes_never_follow_a_redirect():
     c, http = logged_in({("GET", EXAMPLE): resp(COLL_GAME),
-                         ("POST", EXAMPLE): resp("", status=302, location="/elsewhere")})
-    with pytest.raises(TAError):
+                         ("POST", UPDATE): resp("", status=302, location="/elsewhere")})
+    with pytest.raises(TAError, match="HTTP 302"):
         c.collection_add("Example-Quest")
+    assert http.urls("GET") == [EXAMPLE]
     c, http = logged_in({("POST", EDIT): resp("", status=302, location="/login")})
     with pytest.raises(TAError, match="HTTP 302"):
         c.collection_set(12345, "media", "Digital")
@@ -1355,7 +1382,8 @@ def test_network_errors_and_unpassed_challenges_are_unreachable(monkeypatch):
 
 
 def test_collection_add_with_a_game_id_refuses_another_games_page():
-    c, http = logged_in({("GET", EXAMPLE): resp(COLL_GAME), ("POST", EXAMPLE): resp(COLL_GAME_IN)})
+    c, http = logged_in({("GET", EXAMPLE): [resp(COLL_GAME), resp(COLL_GAME), resp(COLL_GAME_IN)],
+                         ("POST", UPDATE): ajax((200, ok_d()))})
     with pytest.raises(TAError, match="12345, not 777"):
         c.collection_add("Example-Quest", game_id=777)
     assert http.urls("POST") == []  # nothing was posted

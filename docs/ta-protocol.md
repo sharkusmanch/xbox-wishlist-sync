@@ -29,6 +29,10 @@ fetch (with `GamerToken`, `HashKey`, ...) sent through it would put those values
   `TAError` (a challenge never reached TA, so repeating a write is safe). Each later request may
   refresh once more. On 2026-11-01 TA answered `curl_cffi` without any challenge, with or without
   a clearance, so FlareSolverr was not needed at all; the client copes either way.
+- **Form POSTs are challenged (2026-11-20).** A form POST to a page (`/login`, a game page's
+  postback) now meets HTTP `403` even with a fresh clearance, while page `GET`s and the AJAX
+  calls (`/ajaxfunctions.aspx/...`) pass. So the collection add uses the site's AJAX add (below),
+  and a fresh login fails: the client lives on its saved session until that expires.
 - A `cf_clearance` that TA itself renews in a `Set-Cookie` replaces the stored one (same user agent).
   The clearance is kept in memory only, never in the session file.
 - FlareSolverr's own API, for reference: `POST <FLARESOLVERR_URL>` with JSON; the answer's
@@ -191,11 +195,16 @@ FlareSolverr).
 Used by the library step (`TAClient.collection_page`, `collection_add`, `collection_set`).
 
 - **Add.** The logged-in game page carries `Postback('btnGC_Add','<id>')` or `btnGC_Remove` (in the
-  collection already). Adding posts the page's own form with `Command=btnGC_Add` and
-  `Argument=<game id>` back to the page's final address (after TA's redirects, e.g. a renamed slug);
-  success is a page containing `Postback('btnGC_Remove','<id>')` afterwards,
-  checked. Both the button's id and, when given, the expected id are checked before posting. A game
-  already in the collection is not posted; a *new* add of one raises `AlreadyListed`.
+  collection already): it gives the game id and says whether the game is listed. The add itself is
+  the AJAX call TA's own game lists use (`SiteList_AddGame` in
+  `/js-responsive/shared/game-collection-rd.min.js`, read 2026-11-20): `GameCollection_UpdateGame`
+  with `GameCollection_Data` = `GameID`, `GamerID`, `HashKey` and `Field: "AddGame"`. Its answer
+  is not relied on (the site's script ignores it); an answer with `errors` fails the add (a
+  logged-out one logs in again once). The page is then read again from its final address (after
+  TA's redirects, e.g. a renamed slug) and must show `Postback('btnGC_Remove','<id>')`. The page's
+  own form postback (`Command=btnGC_Add`) is not used: Cloudflare challenges it (see Transport).
+  Both the button's id and, when given, the expected id are checked before the add. A game
+  already in the collection is not added again; a *new* add of one raises `AlreadyListed`.
 - **EditOptions.** `GameCollection_EditOptions` (the same AJAX endpoint family as the wishlist
   writes, payload `GameCollection_Data` with `GameID`, `HashKey`) returns an HTML fragment with a
   `<select>` per field (`id="<prefix>_<game id>"`; ownership and media). The current choice carries
