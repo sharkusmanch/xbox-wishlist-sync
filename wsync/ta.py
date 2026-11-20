@@ -54,7 +54,6 @@ ONE = "Xbox One"
 _LOGGED_OUT = "the gamer must be specified"
 _ALREADY_LISTED = "already on your wishlist"
 _SKIP_INPUT_TYPES = {"checkbox", "radio", "password"}
-_POSTBACK_SKIP_TYPES = _SKIP_INPUT_TYPES | {"submit", "button", "image"}
 COLLECTION_FIELDS = {"ownership": "ddlOwnershipStatusID", "media": "ddlGameMediaID"}
 
 
@@ -919,9 +918,11 @@ class TAClient:
         return parse_collection_page(self._get(BASE + "/game/" + quote(slug, safe=""), need_login=True).html, slug)
 
     def collection_add(self, slug: str, *, game_id: int | None = None, new: bool = False) -> int:
-        """Add the game to the Game Collection with the page's own postback; returns its TA id. A game already in
-        the collection is left as it is (its id returned), or with `new` raises AlreadyListed. With `game_id`, the
-        page must be that game's. Both checks come before a request is posted."""
+        """Add the game to the Game Collection; returns its TA id. The add is the site's own AJAX call
+        (GameCollection_UpdateGame with Field "AddGame", what TA's game lists use): the game page's form postback
+        is challenged by Cloudflare for a client that isn't a browser. The page is read again afterwards and must
+        show the Remove button. A game already in the collection is left as it is (its id returned), or with `new`
+        raises AlreadyListed. With `game_id`, the page must be that game's. Both checks come before the add."""
         url = BASE + "/game/" + quote(slug, safe="")
         p = self._get(url, need_login=True)
         game, have = parse_collection_page(p.html, slug)
@@ -931,16 +932,12 @@ class TAClient:
             if new:
                 raise AlreadyListed(f"collection add of {slug!r}: game {game.id} is already in the collection")
             return game.id
-        form = login_form(p.html, _POSTBACK_SKIP_TYPES)
-        form.update({"Command": "btnGC_Add", "Argument": str(game.id)})
-        # the postback goes back to the page that was read: its final address, after TA's redirects
-        r, _ = self._send("POST", p.url, urlencode(form), {
-            "Content-Type": "application/x-www-form-urlencoded", "Origin": BASE, "Referer": p.url,
-        }, follow=False)
-        if r.status >= 300:
-            raise TAError(f"collection add of {slug!r} answered HTTP {r.status}")
-        if f"Postback('btnGC_Remove','{game.id}')" not in r.text:
-            raise TAError(f"collection add of {slug!r} was not accepted (no Remove button afterwards)")
+        what = f"collection add of {slug!r}"
+        self._collection_ajax(what, "GameCollection_UpdateGame", game.id, {}, {"Field": "AddGame"}, any_answer=True)
+        # read back from the page's final address (after TA's redirects, e.g. a renamed slug)
+        after, listed = parse_collection_page(self._get(p.url, need_login=True).html, slug)
+        if after.id != game.id or not listed:
+            raise TAError(f"{what} was not accepted (no Remove button afterwards)")
         return game.id
 
     def collection_set(self, game_id: int, field_name: str, label: str, expect=None) -> bool:
@@ -970,8 +967,10 @@ class TAClient:
             raise TAError(f"{what}: TA answered {got!r}, expected {chosen!r}")
         return True
 
-    def _collection_ajax(self, what: str, method: str, game_id: int, extra: dict, data: dict | None = None):
-        """One GameCollection_* call: its `d`, logging in again once on a logged-out answer."""
+    def _collection_ajax(self, what: str, method: str, game_id: int, extra: dict, data: dict | None = None, *,
+                         any_answer: bool = False):
+        """One GameCollection_* call: its `d`, logging in again once on a logged-out answer. With `any_answer`, an
+        answer without errors is taken whatever its shape (AddGame's isn't relied on: the caller reads the page)."""
         relogged = False
         while True:
             hash_key, gamer_id = self._cookies.get("HashKey"), self._cookies.get("GamerID")
@@ -998,6 +997,8 @@ class TAClient:
                     if _LOGGED_OUT not in text.lower():
                         raise TAError(f"{what} failed: {text[:200]}")
                 elif isinstance(d, (dict, str)) and not (isinstance(d, str) and _LOGGED_OUT in d.lower()):
+                    return d
+                elif any_answer and not isinstance(d, (dict, str)):
                     return d
             if relogged:
                 raise AuthError(f"{what}: TrueAchievements session not accepted after a fresh login")
