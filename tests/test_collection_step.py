@@ -6,13 +6,14 @@ from datetime import time as dtime, timedelta
 
 import pytest
 
+from test_library_step import FakeXbox
 from test_run import NOW, SECRETS, FakeDeku, FakeTA, Harness, basic
 from wsync.deku import AuthError as DekuAuthError
 from wsync.deku import DekuError, DekuNetworkError, DekuPartialOwn, DekuRateLimited, OwnedDetail
 from wsync.errors import TAError
 from wsync.run import Terminated
 from wsync.state import load_state, save_state, State
-from wsync.ta import IncompleteRead
+from wsync.ta import BudgetSpent, IncompleteRead, TAGame, Unreachable
 from wsync.ta_coll import OwnedRow
 
 SX, ONE, X360 = "xbox-series-x-s", "xbox-one", "xbox-360"
@@ -1059,3 +1060,157 @@ def test_a_360_original_is_added_beside_its_xbox_one_remaster(tmp_path):
                                ("own", "example-saga-definitive-edition", "digital", "xbox_one")]
     assert cache(h)["42"]["slug"] == "example-saga"
     assert cache(h)["7"]["slug"] == "example-saga-definitive-edition"
+
+
+# --------------------------------------------------------------------------- the TA request budget
+
+
+@pytest.mark.parametrize("how", ["admission", "request"])
+def test_collection_read_not_admitted_stamps_nothing(tmp_path, caplog, how):
+    """No room in the collection share for a TA collection read (admitted with its pages + 2 requests: 20 when no
+    earlier read tells the size), or a refused request during it: no last_attempt (no 6 h back-off), no issue and no
+    budget task (a spent collection share only warns); the next run with room reads."""
+    caplog.set_level(logging.INFO)
+    h = live(tmp_path, GAMES, [row(1, "Alpha Quest")])
+    if how == "admission":
+        h.cfg.ta_budget_collection = 19
+    else:
+        h.ta.fail_collection = BudgetSpent("the daily TrueAchievements request budget is spent (collection step)")
+    assert h.run() == 0
+    assert h.ta.collection_calls == (0 if how == "admission" else 1)
+    assert owns(h) == [] and [c for c in h.deku.calls if c[0] != "sleep"] == []
+    assert load_state(h.cfg.state).ta_collection == {}
+    assert h.reporter.notes == [] and h.reporter.budget_tasks == []
+    said = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(m.startswith("collection: ") and "a later run" in m for m in said)
+    h.cfg.ta_budget_collection = 40
+    h.ta.fail_collection = None
+    h.now = NOW + timedelta(minutes=30)
+    assert h.run() == 0 and owns(h) == [("own", "alpha-quest", "digital", "xbox_series")]
+
+
+def test_the_collection_read_is_admitted_by_the_last_reads_size(tmp_path):
+    rows = [row(i, f"Example Owned {i}") for i in range(1, 151)]  # 150 titles: the page, 2 list pages, a login's 2
+    h = only_collection(tmp_path, {}, rows, ta_budget_collection=4)
+    save_state(h.cfg.state, State(ta_collection={"fetched": (NOW - timedelta(days=2)).isoformat(),
+                                                 "rows": [r.__dict__ for r in rows]}))
+    assert h.run() == 0 and h.ta.collection_calls == 0
+    h.cfg.ta_budget_collection = 5
+    assert h.run() == 0 and h.ta.collection_calls == 1
+
+
+# --------------------------------------------------------------------------- the library step's read, handed over
+
+CQ = "9ZZCOLQ000"  # the fictional Store products below: CQ + "01", CQ + "02", ...
+DELTA = {**GAMES, "delta-voyage": ("Delta Voyage", {"xbox_one"})}
+
+
+def with_library(tmp_path, rows, **cfg):
+    """The daily run as scheduled: the library step (live), then the Deku collection step (live), no wishlists, at
+    13:07 UTC, past 12:30 (WSYNC_LIBRARY_AFTER and WSYNC_TA_READ_AFTER: TA's own purchase import). The Deku step's
+    last TA read is yesterday's, so this run needs a new one. Microsoft owns Alpha Quest, which TA has right."""
+    times = {"library_after": dtime(12, 30), "ta_read_after": dtime(12, 30), **cfg}
+    h = live(tmp_path, DELTA, rows, library=True, library_dry_run=False, xbox_refresh_token="rt-seed-Cq9", **times)
+    h.xbox = FakeXbox()
+    h.xbox.own(f"{CQ}01", "Alpha Quest")
+    h.now = NOW.replace(hour=13, minute=7)
+    save_state(h.cfg.state, State(ta_collection={"fetched": (h.now - timedelta(days=1)).isoformat(),
+                                                 "rows": [row(1, "Alpha Quest").__dict__]}))
+    return h
+
+
+def time_passes_after_the_first_read(h, then):
+    """The library step's TA collection read takes the run's clock to `then`, where the Deku step starts."""
+    real = h.ta.collection
+
+    def read():
+        rows = real()
+        h.now = then
+        return rows
+
+    h.ta.collection = read
+
+
+def messages(caplog):
+    return [r.getMessage() for r in caplog.records]
+
+
+def test_collection_step_reuses_the_library_read_when_no_write(tmp_path, caplog):
+    """The library's pass read the TA collection in this run and wrote nothing to TA (its lookups go on next run): the
+    Deku step takes that read as its own, without a second read, stores it with the library's read time and says
+    so."""
+    caplog.set_level(logging.INFO)
+    h = with_library(tmp_path, [row(1, "Alpha Quest"), row(3, "Gamma Tale")], library_lookups=1)
+    h.xbox.own(f"{CQ}02", "Example Unlisted One")  # two games TA has no page for: one lookup now, one next run
+    h.xbox.own(f"{CQ}03", "Example Unlisted Two")
+    read_at = h.now
+    time_passes_after_the_first_read(h, read_at + timedelta(minutes=2))
+    assert h.run() == 0
+    assert h.ta.collection_calls == 1 and h.ta.writes == []
+    state = load_state(h.cfg.state)
+    assert state.library["pass"]["day"] == "2026-11-01" and "last_pass" not in state.library  # the pass goes on
+    assert state.ta_collection == {"fetched": read_at.isoformat(), "rows": [r.__dict__ for r in h.ta.owned_rows]}
+    assert "collection: TrueAchievements collection from this run's library read (2 titles)" in messages(caplog)
+    assert owns(h) == [("own", "alpha-quest", "digital", "xbox_series"),
+                       ("own", "gamma-tale", "digital", "xbox_series")]
+    h.now = NOW.replace(hour=14, minute=7)  # the pass's next run reuses its stored read: no hand-off, the cache holds
+    assert h.run() == 0 and h.ta.collection_calls == 1
+    assert load_state(h.cfg.state).ta_collection["fetched"] == read_at.isoformat()
+
+
+@pytest.mark.parametrize("how", ["write", "partial write", "completed leftover"])
+def test_collection_step_reads_again_after_a_library_write(tmp_path, caplog, how):
+    """A TA write by the library in this run (one made, one stopped part-way, or the rest of one an earlier run left
+    unfinished) leaves the library's read out of date: the Deku step reads the collection again, so the library's
+    writes reach Deku the same day."""
+    caplog.set_level(logging.INFO)
+    rows = [row(1, "Alpha Quest")]
+    if how == "write":  # TA says the owner no longer has Delta Voyage: the library fixes it to Owned
+        rows.append(row(2, "Delta Voyage", ONE, ownership="No longer have"))
+    elif how == "completed leftover":  # an add that reached TA before an earlier run stopped; its media is still blank
+        rows.append(row(2, "Delta Voyage", ONE, media=""))
+    h = with_library(tmp_path, rows)
+    if how == "completed leftover":
+        state = load_state(h.cfg.state)
+        state.library["writing"] = {"2": {"kind": "add", "slug": "Delta-Voyage", "ta_id": 2, "title": "Delta Voyage",
+                                          "sets": [["ownership", "Owned"], ["media", "Digital"]],
+                                          "expect": {"ownership": ["Owned"], "media": [""]}, "pids": [f"{CQ}02"],
+                                          "since": (h.now - timedelta(days=1)).isoformat(), "added": True,
+                                          "sets_done": ["ownership"]}}
+        save_state(h.cfg.state, state)
+    else:
+        h.xbox.own(f"{CQ}02", "Delta Voyage", gen=("ConsoleGen8",))
+    if how == "partial write":  # a new add whose media set stops the writes after the add reached TA
+        h.ta.pages["Delta-Voyage"] = TAGame(2, "Delta Voyage", "Xbox One", "Delta-Voyage", ("Xbox One",))
+        h.ta.fail_set[(2, "media")] = Unreachable("TrueAchievements did not answer")
+    assert h.run() == 0
+    library_writes = {"write": [("gc-set", 2, "ownership", "Owned")],
+                      "partial write": [("gc-add", "Delta-Voyage")],  # Owned already; the media set never got through
+                      "completed leftover": [("gc-set", 2, "media", "Digital")]}
+    assert h.ta.writes == library_writes[how]
+    assert h.ta.collection_calls == 2  # the library's read, then the Deku step's own, after the write
+    st = load_state(h.cfg.state).ta_collection
+    assert st == {"fetched": h.now.isoformat(), "rows": [r.__dict__ for r in h.ta.owned_rows]}
+    fmt = None if how == "partial write" else "digital"
+    assert owns(h) == [("own", "alpha-quest", "digital", "xbox_series"), ("own", "delta-voyage", fmt, "xbox_one")]
+    said = messages(caplog)
+    assert ("collection: not using this run's library read of the TrueAchievements collection: the library wrote to "
+            "TrueAchievements after it") in said
+    assert not any("from this run's library read" in m for m in said)
+
+
+def test_collection_step_reads_again_when_the_library_read_predates_the_boundary(tmp_path, caplog):
+    """The library read the TA collection at 12:29 and the run reached the Deku step at 12:31, past its daily read
+    time (12:30, after TA's own purchase import): the library's read may predate the import, so the step reads
+    again."""
+    caplog.set_level(logging.INFO)
+    h = with_library(tmp_path, [row(1, "Alpha Quest")], library_after=dtime(12, 0))
+    h.now = NOW.replace(hour=12, minute=29)
+    time_passes_after_the_first_read(h, NOW.replace(hour=12, minute=31))
+    assert h.run() == 0
+    assert h.ta.collection_calls == 2
+    assert load_state(h.cfg.state).ta_collection["fetched"] == NOW.replace(hour=12, minute=31).isoformat()
+    said = messages(caplog)
+    assert ("collection: not using this run's library read of the TrueAchievements collection: made before the "
+            "daily read time (12:30 UTC)") in said
+    assert not any("from this run's library read" in m for m in said)

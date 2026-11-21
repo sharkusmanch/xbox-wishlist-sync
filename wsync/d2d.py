@@ -2,7 +2,7 @@
 
 Two community sources, neither official:
   - TrueAchievements' two Disc to Digital lists ("converts" and "unsupported"), a few
-    pages each, fetched through the TA client and cached for 24 hours.
+    pages each, fetched through the TA client and cached for 7 days (a failed refresh backs off: 7 days with a copy, 24 hours without).
   - XCT.live, queried per wishlist game only (its terms allow per-query use, never bulk
     paging), cached for 7 days and capped per run.
 
@@ -16,7 +16,6 @@ import html
 import json
 import logging
 import re
-import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -30,7 +29,8 @@ TA_BASE = "https://www.trueachievements.com"
 TA_LISTS = {"yes": "/disc-to-digital/games", "no": "/disc-to-digital-unsupported/games"}
 TA_MIN_TITLES = 50
 TA_MAX_PAGES = 30
-TA_TTL = timedelta(hours=24)
+TA_TTL = timedelta(days=7)
+TA_RETRY_NO_COPY = timedelta(hours=24)
 
 XCT_API = "https://xct.live/api/v1/d2d"
 XCT_UA = "xbox-wishlist-sync/1.0 (personal use)"
@@ -62,6 +62,11 @@ class D2DError(Exception):
 
 class XctIncomplete(D2DError):
     """XCT is rebuilding its index and had no match: not evidence the game is unlisted."""
+
+
+class D2DWaiting(Exception):
+    """No copy of TA's lists, and the read after a failed one waits (TA_RETRY_NO_COPY): no verdicts this run. Nothing
+    was sent; the run that failed raised the issue, so the caller keeps its cached verdicts quietly."""
 
 
 class Fetcher(Protocol):
@@ -100,12 +105,10 @@ def ta_last_page(page: str, path: str) -> int:
     return max([1] + [int(n) for n in nums])
 
 
-def _fetch_ta_list(fetch: Fetcher, path: str, pause: float) -> list[str]:
+def _fetch_ta_list(fetch: Fetcher, path: str) -> list[str]:
     titles: list[str] = []
     last = 1
     for n in range(1, TA_MAX_PAGES + 1):
-        if n > 1 and pause:
-            time.sleep(pause)
         page = fetch.get_html(f"{TA_BASE}{path}" + (f"?page={n}" if n > 1 else ""))
         if n == 1 and f'href="{TA_BASE}{path}"' not in page:
             raise D2DError(f"TrueAchievements did not return {path} (challenge not cleared?)")
@@ -121,10 +124,10 @@ def _fetch_ta_list(fetch: Fetcher, path: str, pause: float) -> list[str]:
     return titles
 
 
-def fetch_ta_lists(fetch: Fetcher, *, pause: float = 1.0) -> dict:
+def fetch_ta_lists(fetch: Fetcher) -> dict:
     """{"yes": [...], "no": [...]}: the converts and the unsupported lists, all pages."""
     return {
-        status: _fetch_ta_list(fetch, path, pause)
+        status: _fetch_ta_list(fetch, path)
         for status, path in TA_LISTS.items()
     }
 
@@ -238,18 +241,42 @@ def _age(value: str | None, now: datetime) -> timedelta | None:
         return None
 
 
-def _ta_lists(state: State, fetch: Fetcher, now: datetime, pause: float) -> dict:
+def _ta_lists(state: State, fetch: Fetcher, now: datetime) -> dict:
+    """The TA lists: the cached copy for 7 days, then one refresh attempt.
+
+    A failed attempt is stamped `tried`: with a copy the next attempt waits 7 days and the copy
+    is served; with none it waits 24 hours, the first failure raising and the runs inside the
+    wait raising D2DWaiting (no lists: no verdict rests on XCT alone). A TAPaused (nothing was
+    sent) serves the copy, or with none passes through; it stamps nothing. A success replaces the
+    whole record, clearing `tried`.
+    """
+    from .ta import TAPaused  # ta imports this module
+
     cached = state.ta_lists or {}
     have = isinstance(cached.get("yes"), list) and isinstance(cached.get("no"), list)
     age = _age(cached.get("fetched"), now)
     if have and age is not None and age < TA_TTL:
         return cached
-    try:
-        lists = fetch_ta_lists(fetch, pause=pause)
-    except Exception:
-        # A stale list beats none; with nothing cached the run can't judge, so fail loudly.
+    since_try = _age(cached.get("tried"), now)
+    if since_try is not None and since_try < (TA_TTL if have else TA_RETRY_NO_COPY):
         if have:
             return cached
+        due = _parse_time(cached["tried"]) + TA_RETRY_NO_COPY
+        raise D2DWaiting(f"no copy of the TrueAchievements lists and the last read failed; next read from "
+                         f"{due.astimezone(timezone.utc):%Y-%m-%d %H:%M} UTC")
+    try:
+        lists = fetch_ta_lists(fetch)
+    except TAPaused as e:
+        if not have:
+            raise
+        log.warning("d2d: TrueAchievements Disc to Digital lists not refreshed (%s); using the copy read %s",
+                    type(e).__name__, str(cached.get("fetched") or "?")[:10])
+        return cached
+    except Exception:
+        # A stale list beats none; with nothing cached the run can't judge, so fail loudly (once).
+        state.ta_lists = {**cached, "tried": now.isoformat()}
+        if have:
+            return state.ta_lists
         raise
     state.ta_lists = {"fetched": now.isoformat(), **lists}
     return state.ta_lists
@@ -272,8 +299,6 @@ def refresh_verdicts(
     fetch: Fetcher,
     http_get: Callable[[str, dict], dict] | None,
     now: datetime,
-    *,
-    pause: float = 1.0,
 ) -> dict[str, str | None]:
     """productId -> verdict (yes / no / disputed / None). Mutates state.ta_lists and state.d2d.
 
@@ -283,7 +308,7 @@ def refresh_verdicts(
     that ends incomplete or in an error keeps any older answer. Items without a fresh answer
     fall back to the last cached XCT answer, else TA alone, and are retried on later runs.
     """
-    lists = _ta_lists(state, fetch, now, pause)
+    lists = _ta_lists(state, fetch, now)
     yes_keys, no_keys = _keys(lists["yes"]), _keys(lists["no"])
 
     def entry_of(pid: str) -> dict | None:

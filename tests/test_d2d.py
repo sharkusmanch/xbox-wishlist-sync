@@ -116,7 +116,7 @@ def build_pages(n_yes=120, n_no=60, per_page=50):
 
 def test_fetch_ta_lists_follows_pages():
     fetch = FakeFetch(build_pages())
-    lists = d2d.fetch_ta_lists(fetch, pause=0)
+    lists = d2d.fetch_ta_lists(fetch)
     assert len(lists["yes"]) == 120 and len(lists["no"]) == 60
     assert lists["yes"][0] == "Y Game 0" and lists["no"][-1] == "N Game 59"
     assert fetch.urls == [
@@ -130,16 +130,16 @@ def test_fetch_ta_lists_follows_pages():
 
 def test_fetch_ta_lists_rejects_short_list():
     with pytest.raises(d2d.D2DError, match="only 10"):
-        d2d.fetch_ta_lists(FakeFetch(build_pages(n_yes=10)), pause=0)
+        d2d.fetch_ta_lists(FakeFetch(build_pages(n_yes=10)))
     with pytest.raises(d2d.D2DError, match="only 49"):
-        d2d.fetch_ta_lists(FakeFetch(build_pages(n_no=49)), pause=0)
+        d2d.fetch_ta_lists(FakeFetch(build_pages(n_no=49)))
 
 
 def test_fetch_ta_lists_rejects_wrong_page():
     pages = build_pages()
     pages["https://www.trueachievements.com/disc-to-digital/games"] = "<html>Just a moment...</html>"
     with pytest.raises(d2d.D2DError, match="did not return"):
-        d2d.fetch_ta_lists(FakeFetch(pages), pause=0)
+        d2d.fetch_ta_lists(FakeFetch(pages))
 
 
 # ---------------------------------------------------------------- xct_lookup
@@ -314,9 +314,9 @@ def test_refresh_ta_membership_strips_platform_suffix_and_edition():
 
 
 def test_refresh_refetches_stale_ta_lists_and_stores_them():
-    state = fresh_state(age=timedelta(hours=25))
+    state = fresh_state(age=timedelta(days=8))
     fetch = FakeFetch(build_pages())
-    out = d2d.refresh_verdicts([item("A", "Y Game 3")], state, fetch, FakeXct({}), NOW, pause=0)
+    out = d2d.refresh_verdicts([item("A", "Y Game 3")], state, fetch, FakeXct({}), NOW)
     assert out == {"A": "yes"}
     assert fetch.urls
     assert state.ta_lists["fetched"] == NOW.isoformat()
@@ -324,13 +324,13 @@ def test_refresh_refetches_stale_ta_lists_and_stores_them():
 
 
 def test_refresh_stale_lists_used_when_refetch_fails():
-    state = fresh_state(age=timedelta(hours=30))
+    state = fresh_state(age=timedelta(days=8))
 
     class Broken:
         def get_html(self, url):
             raise OSError("boom")
 
-    out = d2d.refresh_verdicts([item("A", "Alan Wake 2")], state, Broken(), FakeXct({}), NOW, pause=0)
+    out = d2d.refresh_verdicts([item("A", "Alan Wake 2")], state, Broken(), FakeXct({}), NOW)
     assert out == {"A": "yes"}
     assert state.ta_lists["fetched"] != NOW.isoformat()
 
@@ -341,7 +341,7 @@ def test_refresh_no_lists_and_fetch_fails_raises():
             raise OSError("boom")
 
     with pytest.raises(OSError):
-        d2d.refresh_verdicts([item("A", "X")], State(), Broken(), FakeXct({}), NOW, pause=0)
+        d2d.refresh_verdicts([item("A", "X")], State(), Broken(), FakeXct({}), NOW)
 
 
 def test_refresh_dlc_skipped():
@@ -599,3 +599,82 @@ def test_refresh_logs_outcome_counts(caplog, monkeypatch):
     items = [item(f"P{i}", t) for i, t in enumerate(["Hit", "Missing", "Busy", "Broken", "Later", "Later 2"])]
     d2d.refresh_verdicts(items, state, never_fetch(), http, NOW)
     assert "hit 1, unlisted 1, incomplete 1, error 1, deferred 2" in caplog.text
+
+
+# ---------------------------------------------------------------- weekly refresh with back-off
+
+
+class _Broken:
+    def __init__(self, exc=None):
+        self.calls = 0
+        self.exc = exc or OSError("boom")
+
+    def get_html(self, url):
+        self.calls += 1
+        raise self.exc
+
+
+def test_lists_refresh_weekly():
+    assert d2d.TA_TTL == timedelta(days=7)
+    state = fresh_state(age=timedelta(days=6))
+    d2d.refresh_verdicts([item("A", "X")], state, never_fetch(), FakeXct({}), NOW)
+    stale = fresh_state(age=timedelta(days=8))
+    fetch = FakeFetch(build_pages())
+    d2d.refresh_verdicts([item("A", "X")], stale, fetch, FakeXct({}), NOW)
+    assert fetch.urls
+
+
+def test_failed_refresh_with_a_copy_waits_7_days_and_serves_the_copy():
+    state = fresh_state(age=timedelta(days=8))
+    b = _Broken()
+    out = d2d.refresh_verdicts([item("A", "Alan Wake 2")], state, b, FakeXct({}), NOW)
+    assert out == {"A": "yes"} and b.calls == 1
+    assert state.ta_lists["tried"] == NOW.isoformat()
+    later = NOW + timedelta(days=6)
+    out = d2d.refresh_verdicts([item("A", "Alan Wake 2")], state, never_fetch(), FakeXct({}), later)
+    assert out == {"A": "yes"}
+    after = NOW + timedelta(days=7, minutes=1)
+    b2 = _Broken()
+    d2d.refresh_verdicts([item("A", "Alan Wake 2")], state, b2, FakeXct({}), after)
+    assert b2.calls == 1
+
+
+def test_failed_refresh_without_a_copy_raises_once_then_waits_24h_quietly():
+    """With no copy, the first failure raises (the run's issue). The runs inside the 24 h wait have no lists either:
+    D2DWaiting, with nothing sent to TA or XCT.live, so no verdict rests on XCT.live alone (the run keeps its cached
+    verdicts and makes no Deku format changes, quietly)."""
+    state = State()
+    with pytest.raises(OSError):
+        d2d.refresh_verdicts([item("A", "X")], state, _Broken(), FakeXct({}), NOW)
+    xct = FakeXct({})
+    with pytest.raises(d2d.D2DWaiting):
+        d2d.refresh_verdicts([item("A", "X")], state, never_fetch(), xct, NOW + timedelta(hours=23))
+    assert xct.calls == [] and state.d2d == {}
+    b = _Broken()
+    with pytest.raises(OSError):
+        d2d.refresh_verdicts([item("A", "X")], state, b, FakeXct({}), NOW + timedelta(hours=25))
+    assert b.calls == 1
+
+
+def test_success_clears_tried():
+    state = fresh_state(age=timedelta(days=8))
+    state.ta_lists["tried"] = (NOW - timedelta(days=8)).isoformat()
+    d2d.refresh_verdicts([item("A", "X")], state, FakeFetch(build_pages()), FakeXct({}), NOW)
+    assert "tried" not in state.ta_lists and state.ta_lists["fetched"] == NOW.isoformat()
+
+
+def test_a_paused_ta_serves_a_stale_copy_and_without_one_is_reraised_without_a_tried_stamp():
+    """A refresh held back (TAPaused: nothing was sent) serves the copy it has, as a failed refresh would, but stamps
+    nothing, so a later run with room refreshes it; with no copy the pause passes through."""
+    from wsync.ta import BudgetSpent
+
+    state = fresh_state(yes=("Yonder Quest",), age=timedelta(days=8))
+    before = copy.deepcopy(state.ta_lists)
+    b = _Broken(BudgetSpent("spent"))
+    out = d2d.refresh_verdicts([item("A", "Yonder Quest")], state, b, FakeXct({}), NOW)
+    assert out == {"A": "yes"} and b.calls == 1  # the copy's verdict
+    assert state.ta_lists == before  # untouched: no "tried" stamp
+    state = State()
+    with pytest.raises(BudgetSpent):
+        d2d.refresh_verdicts([item("A", "X")], state, _Broken(BudgetSpent("spent")), FakeXct({}), NOW)
+    assert "tried" not in state.ta_lists

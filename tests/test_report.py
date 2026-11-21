@@ -522,3 +522,32 @@ def test_library_tasks_survive_the_problem_sync():
     assert {t["title"] for t in fake.tasks.values() if not t["done"]} == {LIBRARY_CHECK_TITLE, LIBRARY_SIGNIN_TITLE}
     assert library_task(vk_with(fake), LIBRARY_CHECK_KEY, LIBRARY_CHECK_TITLE, None) is False  # None closes it
     assert [t["title"] for t in fake.tasks.values() if not t["done"]] == [LIBRARY_SIGNIN_TITLE]
+
+
+def test_the_ta_budget_task_survives_the_problem_sync_and_closes_on_none():
+    from wsync.report import TA_BUDGET_KEY, TA_BUDGET_TITLE, _REVIEW_KEYS, ta_budget_task
+
+    assert TA_BUDGET_KEY == "ta-budget" and TA_BUDGET_KEY in _REVIEW_KEYS
+    fake = FakeVikunja()
+    assert ta_budget_task(vk_with(fake), "spent") is True
+    assert ta_budget_task(vk_with(fake), "spent") is False
+    task = next(iter(fake.tasks.values()))
+    assert task["title"] == TA_BUDGET_TITLE == "TrueAchievements request budget spent"
+    assert f"wsync-key: {TA_BUDGET_KEY}" in task["description"]
+    sync_problem_tasks(vk_with(fake), [])  # not a problem task: the problem sync leaves it open
+    assert not any(t["done"] for t in fake.tasks.values())
+    assert ta_budget_task(vk_with(fake), None) is False
+    assert all(t["done"] for t in fake.tasks.values())
+
+
+def test_the_ta_budget_body_names_what_is_spent_and_when_it_resets():
+    from wsync.report import ta_budget_body
+
+    body = ta_budget_body("2026-11-20", [("wishlist", 80, 80)])
+    first = body.splitlines()[0]
+    assert first == ("TrueAchievements request budget spent: wishlist 80/80; TA work paused until 2026-11-21 "
+                     "00:00 UTC.")
+    assert "closes itself" in body and "WSYNC_TA_DAILY_BUDGET" in body
+    both = ta_budget_body("2026-12-31", [("wishlist", 80, 80), ("ceiling", 300, 300)])
+    assert both.startswith("TrueAchievements request budget spent: wishlist 80/80, ceiling 300/300; TA work "
+                           "paused until 2027-01-01 00:00 UTC.")

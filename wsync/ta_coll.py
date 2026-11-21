@@ -20,6 +20,7 @@ from html.parser import HTMLParser
 from urllib.parse import quote
 
 PER_PAGE = 100  # TrueAchievements caps an AjaxList page at 100 rows
+READ_UNKNOWN = 20  # TA requests a collection read is admitted with when no earlier read tells its size
 # Columns switched on, on top of the gamer's saved column choices.
 EXTRA_COLS = ("Platform", "Ownershipstatus", "Media", "Releasedate")  # Releasedate is headed "Released"
 # Filters set to fixed values whatever view the gamer saved on the site, so a narrowed view can't
@@ -140,6 +141,14 @@ def list_url(base_url: str, filters, page_no: int) -> str:
     params = "oGameCollection|" + f.replace("|", "/\\pipe\\/")  # ff.SafeParam
     return (base_url + "?executeformfunction&function=AjaxList&params="
             + quote(params, safe="-_.!~*'()"))
+
+
+def read_requests(titles: int | None) -> int:
+    """The TA requests a whole collection read (`TAClient.collection`) is admitted with: its pages (the collection
+    page, then one list page per PER_PAGE titles) plus 2 (a login's); READ_UNKNOWN without an earlier read's size."""
+    if not titles or titles < 0:
+        return READ_UNKNOWN
+    return 1 + -(-titles // PER_PAGE) + 2
 
 
 def _cell_text(cell: str) -> str:

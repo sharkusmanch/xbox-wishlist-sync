@@ -11,7 +11,11 @@ from pathlib import Path
 
 @dataclass
 class State:
-    # productId -> {"deku": uuid|None, "deku_slug": str|None, "ta": {"game": int, "dlc": int}|None}
+    # productId -> {"deku": uuid|None, "deku_slug": str|None, "ta": {"game": int, "dlc": int}|None}, plus the TA
+    # lookups kept until due (see wsync.run): "ta_miss": {"status": "none"|"ambiguous", "candidates", "checked": iso,
+    # "key": [base title, kind, product kind, TA override or None]}; "ta_override_miss": {"slug", "title", "kind",
+    # "checked"} (an override page still a placeholder); "ta_backoff": {"failures": n, "until": iso, "key": as
+    # "ta_miss"'s} (a back-off for another key is ignored)
     mapping: dict[str, dict] = field(default_factory=dict)
     # productId -> {"verdict": str, "checked": iso}
     d2d: dict[str, dict] = field(default_factory=dict)
@@ -22,8 +26,9 @@ class State:
     ta_game_ids: dict[str, int] = field(default_factory=dict)
     # digest of the last run's failure (None after a clean run): failure pings are deduplicated
     last_failure: str | None = None
-    # Deku collection step. {"fetched": iso, "rows": [OwnedRow as dict]}: the last full TA read, plus
-    # {"last_attempt": iso, "error": str} after a failed read (the next try waits 6 h)
+    # Deku collection step. {"fetched": iso, "rows": [OwnedRow as dict]}: the last full TA read (its own, or the library
+    # step's read of the same run, with that read's time), plus {"last_attempt": iso, "error": str} after a failed read
+    # (the next try waits 6 h)
     ta_collection: dict = field(default_factory=dict)
     # TA game id (as text) -> {"status": "matched"|"added"|"found"|"none", "slug": str|None, "checked": iso,
     #                          "title": str, ...}  (see wsync.collection)
@@ -45,12 +50,15 @@ class State:
     #              token: not tried again that day with the same seed; removed by a working sign-in;
     #   "pass": {"day": "YYYY-MM-DD", "rows": [OwnedRow as dict], "owned": [OwnedGame as dict], "done": [TA game
     #            id], "errors": n, "lookups": n, "lookup_failed": [lookup key], "lookup_errors": n, "quiet": {lookup
-    #            key: n}}  the TA collection and the owned games the day's pass read in its first run, the TA ids it
-    #              has written since, the write-error streak, the page lookups started that day (the daily cap), the
-    #              games whose lookup failed in the pass, the lookup-error streak and the quiet stops (TA unavailable
-    #              at a game's address) counted against each game still waiting, which a new day's pass takes over
-    #              from an unfinished one; dropped when it completes;
-    #   "lists": {"games-with-gold" | "ea-play": {"fetched": iso, "ids": [TA game id], "tried": iso}};
+    #            key: n}}  the TA collection and the owned games the day's pass read in its first run (the owned
+    #              games kept as soon as Microsoft is read, before the TA reads), the TA ids it has written since, the
+    #              write-error streak, the page lookups started that day (the daily cap), the games whose lookup
+    #              failed in the pass, the lookup-error streak and the quiet stops (TA unavailable at a game's address)
+    #              counted against each game still waiting, which a new day's pass takes over from an unfinished one;
+    #              dropped when it completes;
+    #   "lists": {"games-with-gold" | "ea-play": {"fetched": iso, "ids": [TA game id], "tried": iso}}  Games with Gold
+    #              read only without a copy (delete it to read it again), EA Play every 30 days; "tried": a failed
+    #              refresh, tried again 24 h later;
     #   "pages": {lookup key: {"checked": iso, "slugs": [addresses tried], "pages": [TAGame as dict]}}, each
     #              reused for its `library.lookup_lifetime`, dropped after 180 days; a failed lookup is stamped
     #              {"checked": iso, "failed": [addresses tried]} instead: never a result (no "slugs", so neither
@@ -60,6 +68,13 @@ class State:
     #              write-ahead: saved before a write's first request and after each, removed after its last;
     #   "seen": [Store product id]  review items already reported (decision A).
     library: dict = field(default_factory=dict)
+    # TrueAchievements requests made today (see wsync.meter): {"day": "YYYY-MM-DD", "total": n, "by": {step: n}}
+    ta_requests: dict = field(default_factory=dict)
+    # the UTC day the "request budget spent" task was opened for (one a day); None once a later day's run closed it
+    ta_budget_task: str | None = None
+    # login back-off (see wsync.run): {"failed": iso, "fingerprint": SHA-256 of the TA password + the session file's
+    # mtime, "issued": True once the episode's issue was raised}; empty after a login succeeds
+    ta_login: dict = field(default_factory=dict)
 
 
 def load_state(path: Path) -> State:
@@ -82,6 +97,9 @@ def load_state(path: Path) -> State:
         collection_review=data.get("collection_review"),
         collection_360_review=data.get("collection_360_review"),
         library=data.get("library") or {},
+        ta_requests=data.get("ta_requests") or {},
+        ta_budget_task=data.get("ta_budget_task"),
+        ta_login=data.get("ta_login") or {},
     )
 
 

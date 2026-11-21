@@ -20,7 +20,7 @@ from wsync.errors import TAError
 from wsync.flaresolverr import FlareSolverrError
 from wsync.run import Terminated
 from wsync.state import State, load_state, save_state
-from wsync.ta import ONE, SERIES, IncompleteRead, PageUnavailable, TAGame, Unreachable
+from wsync.ta import ONE, SERIES, BudgetSpent, IncompleteRead, LoginBackoff, PageUnavailable, TAGame, Unreachable
 from wsync.ta import AuthError as TAAuthError
 from wsync.ta_coll import OwnedRow
 
@@ -30,7 +30,6 @@ SEED = "rt-seed-Ab12"
 PRICE = 47.31
 SX = "xbox-series-x-s"
 H, DAY = timedelta(hours=1), timedelta(days=1)
-TA_REQUESTS = {"collection", "list", "page", "gc-add", "gc-set"}
 
 
 class FakeXbox:
@@ -99,7 +98,7 @@ class FakeXbox:
 
 
 def library_only(tmp_path, *, dry=True, overrides=None, **cfg):
-    """A `--only library` run (no feed, no wishlists, no Deku collection step) at NOW, 12:00 UTC: past the default
+    """A `--only library` run (no feed, no wishlists, no Deku collection step) at NOW, 12:00 UTC: past the harness's
     11:30 start of the daily pass. The run's sleeps are noted in `ta.calls`, in order with the TA requests."""
     ta = FakeTA({}, {})
     h = Harness(tmp_path, records=None, deku=FakeDeku({}, {}), ta=ta, overrides=overrides, lists=(), library=True,
@@ -145,11 +144,9 @@ def issue_notes(h):
     return [n for n in h.reporter.notes if n[0] == "Wishlist sync failed"]
 
 
-def assert_paced(calls):
-    """Every TA request the step makes comes 4 s after the one before it."""
-    for i, c in enumerate(calls):
-        if c[0] in TA_REQUESTS:
-            assert i > 0 and calls[i - 1] == ("sleep", 4.0), calls[max(0, i - 2):i + 1]
+def assert_not_paced_here(calls):
+    """The step doesn't sleep before its TA requests: the run's TA meter paces them (see tests/test_meter.py)."""
+    assert [c for c in calls if c[0] == "sleep"] == []
 
 
 def lines(caplog, prefix="library:"):
@@ -250,7 +247,7 @@ def test_dry_run_writes_nothing_and_plans_everything(tmp_path, caplog):
     assert state.library["last_pass"] == "2026-11-01" and not state.library.get("writing")
     assert state.ta_collection == {}  # the Deku collection step's TA cache is never written here
     assert not issue_notes(h)
-    assert_paced(h.ta.calls)
+    assert_not_paced_here(h.ta.calls)
 
 
 def test_live_adds_and_fixes_within_the_budget(tmp_path):
@@ -270,7 +267,7 @@ def test_live_adds_and_fixes_within_the_budget(tmp_path):
     assert h.ta.writes[:2] == [("gc-add", "Example-Finding-1"), ("gc-set", 901, "media", "Digital")]
     assert ("gc-set", 901, "ownership", "Owned") in h.ta.calls  # asked, compared, not posted
     assert "last_pass" not in library_state(h) and not library_state(h).get("writing")
-    assert_paced(h.ta.calls)
+    assert_not_paced_here(h.ta.calls)
     h.ta.writes.clear()
     h.now = NOW + H
     assert h.run() == 0
@@ -278,7 +275,7 @@ def test_live_adds_and_fixes_within_the_budget(tmp_path):
     assert library_state(h)["last_pass"] == "2026-11-01"
     assert all((r.ownership, r.media) == ("Owned", "Digital") for r in h.ta.owned_rows)
     assert not issue_notes(h)
-    assert_paced(h.ta.calls)
+    assert_not_paced_here(h.ta.calls)
 
 
 def test_a_pass_spanning_three_runs_reads_the_ta_collection_once(tmp_path):
@@ -347,12 +344,12 @@ def test_a_later_run_of_a_pass_retries_closing_the_sign_in_task_without_signing_
     assert tasks(h, "library-signin") == [None] and "signin_task" not in library_state(h)
 
 
-def test_property_list_pages_are_paced(tmp_path):
+def test_property_list_pages_are_not_paced_by_the_step(tmp_path):
     h = library_only(tmp_path, dry=True)
     h.ta.list_pages = {"games-with-gold": 5, "ea-play": 2}
     assert h.run() == 0
     assert [c for c in h.ta.calls if c[0] == "list"] == [("list", "games-with-gold")] * 5 + [("list", "ea-play")] * 2
-    assert_paced(h.ta.calls)
+    assert_not_paced_here(h.ta.calls)
 
 
 def test_a_new_days_pass_reads_the_ta_collection_again(tmp_path):
@@ -499,27 +496,78 @@ def test_a_failed_sign_in_is_retried_at_the_next_run_once_the_seed_changes(tmp_p
     assert "signin_failed" not in lib and lib["last_pass"] == "2026-11-01"
 
 
-def test_a_failed_list_refresh_keeps_the_copy_in_state_and_waits_6h(tmp_path, caplog):
-    caplog.set_level(logging.INFO)
+def list_reads(h):
+    return [c for c in h.ta.calls if c[0] == "list"]
+
+
+def test_gwg_list_read_only_without_a_copy(tmp_path):
+    """Games with Gold ended in 2023, so TA's list of it is frozen: read when the state has no copy, then never again
+    however old the copy is, until state.library.lists.games-with-gold is deleted."""
     h = library_only(tmp_path)
-    old = (NOW - 8 * DAY).isoformat()  # older than the weekly refresh
+    h.ta.list_ids = {"games-with-gold": [7], "ea-play": [8]}
+    assert h.run() == 0 and ("list", "games-with-gold") in list_reads(h)
+    assert library_state(h)["lists"]["games-with-gold"] == {"fetched": NOW.isoformat(), "ids": [7]}
+    h.ta.list_ids["games-with-gold"] = [7, 9]
+    for days in (8, 31, 400):  # past the weekly refresh it had, past EA Play's 30 days, a year on
+        h.ta.calls.clear()
+        h.now = NOW + days * DAY
+        assert h.run() == 0 and ("list", "games-with-gold") not in list_reads(h)
+        assert library_state(h)["last_pass"] == h.now.date().isoformat()
+    assert library_state(h)["lists"]["games-with-gold"] == {"fetched": NOW.isoformat(), "ids": [7]}
+    state = load_state(h.cfg.state)
+    del state.library["lists"]["games-with-gold"]  # the documented way to read it again
+    save_state(h.cfg.state, state)
+    h.ta.calls.clear()
+    h.now = NOW + 401 * DAY
+    assert h.run() == 0 and ("list", "games-with-gold") in list_reads(h)
+    assert library_state(h)["lists"]["games-with-gold"] == {"fetched": h.now.isoformat(), "ids": [7, 9]}
+
+
+def test_ea_play_list_refreshes_every_30_days(tmp_path):
+    h = library_only(tmp_path)
+    h.ta.list_ids = {"games-with-gold": [7], "ea-play": [8]}
+    assert h.run() == 0 and ("list", "ea-play") in list_reads(h)
+    h.ta.list_ids["ea-play"] = [8, 9]
+    for days in (7, 8, 29):  # past the weekly refresh it had; still within 30 days
+        h.ta.calls.clear()
+        h.now = NOW + days * DAY
+        assert h.run() == 0 and list_reads(h) == []
+        assert library_state(h)["last_pass"] == h.now.date().isoformat()
+    assert library_state(h)["lists"]["ea-play"] == {"fetched": NOW.isoformat(), "ids": [8]}
+    h.ta.calls.clear()
+    h.now = NOW + 30 * DAY
+    assert h.run() == 0 and list_reads(h) == [("list", "ea-play")]
+    assert library_state(h)["lists"]["ea-play"] == {"fetched": h.now.isoformat(), "ids": [8, 9]}
+
+
+def test_failed_list_refresh_with_a_copy_waits_24h(tmp_path, caplog):
+    """A failed refresh of a list the state has a copy of: a warning (no issue), the pass goes on with the copy, and
+    the next try waits 24 h (it was 6 h): not in the pass's evening runs, but at the next day's pass."""
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, library_lookups=1)
+    old = (NOW - 31 * DAY).isoformat()  # due for EA Play's 30-day refresh
     save_state(h.cfg.state, State(library={"lists": {"games-with-gold": {"fetched": old, "ids": [7]},
                                                      "ea-play": {"fetched": old, "ids": [8]}}}))
-    for n in range(1, 12):  # 11 lookups: the pass takes two runs
+    for n in range(1, 4):  # three lookups, one a run: the pass goes on over three runs
         h.xbox.own(pid(n), f"Example Seeking {n:02d}")
-    h.ta.fail_list["games-with-gold"] = IncompleteRead("games-with-gold list page 1 has no rows (throttled?)")
-    h.ta.list_ids["ea-play"] = [8, 9]
+    h.ta.fail_list["ea-play"] = IncompleteRead("ea-play list page 1 has no rows (throttled?)")
     assert h.run() == 0 and not issue_notes(h)
-    assert any("games-with-gold list refresh failed" in m for m in lines(caplog))
+    assert list_reads(h) == [("list", "ea-play")]  # Games with Gold has a copy: never read again
+    assert any("ea-play list refresh failed" in m and "next try in 24 h" in m for m in lines(caplog))
     lists = library_state(h)["lists"]
-    assert lists["games-with-gold"]["ids"] == [7] and lists["games-with-gold"]["tried"] == NOW.isoformat()
-    assert lists["ea-play"] == {"fetched": NOW.isoformat(), "ids": [8, 9]}
-    h.ta.calls.clear()
-    h.now = NOW + H  # the pass goes on: no new try of the list within 6 h of the failed one
-    assert h.run() == 0 and not [c for c in h.ta.calls if c[0] == "list"]
+    assert lists["ea-play"] == {"fetched": old, "ids": [8], "tried": NOW.isoformat()}
+    assert lists["games-with-gold"] == {"fetched": old, "ids": [7]}
+    h.ta.fail_list.clear()
+    h.ta.list_ids["ea-play"] = [8, 9]
+    for hours in (7, 11):  # past the 6 h it waited before; the pass goes on
+        h.ta.calls.clear()
+        h.now = NOW + hours * H
+        assert h.run() == 0 and list_reads(h) == []
     assert library_state(h)["last_pass"] == "2026-11-01"
-    h.now = NOW + DAY
-    assert h.run() == 0 and ("list", "games-with-gold") in h.ta.calls
+    h.ta.calls.clear()
+    h.now = NOW + DAY  # the next day's pass, 24 h after the failed try
+    assert h.run() == 0 and list_reads(h) == [("list", "ea-play")]
+    assert library_state(h)["lists"]["ea-play"] == {"fetched": h.now.isoformat(), "ids": [8, 9]}
 
 
 def test_a_list_read_failure_without_a_copy_is_an_issue_with_a_back_off(tmp_path):
@@ -556,7 +604,7 @@ def test_page_lookups_are_budgeted_and_cached(tmp_path):
     assert library_state(h)["pages"][pid(1)] == {
         "checked": NOW.isoformat(), "pages": [],
         "slugs": ["Example-Seeking-01", "Example-Seeking-01-Xbox-One", "Example-Seeking-01-Xbox-Series-XS"]}
-    assert_paced(h.ta.calls)
+    assert_not_paced_here(h.ta.calls)
     h.ta.calls.clear()
     h.now = NOW + H
     assert h.run() == 0
@@ -974,7 +1022,7 @@ def test_an_add_interrupted_before_its_field_sets_is_completed_next_run(tmp_path
     assert not [c for c in h.ta.calls if c[0] == "gc-add"]  # already added: not asked again, nor planned again
     assert h.ta.writes == [("gc-add", "Example-Finding"), ("gc-set", 901, "media", "Digital")]
     assert library_state(h)["writing"] == {} and library_state(h)["last_pass"] == "2026-11-01"
-    assert_paced(h.ta.calls)
+    assert_not_paced_here(h.ta.calls)
 
 
 def test_an_add_interrupted_during_its_post_has_its_fields_set_next_run(tmp_path):
@@ -1788,3 +1836,212 @@ def test_the_sign_in_task_closes_as_soon_as_the_sign_in_works(tmp_path):
     h.run()
     assert tasks(h, "library-signin")[-1] is None and "signin_task" not in library_state(h)
     assert "delete the temp file" in tasks(h, "library-signin")[0]
+
+
+# --------------------------------------------------------------------------- the TA request budget
+
+SPENT = BudgetSpent("the daily TrueAchievements request budget is spent (library step)")
+
+
+def a_known_collection(n=1):
+    """`state.ta_collection` holding an earlier read of n titles: a collection read is then admitted with
+    1 + ceil(n / 100) + 2 requests (20 without one)."""
+    rows = [OwnedRow(10_000 + i, f"Example Known {i}", SX, "Owned", "").__dict__ for i in range(n)]
+    return {"fetched": (NOW - 2 * DAY).isoformat(), "rows": rows}
+
+
+@pytest.mark.parametrize("how", ["admission", "request"])
+def test_library_budget_spent_mid_pass_stamps_nothing(tmp_path, caplog, how):
+    """The budget stops the pass's lookups part-way: before a lookup (no room for its three addresses) or at one of
+    its requests. No lib["failed"], no quiet stop counted against the game, its lookup neither failed nor counted
+    toward the day's cap, no issue; the pass carries on at the next run with room."""
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=True)
+    for n, name in enumerate(("Alpha", "Bravo", "Charlie"), 1):
+        h.xbox.own(pid(n), f"Example {name}")
+        h.ta.pages[f"Example-{name}"] = page(900 + n, f"Example {name}")
+    if how == "admission":
+        # 8 requests: the two list pages, the collection read (admitted with 4) and Alpha's three addresses
+        h.metered = True
+        h.cfg.ta_budget_library = 8
+        save_state(h.cfg.state, State(ta_collection=a_known_collection()))
+    else:
+        h.ta.fail_page["Example-Bravo-Xbox-One"] = SPENT
+    assert h.run() == 0 and not issue_notes(h)
+    lib = library_state(h)
+    assert "failed" not in lib and "last_pass" not in lib
+    stored = lib["pass"]
+    assert stored["lookups"] == 1  # Alpha's: the stopped lookup isn't counted toward the day's cap
+    assert not stored.get("quiet") and stored["lookup_failed"] == [] and not stored.get("lookup_errors")
+    assert pid(1) in lib["pages"] and pid(2) not in lib["pages"]  # Bravo: neither a result nor a failed stamp
+    assert any("lookups stopped" in m for m in lines(caplog))
+    h.ta.fail_page.clear()
+    h.cfg.ta_budget_library = 160
+    h.ta.calls.clear()
+    h.now = NOW + H
+    assert h.run() == 0 and not issue_notes(h)
+    assert looked_up(h.ta.calls) == ["Example-Bravo", "Example-Charlie"]
+    assert library_state(h)["last_pass"] == "2026-11-01"
+
+
+@pytest.mark.parametrize("where", ["collection", "list without a copy", "list with a copy"])
+def test_library_budget_spent_at_a_read_stamps_no_back_off(tmp_path, caplog, where):
+    """A refused TA read is a quiet stop, never a failed read: no lib["failed"] (no 6 h back-off), no issue, and a
+    list's copy is used without a "tried" stamp."""
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Mending 01")
+    h.ta.owned_rows = [wrong(501, "Example Mending 01")]
+    old = (NOW - 31 * DAY).isoformat()  # due for its 30-day refresh
+    if where == "collection":
+        h.ta.fail_collection = SPENT
+    else:
+        h.ta.fail_list["ea-play"] = SPENT
+    if where == "list with a copy":
+        save_state(h.cfg.state, State(library={"lists": {"games-with-gold": {"fetched": NOW.isoformat(), "ids": []},
+                                                         "ea-play": {"fetched": old, "ids": [8]}}}))
+    assert h.run() == 0 and not issue_notes(h)
+    lib = library_state(h)
+    assert "failed" not in lib
+    if where == "list with a copy":
+        assert lib["lists"]["ea-play"] == {"fetched": old, "ids": [8]}  # no "tried" stamp: no back-off
+        assert written(h) == [501] and lib["last_pass"] == "2026-11-01"  # the pass went on with the copy
+        return
+    assert h.ta.writes == [] and "last_pass" not in lib
+    assert any("BudgetSpent" in m and "the pass goes on" in m for m in lines(caplog))
+    h.ta.fail_collection = None
+    h.ta.fail_list.clear()
+    h.now = NOW + H  # no back-off: the next run reads at once
+    assert h.run() == 0 and not issue_notes(h)
+    assert written(h) == [501] and library_state(h)["last_pass"] == "2026-11-01"
+
+
+def test_a_pass_whose_ta_read_is_held_signs_in_to_microsoft_once_a_day(tmp_path):
+    """The pass's TA collection read is held back run after run (a TA login back-off: the read's first page finds the
+    session not accepted, and the guard refuses the login). The pass's first run keeps the owned games in today's pass
+    state before its TA read, so the later runs reuse them: one Microsoft sign-in a day, not one a run, and no
+    back-off stamp."""
+    held = LoginBackoff("TrueAchievements login skipped: the last one failed less than 24 h ago")
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Mending 01")
+    h.ta.owned_rows = [wrong(501, "Example Mending 01")]
+    h.ta.fail_collection = held
+    assert h.run() == 0 and not issue_notes(h)
+    first = list(h.xbox.calls)
+    for i in (1, 2):
+        h.now = NOW + i * H
+        assert h.run() == 0 and not issue_notes(h)
+    assert h.xbox.calls == first and h.xbox.refreshed_with == [SEED]  # no sign-in after the pass's first run
+    assert h.ta.collection_calls == 3 and h.ta.writes == []  # each run tries the read, quietly
+    lib = library_state(h)
+    assert "failed" not in lib and "last_pass" not in lib
+    assert lib["pass"]["day"] == "2026-11-01" and "rows" not in lib["pass"] and len(lib["pass"]["owned"]) == 1
+    h.ta.fail_collection = None  # the hold ends (a re-seeded session file, say)
+    h.now = NOW + 3 * H
+    assert h.run() == 0 and written(h) == [501] and library_state(h)["last_pass"] == "2026-11-01"
+    assert h.xbox.calls == first
+    h.ta.fail_collection = held
+    for i in (0, 1):  # the next day's pass signs in again, once
+        h.now = NOW + DAY + i * H
+        assert h.run() == 0
+    assert h.xbox.refreshed_with == [SEED, "rt-rotated-1-Zp"]
+
+
+def test_library_writes_wait_quietly_when_the_budget_has_no_room_for_one(tmp_path, caplog):
+    """A write is admitted with 7 requests: with less room left the writes stop before the next one, quietly and with
+    no write-ahead left behind; the pass goes on at the next run with room."""
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=False, ta_budget_library=11)
+    h.metered = True  # 11: the two list pages, the read (admitted with 4) and one fix's two field sets
+    h.xbox.own(pid(1), "Example Mending 01")
+    h.xbox.own(pid(2), "Example Mending 02")
+    h.ta.owned_rows = [wrong(501, "Example Mending 01"), wrong(502, "Example Mending 02")]
+    save_state(h.cfg.state, State(ta_collection=a_known_collection(2)))
+    assert h.run() == 0 and not issue_notes(h)
+    assert written(h) == [501]
+    lib = library_state(h)
+    assert lib["writing"] == {} and "last_pass" not in lib and "failed" not in lib
+    assert any("no room" in m and "write" in m for m in lines(caplog))
+    h.cfg.ta_budget_library = 160
+    h.now = NOW + H
+    assert h.run() == 0 and written(h) == [501, 502] and library_state(h)["last_pass"] == "2026-11-01"
+
+
+def test_a_budget_stop_while_writing_keeps_the_write_for_the_next_run(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=False)
+    h.xbox.own(pid(1), "Example Finding")
+    h.ta.pages["Example-Finding"] = page(901, "Example Finding")
+    h.ta.fail_set[(901, "media")] = SPENT
+    assert h.run() == 0 and not issue_notes(h)
+    entry = library_state(h)["writing"]["901"]
+    assert entry["added"] is True and "tried" not in entry  # completed from where it got to, not in a later pass
+    assert any("BudgetSpent" in m and "a later run" in m for m in lines(caplog))
+    h.ta.fail_set.clear()
+    h.now = NOW + H
+    assert h.run() == 0 and library_state(h)["writing"] == {}
+    assert ("gc-set", 901, "media", "Digital") in h.ta.writes and library_state(h)["last_pass"] == "2026-11-01"
+
+
+def test_library_or_collection_share_spent_only_warns(tmp_path, caplog):
+    """The day's library and collection shares are spent, not the wishlist share or the ceiling: those two steps stop
+    with a warning and stamp nothing; no budget task, no issue; the wishlist mirror runs as usual."""
+    caplog.set_level(logging.INFO)
+    h = basic(tmp_path, dry_run=False, library=True, library_dry_run=False, collection=True,
+              collection_dry_run=False, xbox_refresh_token=SEED)
+    h.metered = True
+    h.xbox = FakeXbox()
+    h.xbox.own(pid(1), "Example Mending 01")
+    h.ta.owned_rows = [wrong(501, "Example Mending 01")]
+    save_state(h.cfg.state, State(ta_requests={"day": "2026-11-01", "total": 220,
+                                               "by": {"library": 160, "collection": 60}}))
+    assert h.run() == 0
+    assert h.ta.writes == [("add", "101"), ("add", "102"), ("remove", "999")]  # the wishlist mirror
+    assert h.xbox.calls == [] and h.ta.collection_calls == 0 and ("collection",) not in h.deku.calls
+    assert h.reporter.budget_tasks == [] and not issue_notes(h)
+    state = load_state(h.cfg.state)
+    assert "failed" not in state.library and "last_pass" not in state.library
+    assert state.ta_collection == {}  # no last_attempt: no back-off
+    said = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(m.startswith("library: no room") for m in said)
+    assert any(m.startswith("collection: no room") for m in said)
+    assert any("library 160/160" in m and "collection 60/60" in m for m in said)
+
+
+def test_the_library_step_starts_only_with_room_for_its_collection_read(tmp_path, caplog):
+    """Nearly the whole day's ceiling is spent by other steps: a pass that still has to read the collection doesn't
+    sign in to Microsoft or read TA's lists for a read it would have no room for."""
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=False)
+    h.metered = True
+    h.xbox.own(pid(1), "Example Mending 01")
+    h.ta.owned_rows = [wrong(501, "Example Mending 01")]
+    save_state(h.cfg.state, State(ta_requests={"day": "2026-11-01", "total": 290,
+                                               "by": {"wishlist": 50, "collection": 30, "clearance": 210}}))
+    assert h.run() == 0 and not issue_notes(h)
+    assert h.xbox.calls == [] and h.ta.calls == []
+    assert any(m.startswith("library: no room") and "(20 requests)" in m for m in lines(caplog))
+    assert h.reporter.budget_tasks == []  # the ceiling has room left: no budget task
+
+
+# --------------------------------------------------------------------------- the collection read, handed over
+
+
+def test_library_pass_completion_does_not_lose_the_handoff(tmp_path, caplog):
+    """The day's pass reads the TA collection, writes nothing and completes in the same run, which drops its stored
+    read with the rest of state.library["pass"]. The Deku collection step later in the run still uses that read,
+    handed over in memory: no second read."""
+    caplog.set_level(logging.INFO)
+    h = library_only(tmp_path, dry=False, collection=True, collection_dry_run=False)
+    h.xbox.own(pid(1), "Example Mending 01")
+    h.ta.owned_rows = [OwnedRow(501, "Example Mending 01", SX, "Owned", "Digital")]  # already right: nothing to write
+    h.deku.games["example-mending-01"] = ("Example Mending 01", {"xbox_series"})
+    assert h.run() == 0 and not issue_notes(h)
+    lib = library_state(h)
+    assert lib["last_pass"] == "2026-11-01" and "pass" not in lib  # complete: its stored read went with it
+    assert h.ta.collection_calls == 1 and h.ta.writes == []
+    assert load_state(h.cfg.state).ta_collection == {"fetched": NOW.isoformat(),
+                                                     "rows": [r.__dict__ for r in h.ta.owned_rows]}
+    said = lines(caplog, "collection:")
+    assert "collection: TrueAchievements collection from this run's library read (1 titles)" in said
+    assert h.deku.owned["example-mending-01"] == [OwnedDetail("o-example-mending-01-0", "xbox_series", "digital")]

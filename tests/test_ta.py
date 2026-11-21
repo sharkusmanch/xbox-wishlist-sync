@@ -14,6 +14,7 @@ from wsync.ta import (
     AlreadyListed,
     AuthError,
     HttpResponse,
+    LoginBackoff,
     IncompleteRead,
     TAClient,
     TAError,
@@ -1467,3 +1468,186 @@ def test_edit_options_that_are_not_html_are_a_ta_error():
     with pytest.raises(TAError, match="isn't HTML"):
         c.collection_set(12345, "media", "Digital")
     assert not any(x["url"].endswith("UpdateGame") for x in http.calls)
+
+
+class CountingMeter:
+    def __init__(self):
+        self.requests = 0
+        self.clearances = 0
+
+    def before_request(self):
+        self.requests += 1
+
+    def count_clearance(self):
+        self.clearances += 1
+
+
+def test_client_reports_every_request_to_the_meter_including_redirect_hops_and_login():
+    meter = CountingMeter()
+    http = FakeHttp(login_routes())
+    c = client(http, meter=meter)
+    c.login()  # GET /login, POST /login, then the redirect's GET /
+    assert meter.requests == len(http.calls) == 3
+    # a challenge: the refused request and its retry both count, and so does the clearance fetch
+    c2 = client(FakeHttp({("GET", "/game/X"): [CHALLENGE, resp(GAME)]}), FakeFS(), meter=meter)
+    c2.game("X")
+    assert meter.requests == 5 and meter.clearances == 1
+
+
+def test_client_without_a_meter_makes_requests_unmetered():
+    c, http = logged_in({("GET", "/game/X"): resp(GAME)})
+    c.game("X")
+    assert len(http.calls) == 1
+
+
+def test_a_refused_request_is_never_sent():
+    class Refusing:
+        def before_request(self):
+            raise ta.BudgetSpent("spent")
+
+    c, http = logged_in({("GET", "/game/X"): resp(GAME)}, meter=Refusing())
+    with pytest.raises(ta.BudgetSpent):
+        c.game("X")
+    assert http.calls == []
+
+
+def test_budget_spent_is_a_ta_pause_and_neither_is_a_page_unavailable():
+    from wsync.ta import BudgetSpent, PageUnavailable, TAPaused, Unreachable
+
+    assert issubclass(BudgetSpent, TAPaused) and issubclass(TAPaused, Unreachable)
+    assert not issubclass(TAPaused, PageUnavailable) and not issubclass(BudgetSpent, PageUnavailable)
+
+
+class Guard:
+    """A login guard on a plain dict, as the run keeps it (the fingerprint is the test's to change)."""
+
+    def __init__(self):
+        self.fingerprint, self.stamp, self.errors = "fp-1", None, []
+
+    def allowed(self):
+        return not (self.stamp and self.stamp == self.fingerprint)
+
+    def failed(self, exc):
+        self.stamp = self.fingerprint
+        self.errors.append(exc)
+
+    def succeeded(self):
+        self.stamp = None
+
+
+def _forbidden_login():
+    routes = login_routes()
+    routes[("POST", "/login")] = resp("<html>Forbidden</html>", status=403)
+    return routes
+
+
+def test_failed_login_keeps_the_session_cookies():
+    guard = Guard()
+    http = FakeHttp(_forbidden_login())
+    c = client(http, login_guard=guard)
+    c._cookies = {"GamerToken": "old-token", "HashKey": "old-hash"}
+    with pytest.raises(TAError):
+        c.login()
+    assert c._cookies == {"GamerToken": "old-token", "HashKey": "old-hash"}
+    assert len(guard.errors) == 1 and guard.stamp == "fp-1"
+
+
+def test_login_refused_for_24h_after_a_failure_with_the_same_fingerprint():
+    guard = Guard()
+    http = FakeHttp(_forbidden_login())
+    c = client(http, login_guard=guard)
+    with pytest.raises(TAError):
+        c.login()
+    n = len(http.calls)
+    with pytest.raises(LoginBackoff):
+        c.login()
+    assert len(http.calls) == n  # no request at all
+
+
+def test_a_new_password_or_session_file_reenables_login():
+    guard = Guard()
+    http = FakeHttp(_forbidden_login())
+    c = client(http, login_guard=guard)
+    with pytest.raises(TAError):
+        c.login()
+    guard.fingerprint = "fp-2"  # a new password or a new session file
+    c._http = FakeHttp(login_routes())
+    c.login()
+    assert c._cookies["GamerToken"] == TOKEN and guard.stamp is None
+
+
+# ---- the real LoginGuard (wsync.run) on a stub run
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from wsync.run import LoginGuard  # noqa: E402
+from wsync.state import load_state, save_state, State  # noqa: E402
+
+T0 = datetime(2026, 11, 20, 9, 30, tzinfo=timezone.utc)
+
+
+def _guard_run(tmp_path, password="pw-one"):
+    r = SimpleNamespace(cfg=SimpleNamespace(ta_password=password, state_dir=tmp_path), state=State(), issues=[])
+    r.now = T0
+    r.deps = SimpleNamespace(now=lambda: r.now)
+    r.issue = r.issues.append
+    return r, LoginGuard(r)
+
+
+def test_real_guard_holds_until_exactly_24h_and_words_the_issue(tmp_path):
+    r, g = _guard_run(tmp_path)  # no session file: counts as no mtime
+    assert g.allowed()
+    g.failed(TAError("x"))
+    assert r.issues == ["TrueAchievements login failing since 2026-11-20 09:30 UTC; TA steps paused until "
+                        "2026-11-21 09:30 UTC (sooner with a new password or session file)"]
+    r.now = T0 + timedelta(hours=23, minutes=59)
+    assert not g.allowed()
+    r.now = T0 + timedelta(hours=24)
+    assert g.allowed()
+
+
+def test_real_guard_new_password_or_session_file_allows_at_once(tmp_path):
+    r, g = _guard_run(tmp_path)
+    g.failed(TAError("x"))
+    assert not g.allowed()
+    session = tmp_path / "ta-session"
+    session.write_text("{}")  # the file appears: a new mtime
+    assert g.allowed()
+    g.failed(TAError("x"))
+    assert not g.allowed()
+    os.utime(session, ns=(1, 1))  # re-seeded
+    assert g.allowed()
+    g.failed(TAError("x"))
+    assert not g.allowed()
+    r.cfg.ta_password = "pw-two"
+    assert g.allowed()
+    assert len(r.issues) == 3  # one per episode: the fingerprint changed twice after failures
+
+
+def test_real_guard_hold_survives_save_and_load_state(tmp_path):
+    r, g = _guard_run(tmp_path)
+    g.failed(TAError("x"))
+    save_state(tmp_path / "state.json", r.state)
+    r2, g2 = _guard_run(tmp_path)
+    r2.state = load_state(tmp_path / "state.json")
+    r2.now = T0 + timedelta(hours=3)
+    assert not g2.allowed()
+    assert SECRET not in json.dumps(r2.state.ta_login)
+
+
+def test_real_client_login_with_the_real_guard_holds_after_a_403(tmp_path):
+    r, g = _guard_run(tmp_path, password=SECRET)
+    routes = login_routes()
+    routes[("POST", "/login")] = resp("<html>Forbidden</html>", status=403)
+    http = FakeHttp(routes)
+    c = client(http, session_path=tmp_path / "ta-session", login_guard=g)
+    c._cookies = {"GamerToken": "old-token", "HashKey": "old-hash"}
+    with pytest.raises(TAError):
+        c.login()
+    assert c._cookies == {"GamerToken": "old-token", "HashKey": "old-hash"}
+    assert set(r.state.ta_login) == {"failed", "fingerprint", "issued"} and len(r.issues) == 1
+    sent = len(http.calls)
+    with pytest.raises(LoginBackoff):
+        c.login()
+    assert len(http.calls) == sent

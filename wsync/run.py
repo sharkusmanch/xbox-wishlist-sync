@@ -6,7 +6,9 @@ Order (each list is handled independently; a failure on one never blocks the oth
   2. read both wishlists (logging in when the stored session has expired);
   3. refresh the Disc to Digital verdicts (Deku formats);
   4. resolve every Xbox item on every list: override, then the cached mapping (re-validated),
-     then search plus a confident pick;
+     then search plus a confident pick. A TrueAchievements lookup that found nothing to add is kept
+     and reused without a request until it's due (daily for a released game, at the product's hour
+     of the day; weekly before release, at its hour of the week), and a failed one backs off for hours;
   5. plan; 6. apply (dry run: nothing) adds, then updates, then removes, none started past the
      write deadline; 7. save state, report. SIGTERM stops the run, saves state and exits 1.
   8. the library step (`wsync.library`), once a day: Microsoft licences and orders -> TrueAchievements
@@ -25,7 +27,12 @@ Safety rules beyond the planner's:
     articles skipped, numbers compared by value), plus any entry about to be removed that is
     related; unrelated full-text search noise doesn't count as a candidate;
   - nothing secret is logged or reported: every message passes through a scrubber that knows
-    the configured secrets, and lookup failures are logged by exception class only.
+    the configured secrets, and lookup failures are logged by exception class only;
+  - every TrueAchievements request goes through the run's meter (`wsync.meter`). Held-back TA
+    requests (`TAPaused`: a spent request budget) are never a failure: a step skips a unit of work
+    the budget has no room for, and stops quietly where a request is refused. A paused TA list is
+    left as `--only` leaves a disabled one: no TA writes, its problem tasks neither opened nor
+    closed. One task a UTC day says the wishlist share or the day's ceiling is spent.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -46,15 +54,16 @@ from wsync.collection import run_collection_step
 from wsync.deku import AuthError as DekuAuthError
 from wsync.deku import DekuClient, DekuItem
 from wsync.feed import FeedError, XboxItem, check_count, is_dlc, load_feed
-from wsync.flaresolverr import FlareSolverr
+from wsync.flaresolverr import FlareSolverr, FlareSolverrError
 from wsync.library import run_library_step
+from wsync.meter import TAMeter
 from wsync.match import Match, base_title, norm, pick, strip_edition_noise
 from wsync.overrides import SKIP, OverridesError, load_collection_overrides, load_library_overrides, load_overrides
 from wsync.plan import XBOX_PLATFORMS, Entry, ListPlan, Plan, Problem, build_plan, is_transient, transient
 from wsync.state import State, load_state, save_state
 from wsync.ta import AlreadyListed
 from wsync.ta import AuthError as TAAuthError
-from wsync.ta import TAClient, TAGame, choose_ta_page, excluded_page
+from wsync.ta import TAClient, TAGame, TAPaused, choose_ta_page, excluded_page
 from wsync.xbox import Http, UrllibHttp
 
 log = logging.getLogger("wsync")
@@ -62,11 +71,18 @@ log = logging.getLogger("wsync")
 LISTS = ("deku", "ta")
 COLLECTION = "collection"  # `--only collection`: the Deku collection step alone
 LIBRARY = "library"  # `--only library`: the library step alone
-LIBRARY_AFTER = dtime(11, 30)  # WSYNC_LIBRARY_AFTER's default (UTC)
+LIBRARY_AFTER = dtime(12, 30)  # WSYNC_LIBRARY_AFTER's default (UTC): just after TA's own daily purchase import
 LABEL = {"deku": "Deku Deals", "ta": "TrueAchievements"}
 KIND = {"deku": "unmatched-deku", "ta": "unmatched-ta"}
 MAX_LOOKUP_ERRORS = 3  # consecutive failed lookups on a list before the rest are skipped
 MAX_PAGES = 4  # candidate pages fetched per item (TA pages cost 3-30 s each)
+LOOKUP_REQUESTS = 4  # admission: the TA requests a wishlist item's lookup asks the day's budget for (a search, pages)
+WRITE_RESERVE = 10  # admission: the wishlist-share requests a lookup leaves free for the TA adds, removes and re-read
+RECHECK_RELEASED = timedelta(days=1)  # a kept TA lookup result of a released game is looked up again daily,
+RECHECK_UNRELEASED = timedelta(days=7)  # of a game not out yet (feed kind other than "released") weekly,
+RECHECK_AFTER = timedelta(days=1)  # never sooner than a day after the hour it was checked in
+SLOTS_FROM = datetime(2001, 1, 1, tzinfo=timezone.utc)  # a Monday, 00:00 UTC: the re-check slots count from it
+BACKOFF_MAX = timedelta(hours=24)  # a failing TA lookup waits 1, 2, 4 ... hours after each failure, at most this
 WRITE_DEADLINE = 45 * 60.0  # the job's hard limit is 50 min: no write starts later than this
 _FALSE = {"false", "0", "no", "off"}
 _TA_SUFFIX = re.compile(r"\s*\((?:Xbox One|Xbox Series X\|S|Xbox 360|Windows|PC|Xbox)\)\s*$", re.I)
@@ -120,6 +136,13 @@ class Config:
     library_budget: int = 25  # WSYNC_LIBRARY_BUDGET: games written on TrueAchievements per run
     library_lookups: int = 10  # WSYNC_LIBRARY_LOOKUPS: games whose TrueAchievements pages are looked up per run
     library_lookups_per_day: int = 40  # WSYNC_LIBRARY_LOOKUPS_PER_DAY: the same per UTC day, across its runs
+    ta_gap: float = 4.0  # WSYNC_TA_GAP: seconds from one TA request's start to the next
+    ta_jitter: float = 3.0  # WSYNC_TA_JITTER: up to this many seconds more, at random
+    ta_daily_budget: int = 300  # WSYNC_TA_DAILY_BUDGET: the day's TA request ceiling, clearances included
+    ta_budget_wishlist: int = 80  # WSYNC_TA_BUDGET_WISHLIST: the wishlist and Disc to Digital steps' share
+    ta_budget_library: int = 160  # WSYNC_TA_BUDGET_LIBRARY: the library step's share
+    ta_budget_collection: int = 60  # WSYNC_TA_BUDGET_COLLECTION: the collection step's share
+    ta_budget_other: int = 20  # WSYNC_TA_BUDGET_OTHER: requests made outside any step
 
     @property
     def state_dir(self) -> Path:
@@ -180,6 +203,20 @@ def _count_env(env, name: str, default: int) -> int:
     if value is None:
         return default
     if value < 0:
+        raise ConfigError(f"{name} must be 0 or more")
+    return value
+
+
+def _seconds_env(env, name: str, default: float) -> float:
+    """Seconds (0 or more) from the environment; `default` when unset or empty."""
+    raw = (env.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ConfigError(f"{name} must be a number") from None
+    if value < 0 or value != value:
         raise ConfigError(f"{name} must be 0 or more")
     return value
 
@@ -246,6 +283,13 @@ def config_from(argv: list[str], env) -> Config:
         library_budget=_count_env(env, "WSYNC_LIBRARY_BUDGET", Config.library_budget),
         library_lookups=_count_env(env, "WSYNC_LIBRARY_LOOKUPS", Config.library_lookups),
         library_lookups_per_day=_count_env(env, "WSYNC_LIBRARY_LOOKUPS_PER_DAY", Config.library_lookups_per_day),
+        ta_gap=_seconds_env(env, "WSYNC_TA_GAP", Config.ta_gap),
+        ta_jitter=_seconds_env(env, "WSYNC_TA_JITTER", Config.ta_jitter),
+        ta_daily_budget=_count_env(env, "WSYNC_TA_DAILY_BUDGET", Config.ta_daily_budget),
+        ta_budget_wishlist=_count_env(env, "WSYNC_TA_BUDGET_WISHLIST", Config.ta_budget_wishlist),
+        ta_budget_library=_count_env(env, "WSYNC_TA_BUDGET_LIBRARY", Config.ta_budget_library),
+        ta_budget_collection=_count_env(env, "WSYNC_TA_BUDGET_COLLECTION", Config.ta_budget_collection),
+        ta_budget_other=_count_env(env, "WSYNC_TA_BUDGET_OTHER", Config.ta_budget_other),
     )
 
 
@@ -311,6 +355,9 @@ class NullReporter:
     def library_task(self, key, title, body) -> bool:
         return False
 
+    def ta_budget_task(self, body) -> bool:
+        return False
+
     def notify(self, title, body) -> None:
         pass
 
@@ -335,6 +382,9 @@ class LiveReporter:
     def library_task(self, key, title, body) -> bool:
         return report.library_task(self._vk, key, title, body)
 
+    def ta_budget_task(self, body) -> bool:
+        return report.ta_budget_task(self._vk, body)
+
     def notify(self, title, body) -> None:
         report.notify(self._apprise, title, body)
 
@@ -346,9 +396,48 @@ def _make_deku(cfg: Config) -> DekuClient:
     return DekuClient(cfg.deku_email, cfg.deku_password, cfg.deku_wishlist_id, cfg.state_dir / "deku-session")
 
 
-def _make_ta(cfg: Config, game_ids: dict[str, int]) -> TAClient:
+def _make_ta(cfg: Config, game_ids: dict[str, int], meter: TAMeter | None = None,
+             login_guard=None) -> TAClient:
     return TAClient(cfg.ta_gamertag, cfg.ta_password, FlareSolverr(cfg.flaresolverr_url),
-                    cfg.state_dir / "ta-session", game_ids=game_ids)
+                    cfg.state_dir / "ta-session", game_ids=game_ids, meter=meter, login_guard=login_guard)
+
+
+class LoginGuard:
+    """The login back-off, kept in `state.ta_login`: after a failed login none is tried for 24 h while the TA password
+    and the session file (its mtime) are unchanged. A new password or session file, or a login that works, ends it.
+    One issue per episode (the first failure), not per run. Only the fingerprint's hash is stored."""
+
+    HOLD = timedelta(hours=24)
+
+    def __init__(self, run: "_Run"):
+        self._run = run
+
+    def _fingerprint(self) -> str:
+        cfg = self._run.cfg
+        try:
+            mtime = (cfg.state_dir / "ta-session").stat().st_mtime_ns
+        except OSError:
+            mtime = "none"
+        return hashlib.sha256(f"{cfg.ta_password}\0{mtime}".encode()).hexdigest()
+
+    def allowed(self) -> bool:
+        st = self._run.state.ta_login
+        if not st or st.get("fingerprint") != self._fingerprint():
+            return True
+        return self._run.deps.now() - datetime.fromisoformat(st["failed"]) >= self.HOLD
+
+    def failed(self, exc: Exception) -> None:
+        run, fp = self._run, self._fingerprint()
+        prior = run.state.ta_login
+        issued = bool(prior) and prior.get("fingerprint") == fp and bool(prior.get("issued"))
+        run.state.ta_login = {"failed": run.deps.now().isoformat(), "fingerprint": fp, "issued": True}
+        if not issued:
+            at = run.deps.now().astimezone(timezone.utc)
+            run.issue(f"TrueAchievements login failing since {at:%Y-%m-%d %H:%M} UTC; TA steps paused until "
+                      f"{at + self.HOLD:%Y-%m-%d %H:%M} UTC (sooner with a new password or session file)")
+
+    def succeeded(self) -> None:
+        self._run.state.ta_login = {}
 
 
 def _make_reporter(cfg: Config):
@@ -358,14 +447,14 @@ def _make_reporter(cfg: Config):
 @dataclass
 class Deps:
     make_deku: Callable[[Config], Any] = _make_deku
-    make_ta: Callable[[Config, dict], Any] = _make_ta
+    make_ta: Callable[[Config, dict, Any, Any], Any] = _make_ta  # (cfg, game ids, the run's meter, its login guard)
     make_reporter: Callable[[Config], Any] = _make_reporter
     refresh_verdicts: Callable = d2d.refresh_verdicts
     http_get: Callable | None = None  # XCT transport; None = d2d's default
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
     monotonic: Callable[[], float] = time.monotonic
-    sleep: Callable[[float], None] = time.sleep  # the collection and library steps' pacing
-    d2d_pause: float = 1.0
+    sleep: Callable[[float], None] = time.sleep  # the collection step's pacing, and the TA meter's
+    rand: Callable[[], float] = random.random  # the TA meter's jitter
     make_xbox_http: Callable[[], Http] = UrllibHttp  # the library step's Microsoft transport
 
 
@@ -454,6 +543,55 @@ def _ta_ids(key: str) -> tuple[int, int]:
     return int(game), int(dlc or 0)
 
 
+def _ta_miss_key(item: XboxItem, ov: dict) -> list:
+    """What a stored TA lookup result depends on: the base title, the feed's kind and product kind, and the item's TA
+    override (None without one). Any change, an override's removal included, means a new lookup."""
+    override = {k: ov[k] for k in ("ta", "ta_dlc") if ov.get(k)}
+    return [base_title(item.title), item.kind, item.product_kind, override or None]
+
+
+def _placeholder_override(title: str) -> str:
+    return f"override page {title} is a pre-release placeholder"
+
+
+def _pid_hash(pid: str) -> int:
+    return int(hashlib.sha256(pid.encode()).hexdigest(), 16)
+
+
+def hour_slot(pid: str) -> int:
+    """The product's hour of the day (UTC) for its daily TA re-checks, so that they spread over the day."""
+    return _pid_hash(pid) % 24
+
+
+def week_slot(pid: str) -> int:
+    """The product's hour of the week (0 = Monday 00:00 UTC) for its weekly TA re-checks, so that they spread over the
+    week. It falls in the product's `hour_slot` (24 divides 168): a game keeps its hour of the day once released."""
+    return _pid_hash(pid) % 168
+
+
+def recheck_due(pid: str, kind: str, checked: datetime) -> datetime:
+    """When a kept TA lookup result is looked up again: at the start of the product's first slot at least a day after
+    the hour it was checked in. A released game's slot comes daily (`hour_slot`); the slot of a game not out yet comes
+    weekly (`week_slot`). A re-check made in the slot is due again exactly a period later; after a check outside the
+    slot the first re-check comes 1-2 days later (released) or 1-8 days later (not out yet). Weekly slots spread the
+    games first looked up in one run (a deploy, say) over the week, instead of bringing them all back on one day."""
+    if kind == "released":
+        period, first = RECHECK_RELEASED, SLOTS_FROM + timedelta(hours=hour_slot(pid))
+    else:
+        period, first = RECHECK_UNRELEASED, SLOTS_FROM + timedelta(hours=week_slot(pid))
+    earliest = checked.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0) + RECHECK_AFTER
+    return first + period * -((first - earliest) // period)  # the first slot start at or after `earliest`
+
+
+def _utc(value) -> datetime | None:
+    """A stored ISO time as an aware UTC datetime; None when it isn't one."""
+    try:
+        t = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
 def _err(e: BaseException) -> str:
     text = str(e)
     return f"{type(e).__name__}: {text}" if text else type(e).__name__
@@ -490,6 +628,11 @@ class _Deferred(Exception):
     """A lookup that needs a search, after the run's lookup time budget is spent."""
 
 
+class _NoRoom(Exception):
+    """A TA lookup the day's TA request budget has no room for, the writes' reserve kept (admission): it waits,
+    nothing is sent."""
+
+
 @dataclass
 class _List:
     name: str
@@ -499,10 +642,12 @@ class _List:
     current: dict[str, Entry] | None = None
     matches: dict[str, Match] = field(default_factory=dict)
     failed: str | None = None  # set: no writes at all on this list this run
+    paused: str | None = None  # set (with `failed`): TA requests held back; left as --only leaves a disabled list
     pause: list[str] = field(default_factory=list)  # reasons to make no removals
     errors: int = 0
     stop: str | None = None  # set: remaining lookups are skipped (ambiguous)
     deferred: int = 0
+    no_room: int = 0  # lookups the day's TA request budget had no room for
 
     @property
     def active(self) -> bool:
@@ -536,6 +681,11 @@ class _Run:
         self.keep_keys: set[str] = set()
         self.late_writes = 0
         self.ta_client: Any = None
+        self.meter: TAMeter | None = None  # built once the state has loaded; every TA client shares it
+        # The library step's TA collection read in this run, (read time, rows), and whether the library has started a
+        # TA write in this run since: without one, the Deku collection step takes that read as its own (no second read)
+        self.library_read: tuple[datetime, list] | None = None
+        self.library_wrote = False
 
     # ---- logging
 
@@ -583,8 +733,67 @@ class _Run:
     def library_dry(self) -> bool:
         return self.cfg.dry_run or self.cfg.library_dry_run
 
+    def _utc_day(self) -> str:
+        return self.deps.now().astimezone(timezone.utc).strftime("%Y-%m-%d")
+
+    def _make_meter(self) -> TAMeter:
+        cfg = self.cfg
+        budgets = {"wishlist": cfg.ta_budget_wishlist, "library": cfg.ta_budget_library,
+                   "collection": cfg.ta_budget_collection, "other": cfg.ta_budget_other}
+        return TAMeter(self.state.ta_requests, budgets=budgets, ceiling=cfg.ta_daily_budget, gap=cfg.ta_gap,
+                       jitter=cfg.ta_jitter, clock=self.deps.monotonic, sleep=self.deps.sleep,
+                       rand=self.deps.rand, today=self._utc_day)
+
+    def _make_ta(self):
+        return self.deps.make_ta(self.cfg, dict(self.state.ta_game_ids), self.meter, LoginGuard(self))
+
+    def ta_admit(self, n: int, step: str | None = None) -> bool:
+        """Admission control: does the day's TA request budget have room for `n` more requests under the step (default:
+        the running one; its share and the ceiling)? Counts nothing. A step asks before a unit of several requests and
+        skips the unit quietly when it doesn't fit; without a meter there is always room."""
+        return self.meter is None or self.meter.admit(n, step)
+
+    def _ta_budget(self) -> None:
+        """The day's spent shares are a warning; while the wishlist share or the day's ceiling is spent, one task a
+        UTC day (with one ping) says so, until the first run of a later day that has room closes it. Not an issue:
+        every step stopped quietly. A task that couldn't be written is one, and is retried at the next run, as is
+        everything in a run without a reporter (--no-report)."""
+        usage = [(s, *self.meter.usage(s)) for s in self.meter.spent()]
+        if usage:
+            self.say("ta budget: spent today: " + ", ".join(f"{s} {used}/{limit}" for s, used, limit in usage)
+                     + "; the work waits for 00:00 UTC", logging.WARNING)
+        if isinstance(self.reporter, NullReporter):
+            return
+        day, opened = self._utc_day(), self.state.ta_budget_task
+        paused = [u for u in usage if u[0] in ("wishlist", "ceiling")]
+        if paused and opened != day:
+            body = report.ta_budget_body(day, paused)
+            try:
+                self.reporter.ta_budget_task(self.scrub(body))
+            except Exception as e:  # noqa: BLE001
+                self.issue(f"Vikunja TA request budget task not updated ({type(e).__name__})")
+                return
+            self.state.ta_budget_task = day
+            self.notify(report.TA_BUDGET_TITLE,
+                        f"{body.splitlines()[0]}\nSee the task in Vikunja (Wishlist Sync).")
+        elif not paused and opened is not None and opened != day:
+            try:
+                self.reporter.ta_budget_task(None)
+            except Exception as e:  # noqa: BLE001
+                self.issue(f"Vikunja TA request budget task not closed ({type(e).__name__})")
+                return
+            self.state.ta_budget_task = None
+            self.say("ta budget: room again today; the request budget task is closed")
+
     def _finish(self) -> int:
         """Exit code; the failure ping goes out only when the set of issues changed since last run."""
+        if self.meter is not None:
+            self.say(f"ta requests: {self.meter.summary()}")
+            if self.state_ok:  # the counts are the day's ledger: keep them even when no step saved last
+                try:
+                    save_state(self.cfg.state, self.state)
+                except Exception as e:  # noqa: BLE001
+                    self.say(f"state not saved ({type(e).__name__})", logging.ERROR)
         digest = failure_digest(self.issues) if self.issues else None
         if digest is not None:
             if self.state_ok and self.state.last_failure == digest:
@@ -650,12 +859,17 @@ class _Run:
         except Exception as e:  # noqa: BLE001 - corrupt JSON surfaces as several error types
             self.issue(f"state file unreadable ({type(e).__name__}); fix or delete {cfg.state}")
             return self.fail()
+        self.meter = self._make_meter()
         if cfg.lists:
-            self._wishlist()
+            with self.meter.step_as("wishlist"):
+                self._wishlist()
         if cfg.library:
-            self._library()
+            with self.meter.step_as("library"):
+                self._library()
         if cfg.collection:
-            self._collection()
+            with self.meter.step_as("collection"):
+                self._collection()
+        self._ta_budget()
         return self._finish()
 
     def _wishlist(self) -> None:
@@ -695,7 +909,7 @@ class _Run:
         ta_client = None
         if ta.enabled or deku.enabled:  # Deku needs TA's D2D lists
             try:
-                ta_client = self.deps.make_ta(cfg, dict(self.state.ta_game_ids))
+                ta_client = self._make_ta()
             except Exception as e:  # noqa: BLE001
                 self.issue(f"{ta.label}: client setup failed ({type(e).__name__})")
                 ta.failed = "client setup failed"
@@ -703,6 +917,8 @@ class _Run:
         ta.client = ta_client if ta.enabled else None
         self._clients = {"deku": deku.client, "ta": ta.client}
         self._read(deku, with_platforms=True)
+        if ta.enabled and ta.client is not None and not ta.failed and not self.ta_admit(1):
+            self._paused(ta, "no room left in the day's TrueAchievements request budget")
         self._read(ta)
 
         # 3. Disc to Digital verdicts (only Deku formats use them)
@@ -714,8 +930,9 @@ class _Run:
         # 4. matching
         if deku.active:
             self._match(deku, self._deku_resolve)
-        if ta.active:
-            self._match(ta, self._ta_resolve)
+        if ta.active:  # stored TA results are reused without a request; a failed lookup backs off, not retried at once
+            self._match(ta, self._ta_resolve, reuse=self._ta_reused, failed=self._ta_failed,
+                        retry=lambda e: isinstance(e, FlareSolverrError))
 
         # 5. plan
         plan = self._plan(lists, verdicts, d2d_ok)
@@ -751,7 +968,7 @@ class _Run:
             self.issue(f"library step skipped: library overrides rejected: {e}")
             return
         try:
-            ta = self.ta_client or self.deps.make_ta(cfg, dict(self.state.ta_game_ids))
+            ta = self.ta_client or self._make_ta()
             http = self.deps.make_xbox_http()
         except Exception as e:  # noqa: BLE001
             self.issue(f"library step: client setup failed ({type(e).__name__})")
@@ -781,7 +998,7 @@ class _Run:
             return
         try:
             deku = self._clients.get("deku") or self.deps.make_deku(cfg)
-            ta = self.ta_client or self.deps.make_ta(cfg, dict(self.state.ta_game_ids))
+            ta = self.ta_client or self._make_ta()
         except Exception as e:  # noqa: BLE001
             self.issue(f"Deku collection step: client setup failed ({type(e).__name__})")
             return
@@ -810,6 +1027,13 @@ class _Run:
 
     # ---- 2. reads
 
+    def _paused(self, lst: _List, why: str) -> None:
+        """The list's TA requests are held back (`TAPaused`, or no room for them): it is left as --only leaves a
+        disabled list, quietly. No writes on it this run, its problem tasks neither opened nor closed, no issue."""
+        lst.paused = lst.failed = f"TrueAchievements requests paused ({why})"
+        self.say(f"{lst.name}: not synced this run: {lst.paused}; no {lst.label} writes, its tasks left as they "
+                 "are; retried at a later run", logging.WARNING)
+
     def _read(self, lst: _List, *, with_platforms: bool = False) -> None:
         if not lst.enabled:
             self.say(f"{lst.name}: not synced this run (--only)")
@@ -821,6 +1045,9 @@ class _Run:
                 lst.current = lst.client.wishlist(with_platforms=True)
             else:
                 lst.current = lst.client.wishlist()
+        except TAPaused as e:
+            self._paused(lst, _err(e))
+            return
         except Exception as e:  # noqa: BLE001 - any read failure: no writes on this list
             lst.failed = "wishlist read failed"
             self.issue(f"{lst.label} wishlist read failed, no {lst.label} writes this run: {_err(e)}")
@@ -839,8 +1066,13 @@ class _Run:
         try:
             if fetch is None:
                 raise RuntimeError("no TrueAchievements client for the D2D lists")
-            verdicts = self.deps.refresh_verdicts(items, self.state, fetch, self.deps.http_get, now,
-                                                  pause=self.deps.d2d_pause)
+            with self.meter.step_as("d2d"):
+                verdicts = self.deps.refresh_verdicts(items, self.state, fetch, self.deps.http_get, now)
+        except (TAPaused, d2d.D2DWaiting) as e:  # no copy of TA's lists, and TA requests held back or the read after a
+            # failed one not due yet (that run raised the issue): quietly, judging nothing on XCT.live alone
+            self.say(f"d2d: TrueAchievements Disc to Digital lists not read ({_err(e)}): using cached verdicts and "
+                     "making no Deku format changes this run", logging.WARNING)
+            return {i.product_id: (self.state.d2d.get(i.product_id) or {}).get("verdict") for i in items}, False
         except Exception as e:  # noqa: BLE001
             self.issue(f"Disc to Digital refresh failed ({_err(e)}): using cached verdicts and "
                        "making no Deku format changes this run")
@@ -869,50 +1101,72 @@ class _Run:
     def _over_budget(self) -> bool:
         return self.deps.monotonic() - self.start > self.cfg.match_budget
 
-    def _match(self, lst: _List, resolve) -> None:
+    def _match(self, lst: _List, resolve, *, reuse=None, retry=None, failed=None) -> None:
+        """Every item's match. `reuse(item)`: the item's result without a request, or None; it is still used after the
+        list's lookups stopped (repeated errors). `retry(exc)`: whether a failed lookup is retried at once (default:
+        always). `failed(item)`: called after a failed lookup; says when it is retried (default: the next run)."""
         for item in lst.items:
             pid = item.product_id
             if lst.failed or lst.stop:
-                lst.matches[pid] = transient(lst.stop or "list failed")
-                continue
-            try:
-                m = self._resolve(lst, resolve, item)
-                lst.errors = 0
-            except _Deferred:
-                lst.deferred += 1
-                m = transient("deferred to the next run (lookup time budget)")
-            except (DekuAuthError, TAAuthError) as e:
-                lst.failed = "login rejected during matching"
-                self.issue(f"{lst.label}: {lst.failed} ({type(e).__name__}); no {lst.label} writes this run")
-                m = transient(lst.failed)
-            except Exception as e:  # noqa: BLE001 - never let a failed lookup read as "none"
-                # A per-item failure is a warning: the item is ambiguous (removals pause) and is
-                # retried next run; it isn't a run failure and opens no task.
-                lst.errors += 1
-                self.say(f"{lst.label}: lookup failed for {item.title!r} ({_err(e)}); "
-                         "removals paused, retried next run", logging.WARNING)
-                m = transient(f"lookup failed ({type(e).__name__})")
-                if lst.errors >= MAX_LOOKUP_ERRORS:
-                    lst.stop = "lookup skipped after repeated errors"
-                    self.say(f"{lst.label}: {MAX_LOOKUP_ERRORS} lookups failed in a row; skipping the rest "
-                             "this run", logging.WARNING)
+                m = reuse(item) if reuse is not None and not lst.failed else None
+                if m is None:
+                    lst.matches[pid] = transient(lst.stop or lst.paused or "list failed")
+                    continue
+            else:
+                m = self._lookup(lst, resolve, item, retry, failed)
             lst.matches[pid] = m
             self.say(f"{lst.name} match: {item.title} -> {m.status}"
                      + (f" {m.target}" if m.target else "")
                      + (f" [{'; '.join(m.candidates)}]" if m.status != "matched" and m.candidates else ""))
         if lst.deferred:
             self.say(f"{lst.name}: {lst.deferred} lookups deferred to the next run (time budget)")
+        if lst.no_room:
+            self.say(f"{lst.name}: {lst.no_room} lookup{'s' if lst.no_room != 1 else ''} deferred to a later run (no "
+                     "room left in the day's TrueAchievements request budget)", logging.WARNING)
         self._related_to_stale(lst)
 
-    def _resolve(self, lst: _List, resolve, item: XboxItem) -> Match:
-        """One lookup, retried once after a failure (FlareSolverr challenges time out at random)."""
+    def _lookup(self, lst: _List, resolve, item: XboxItem, retry, failed) -> Match:
+        """One item's match; whatever goes wrong becomes a transient result (or stops the list), never "none"."""
+        try:
+            m = self._resolve(lst, resolve, item, retry)
+            lst.errors = 0
+        except _Deferred:
+            lst.deferred += 1
+            m = transient("deferred to the next run (lookup time budget)")
+        except _NoRoom:  # nothing sent: no failure, no back-off
+            lst.no_room += 1
+            m = transient("deferred (TA budget)")
+        except (DekuAuthError, TAAuthError) as e:
+            lst.failed = "login rejected during matching"
+            self.issue(f"{lst.label}: {lst.failed} ({type(e).__name__}); no {lst.label} writes this run")
+            m = transient(lst.failed)
+        except TAPaused as e:  # what was looked up stays cached; the list is left as a disabled one
+            self._paused(lst, _err(e))
+            m = transient(lst.paused)
+        except Exception as e:  # noqa: BLE001 - never let a failed lookup read as "none"
+            # A per-item failure is a warning: the item is ambiguous (removals pause) and is
+            # retried at a later run; it isn't a run failure and opens no task.
+            lst.errors += 1
+            when = failed(item) if failed is not None else "retried next run"
+            self.say(f"{lst.label}: lookup failed for {item.title!r} ({_err(e)}); "
+                     f"removals paused, {when}", logging.WARNING)
+            m = transient(f"lookup failed ({type(e).__name__})")
+            if lst.errors >= MAX_LOOKUP_ERRORS:
+                lst.stop = "lookup skipped after repeated errors"
+                self.say(f"{lst.label}: {MAX_LOOKUP_ERRORS} lookups failed in a row; skipping the rest "
+                         "this run", logging.WARNING)
+        return m
+
+    def _resolve(self, lst: _List, resolve, item: XboxItem, retry=None) -> Match:
+        """One lookup, retried once after a failure `retry` allows (default: any; FlareSolverr challenges time out at
+        random)."""
         for attempt in (1, 2):
             try:
                 return resolve(item, not self._over_budget())
-            except (_Deferred, DekuAuthError, TAAuthError):
+            except (_Deferred, _NoRoom, DekuAuthError, TAAuthError, TAPaused):  # TAPaused: held back, never sent
                 raise
             except Exception as e:  # noqa: BLE001
-                if attempt == 2:
+                if attempt == 2 or (retry is not None and not retry(e)):
                     raise
                 self.say(f"{lst.name}: lookup for {item.title!r} failed ({type(e).__name__}); retrying once",
                          logging.WARNING)
@@ -1002,15 +1256,23 @@ class _Run:
 
     # TrueAchievements
 
+    def _ta_override_page(self, pid: str, slug: str) -> tuple[int, str] | None:
+        """(game id, title) of an override slug from the cache, or None when the page has to be fetched."""
+        ta = self._client("ta")
+        cached = (self.state.mapping.get(pid) or {}).get("ta_override") or {}
+        if (ta.game_ids.get(slug, 0) > 0 and cached.get("slug") == slug and cached.get("title")):
+            return ta.game_ids[slug], cached["title"]
+        return None
+
     def _ta_game_id(self, pid: str, slug: str) -> tuple[int, str]:
         """(game id, title) for an override slug; positive ids and the title are cached in state.
 
         A placeholder (pre-release, id < 1) is never cached: its id changes on release.
         """
+        known = self._ta_override_page(pid, slug)
+        if known is not None:
+            return known
         ta = self._client("ta")
-        cached = (self.state.mapping.get(pid) or {}).get("ta_override") or {}
-        if (ta.game_ids.get(slug, 0) > 0 and cached.get("slug") == slug and cached.get("title")):
-            return ta.game_ids[slug], cached["title"]
         page = ta.game(slug)
         if page.id > 0:
             ta.game_ids[slug] = page.id
@@ -1050,7 +1312,7 @@ class _Run:
             ta.game_ids[p.slug] = p.id
         if not pages:
             # Only pre-release placeholder pages (negative ids, not writable): no page yet.
-            self.say(f"ta: {title} has only a pre-release placeholder page on TrueAchievements; retried each run")
+            self.say(f"ta: {title} has only a pre-release placeholder page on TrueAchievements")
             return Match("none", None, [PLACEHOLDER]), None
         chosen = choose_ta_page(pages)
         described = [f"{p.title} [{p.platform or 'no platform'}]" for p in pages]
@@ -1089,9 +1351,14 @@ class _Run:
         slug, dlc = ov.get("ta"), ov.get("ta_dlc")
         if slug:
             game_id, title = self._ta_game_id(item.product_id, slug)
-            if game_id < 1:
-                self.say(f"ta: override page for {item.title} is a pre-release placeholder; retried each run")
-                return transient(f"override page {title} is a pre-release placeholder")
+            if game_id < 1:  # transient for planning, but kept for its slug until due, like a stored miss
+                now = self.deps.now()
+                self.state.mapping.setdefault(item.product_id, {})["ta_override_miss"] = {
+                    "slug": slug, "title": title, "kind": item.kind, "checked": now.isoformat()}
+                due = recheck_due(item.product_id, item.kind, now)
+                self.say(f"ta: override page for {item.title} is a pre-release placeholder; looked up again from "
+                         f"{due:%Y-%m-%d %H:%M} UTC")
+                return transient(_placeholder_override(title))
             if dlc:
                 return Match("matched", _ta_key(game_id, dlc), [title])
             if is_dlc(item):
@@ -1107,25 +1374,124 @@ class _Run:
         return Match("ambiguous", None, ["ta_dlc override, but the parent game wasn't found"])
 
     def _ta_resolve(self, item: XboxItem, allow_search: bool) -> Match:
+        """The item's TA match: a result reused without a request (`_ta_reused`), else a fresh lookup. A lookup waits
+        while the item is backed off after failures, past the lookup time budget (a search), and while the day's TA
+        request budget has no room for it plus WRITE_RESERVE kept for the TA writes (admission). Its raw result is kept
+        (`_ta_looked_up`)."""
+        m = self._ta_reused(item)
+        if m is not None:
+            return m
+        held = self._ta_backed_off(item)
+        if held is not None:
+            return held
         pid = item.product_id
         ov = self.overrides.get(pid, {})
-        if ov.get("ta") or ov.get("ta_dlc"):
-            return self._ta_override(item, ov)
-        cached = self.state.mapping.get(pid) or {}
-        ta_map = cached.get("ta")
-        if (isinstance(ta_map, dict) and cached.get("ta_key") == base_title(item.title)
-                and isinstance(ta_map.get("game"), int) and isinstance(ta_map.get("dlc", 0), int)):
-            return Match("matched", _ta_key(ta_map["game"], ta_map.get("dlc", 0)),
-                         [cached.get("ta_title") or item.title])
-        if not allow_search:
+        override = bool(ov.get("ta") or ov.get("ta_dlc"))
+        if not override and not allow_search:
             raise _Deferred
-        m, game = self._ta_dlc(item) if is_dlc(item) else self._ta_game(item.title)
-        if m.status == "matched" and game is not None:
-            gid, dlc = _ta_ids(m.target)
-            self.state.mapping.setdefault(pid, {}).update(
-                ta={"game": gid, "dlc": dlc, "slug": game.slug}, ta_key=base_title(item.title),
-                ta_title=m.candidates[0] if m.candidates else game.title)
+        if not self.ta_admit(LOOKUP_REQUESTS + WRITE_RESERVE, "wishlist"):  # lookups never spend what writes need
+            raise _NoRoom
+        if override:
+            m = self._ta_override(item, ov)
+        else:
+            m, game = self._ta_dlc(item) if is_dlc(item) else self._ta_game(item.title)
+            if m.status == "matched" and game is not None:
+                gid, dlc = _ta_ids(m.target)
+                self.state.mapping.setdefault(pid, {}).update(
+                    ta={"game": gid, "dlc": dlc, "slug": game.slug}, ta_key=base_title(item.title),
+                    ta_title=m.candidates[0] if m.candidates else game.title)
+        self._ta_looked_up(item, ov, m)
         return m
+
+    # TrueAchievements: kept results (`mapping[pid]`: "ta_miss", "ta_override_miss", "ta_backoff")
+
+    def _ta_reused(self, item: XboxItem) -> Match | None:
+        """The item's TA result without a request, or None when it needs a lookup: an override whose page is cached, a
+        cached match, or a kept result that isn't due (`_ta_kept`). No request, so it also serves past the lookup time
+        budget and after the list's lookups stopped."""
+        pid = item.product_id
+        ov = self.overrides.get(pid, {})
+        entry = self.state.mapping.get(pid) or {}
+        slug, m = ov.get("ta"), None
+        if slug or ov.get("ta_dlc"):
+            if slug and (ov.get("ta_dlc") or not is_dlc(item)) and self._ta_override_page(pid, slug) is not None:
+                m = self._ta_override(item, ov)  # the cached id: no page fetch, and no DLC list needed
+        else:
+            ta_map = entry.get("ta")
+            if (isinstance(ta_map, dict) and entry.get("ta_key") == base_title(item.title)
+                    and isinstance(ta_map.get("game"), int) and isinstance(ta_map.get("dlc", 0), int)):
+                m = Match("matched", _ta_key(ta_map["game"], ta_map.get("dlc", 0)),
+                          [entry.get("ta_title") or item.title])
+        if m is None:
+            m = self._ta_kept(item, ov, entry)
+        if m is not None and entry:
+            if m.status == "matched":  # a match ends the kept results
+                entry.pop("ta_miss", None)
+                entry.pop("ta_override_miss", None)
+            if not is_transient(m):
+                entry.pop("ta_backoff", None)
+        return m
+
+    def _ta_kept(self, item: XboxItem, ov: dict, entry: dict) -> Match | None:
+        """A kept lookup result while it isn't due (`recheck_due`): a miss stored for the item's key, rebuilt exactly as
+        the lookup returned it (placeholder marker included), or an override page that was still a placeholder, kept
+        for its slug and the item's release state (transient for planning, as when fetched)."""
+        now, pid = self.deps.now(), item.product_id
+        miss = entry.get("ta_miss")
+        if isinstance(miss, dict) and miss.get("key") == _ta_miss_key(item, ov):
+            checked, status, candidates = _utc(miss.get("checked")), miss.get("status"), miss.get("candidates")
+            if (checked is not None and status in ("none", "ambiguous") and isinstance(candidates, list)
+                    and now < recheck_due(pid, item.kind, checked)):
+                return Match(status, None, [str(c) for c in candidates])
+        held = entry.get("ta_override_miss")
+        if (isinstance(held, dict) and ov.get("ta") and held.get("slug") == ov["ta"]
+                and held.get("kind") == item.kind):
+            checked = _utc(held.get("checked"))
+            if checked is not None and now < recheck_due(pid, item.kind, checked):
+                return transient(_placeholder_override(held.get("title") or ov["ta"]))
+        return None
+
+    def _ta_looked_up(self, item: XboxItem, ov: dict, m: Match) -> None:
+        """Keep a fresh lookup's raw result, from before `_related_to_stale` (which runs on it every run): "none" or
+        "ambiguous" as a miss for the item's key, until due. A match keeps nothing (its mapping is the cache); an
+        override page still a placeholder was kept by `_ta_override`. A lookup that got an answer ends any back-off."""
+        entry = self.state.mapping.setdefault(item.product_id, {})
+        entry.pop("ta_backoff", None)
+        entry.pop("ta_miss", None)
+        if not is_transient(m):
+            entry.pop("ta_override_miss", None)
+        if m.status in ("none", "ambiguous") and not is_transient(m):
+            now = self.deps.now()
+            entry["ta_miss"] = {"status": m.status, "candidates": list(m.candidates), "checked": now.isoformat(),
+                                "key": _ta_miss_key(item, ov)}
+            due = recheck_due(item.product_id, item.kind, now)
+            self.say(f"ta: {item.title}: {m.status}, kept until {due:%Y-%m-%d %H:%M} UTC unless the game changes")
+
+    def _ta_backed_off(self, item: XboxItem) -> Match | None:
+        """Transient, with no request, while the item is backed off after failed lookups of its key (`_ta_miss_key`):
+        a changed key, as for a kept miss, means a lookup at once."""
+        backoff = (self.state.mapping.get(item.product_id) or {}).get("ta_backoff")
+        key = _ta_miss_key(item, self.overrides.get(item.product_id, {}))
+        if not isinstance(backoff, dict) or backoff.get("key") != key:
+            return None
+        until = _utc(backoff.get("until"))
+        if until is None or self.deps.now() >= until:
+            return None
+        n = backoff.get("failures")
+        return transient(f"backed off after {n} failed lookup{'s' if n != 1 else ''}, until {until:%Y-%m-%d %H:%M} UTC")
+
+    def _ta_failed(self, item: XboxItem) -> str:
+        """A failed lookup backs the item off: 1, 2, 4 ... hours after each failure in a row, at most BACKOFF_MAX,
+        ending on the hour, so the hourly run after the delay tries again. It is kept with the item's key: the failures
+        of another key count from 1. Returns when that is, for the warning."""
+        entry = self.state.mapping.setdefault(item.product_id, {})
+        key, prior = _ta_miss_key(item, self.overrides.get(item.product_id, {})), entry.get("ta_backoff")
+        n = prior.get("failures") if isinstance(prior, dict) and prior.get("key") == key else 0
+        n = (n if isinstance(n, int) and n > 0 else 0) + 1
+        delay = min(timedelta(hours=2 ** min(n - 1, 5)), BACKOFF_MAX)
+        until = (self.deps.now() + delay).astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        entry["ta_backoff"] = {"failures": n, "until": until.isoformat(), "key": key}
+        return f"looked up again from {until:%Y-%m-%d %H:%M} UTC"
 
     # ---- 5. plan
 
@@ -1283,6 +1649,10 @@ class _Run:
                 self.issue(f"TrueAchievements login rejected while writing ({type(ex).__name__}); TA writes stopped")
                 stopped = True
                 break
+            except TAPaused as ex:
+                self._writes_paused(len(lp.adds) - n + len(lp.removes), ex)
+                stopped = True
+                break
             except Exception as ex:  # noqa: BLE001
                 block = True
                 self.issue(f"TrueAchievements add failed: {e.title} ({e.target}): {_err(ex)}")
@@ -1296,6 +1666,9 @@ class _Run:
                     ta.remove(*_ta_ids(e.target))
                     done.removes.append(e)
                     self.say(f"ta remove: {e.title} ({e.target})")
+                except TAPaused as ex:
+                    self._writes_paused(len(lp.removes) - n, ex)
+                    break
                 except Exception as ex:  # noqa: BLE001 - stop the sweep at the first surprise
                     self.issue(f"TrueAchievements remove failed: {e.title} ({e.target}): {_err(ex)}; "
                                "remaining TA removals skipped")
@@ -1312,9 +1685,18 @@ class _Run:
                  f"{self.cfg.write_deadline / 60:.0f}-minute write deadline)", logging.WARNING)
         return True
 
+    def _writes_paused(self, remaining: int, e: TAPaused) -> None:
+        """TA requests held back mid-writes: the rest stop quietly, and the next run plans them again (no issue)."""
+        self.say(f"ta: {remaining} writes left for the next run (TrueAchievements requests paused: {_err(e)})",
+                 logging.WARNING)
+
     def _verify_ta(self, ta, done: ListPlan) -> None:
         try:
             after = ta.wishlist()
+        except TAPaused as e:
+            self.say(f"ta: verification re-read skipped ({_err(e)}); the next run's read shows the writes",
+                     logging.WARNING)
+            return
         except Exception as e:  # noqa: BLE001
             self.issue(f"TrueAchievements verification re-read failed: {_err(e)}")
             return
@@ -1335,8 +1717,9 @@ class _Run:
         if ta_client is not None:
             ids = getattr(ta_client, "game_ids", {}) or {}
             self.state.ta_game_ids = {k: v for k, v in ids.items() if isinstance(v, int) and v > 0}
-        # A good run (a list read and synced, no list read failed) sets the shrink-guard baseline.
-        enabled = [lst for lst in lists.values() if lst.enabled]
+        # A good run (a list read and synced, no list read failed) sets the shrink-guard baseline. A paused list
+        # counts as a disabled one.
+        enabled = [lst for lst in lists.values() if lst.enabled and not lst.paused]
         if any(lst.active for lst in enabled) and all(lst.current is not None for lst in enabled):
             self.state.last_feed_count = self.feed_count
         else:
