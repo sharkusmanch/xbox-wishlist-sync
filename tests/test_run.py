@@ -872,7 +872,7 @@ def test_override_to_a_placeholder_page_is_no_page_yet(tmp_path):
     h.ta.pages["alpha-quest"] = tag("alpha-quest", -7827, "Alpha Quest")
     assert h.run() == 0
     assert ("add", "-7827") not in h.ta.writes and not any(w[1].startswith("-") for w in h.ta.writes)
-    assert ("remove", "999") not in h.ta.writes  # ambiguous: TA removals pause
+    assert ("remove", "999") in h.ta.writes  # "no page yet", and the override pins PA: TA removals go ahead
     assert not any(p.product_id == "PA" and p.kind == "unmatched-ta" for p in h.reporter.problems)
     assert "alpha-quest" not in load_state(h.cfg.state).ta_game_ids  # placeholder ids aren't cached
 
@@ -1877,18 +1877,18 @@ def test_a_changed_key_ends_a_back_off_at_once(tmp_path):
 
 def test_placeholder_override_reused_weekly(tmp_path):
     """An override whose page is still a pre-release placeholder is fetched once, then reused on the stored-miss
-    schedule (weekly in PP's slot, Sunday 21:00, before release; daily at 21:00 after), keyed on its slug and the
-    release state. It stays transient for planning: TA removals pause and no task opens."""
+    schedule (weekly in PP's slot, Sunday 21:00, before release; daily at 21:00 after), keyed on the override and
+    the release state. It is "no page yet": no task, and TA removals go ahead."""
     h = basic(tmp_path, dry_run=True, records=[feed_record("PP", "Delta Dawn", kind="concrete")], lists=("ta",),
               overrides={"PP": {"ta": "delta-dawn"}})
     h.ta.pages["delta-dawn"] = tag("delta-dawn", -5150, "Delta Dawn")
     assert run_at(h, NOW) == ([], ["delta-dawn"])
-    assert ta_entry(h, "PP")["ta_override_miss"] == {"slug": "delta-dawn", "title": "Delta Dawn", "kind": "concrete",
-                                                     "checked": NOW.isoformat()}
+    assert ta_entry(h, "PP")["ta_miss"] == {"status": "none", "candidates": [PLACEHOLDER], "checked": NOW.isoformat(),
+                                            "key": ["delta dawn", "concrete", "game", {"ta": "delta-dawn"}]}
     assert run_at(h, at(8, 20, 59)) == ([], [])
     plan = h.reporter.reviews[-1][0]
-    assert plan.ta.removes == [] and [e.target for e in plan.ta.paused_removes] == ["999"]
-    assert not any(p.product_id == "PP" for p in h.reporter.problems) and h.reporter.keep_keys == {"PP:unmatched-ta"}
+    assert [e.target for e in plan.ta.removes] == ["999"] and plan.ta.paused_removes == []
+    assert not any(p.product_id == "PP" for p in h.reporter.problems) and "PP:unmatched-ta" not in h.reporter.keep_keys
     assert run_at(h, at(8, 21)) == ([], ["delta-dawn"])
     write_feed(tmp_path, [feed_record("PP", "Delta Dawn", kind="released")])  # out: looked up at once, then daily
     assert run_at(h, at(8, 21, 30)) == ([], ["delta-dawn"])
@@ -1898,7 +1898,22 @@ def test_placeholder_override_reused_weekly(tmp_path):
     h.ta.pages["delta-dawn-xs"] = tag("delta-dawn-xs", 4242, "Delta Dawn (Xbox Series X|S)")
     assert run_at(h, at(9, 21, 30)) == ([], ["delta-dawn-xs"])
     assert [e.target for e in h.reporter.reviews[-1][0].ta.adds] == ["4242"]
-    assert "ta_override_miss" not in ta_entry(h, "PP")
+    assert "ta_miss" not in ta_entry(h, "PP")
+
+
+def test_placeholder_override_is_no_page_yet_and_pins_its_item(tmp_path):
+    """An override names the item's TA page. A pre-release placeholder there is "no page yet", as for an unannounced
+    game: no task and no removal pause. Placeholders can't be wishlisted, and the override pins the item, so a listed
+    entry whose title merely looks related ("Old Game" ~ "Old Game Revelation") isn't the item's and goes."""
+    h = basic(tmp_path, dry_run=True, records=[feed_record("PP", "Old Game Revelation", kind="concrete")],
+              lists=("ta",), overrides={"PP": {"ta": "old-game-revelation"}})
+    h.ta.pages["old-game-revelation"] = tag("old-game-revelation", -7000, "Old Game Revelation")
+    for when in (NOW, at(1, 13)):  # fetched once, then the kept placeholder (no request): the same plan
+        run_at(h, when)
+        plan = h.reporter.reviews[-1][0]
+        assert [e.target for e in plan.ta.removes] == ["999"] and plan.ta.paused_removes == []
+        assert not any(p.product_id == "PP" for p in h.reporter.problems)
+        assert "PP:unmatched-ta" not in h.reporter.keep_keys
 
 
 def test_match_clears_stored_miss_and_backoff(tmp_path):
