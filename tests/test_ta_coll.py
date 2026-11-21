@@ -406,3 +406,11 @@ def test_list_url_switches_on_the_release_date_column():
 def test_rows_cached_before_the_release_date_column_still_load():
     old = {"ta_id": 1, "title": "T", "platform": "xbox-360", "ownership": "Owned", "media": ""}
     assert OwnedRow(**old).released is None
+
+
+def test_a_collection_read_is_admitted_with_its_pages_plus_two():
+    from wsync.ta_coll import READ_UNKNOWN, read_requests
+
+    assert read_requests(950) == 1 + 10 + 2  # the collection page, 10 list pages of 100 and a login's two
+    assert read_requests(100) == 1 + 1 + 2 and read_requests(101) == 1 + 2 + 2
+    assert read_requests(None) == read_requests(0) == READ_UNKNOWN == 20

@@ -3,9 +3,10 @@
 Two parts:
   - `plan_collection` (pure, no I/O): from the owned rows, the Deku collection as it stands and the
     per-game cache, which rows still need a Deku lookup this run;
-  - `run_collection_step` (the orchestration `wsync.run` calls after the wishlist step): reads both
-    collections, plans, looks each game up on Deku (paced, budgeted), adds it (live) or lists it
-    (dry run), caches every outcome and reports.
+  - `run_collection_step` (the orchestration `wsync.run` calls after the wishlist and library steps):
+    reads both collections (the TA one from the library step's read in the same run when it can),
+    plans, looks each game up on Deku (paced, budgeted), adds it (live) or lists it (dry run), caches
+    every outcome and reports.
 
 The step is add-only. It never names an existing Deku entry for change: a title that only has
 Switch / PlayStation entries still gets a lookup, and the step adds a separate Xbox entry beside
@@ -45,7 +46,8 @@ from .deku import DekuError, DekuItem, DekuNetworkError, DekuPartialOwn, DekuRat
 from .errors import TAError
 from .match import base_title, norm, pick, strip_edition_noise
 from .overrides import SKIP
-from .ta_coll import OwnedRow
+from .ta import TAPaused
+from .ta_coll import OwnedRow, read_requests
 
 # TA platform slug -> Deku platform key. Every other TA platform is skipped without a Deku request.
 # TA's platform is the console the game was played on (an Xbox One game played on a Series X shows
@@ -313,9 +315,20 @@ def _counts_entry(entry: dict | None) -> bool:
 
 
 def _ta_rows(run, ta, state, now: datetime, res: "StepResult") -> list[OwnedRow] | None:
-    """The TA collection, from state while that read is still current (`_ta_fresh`). None when there is none this run:
-    after an issue (a failed read) or quietly (`res.stopped`) during the 6 h back-off after one, or
-    when less than 10 minutes remain before the write deadline."""
+    """The TA collection: the library step's read in this run when the step may take it (`_handed_over`), stored as
+    this step's read with the library's read time; else from state while that read is still current (`_ta_fresh`); else
+    a read of its own. Taking the library's read costs no request, so it comes before the back-off, the deadline margin
+    and the budget's admission. None when there is none this run: after an issue (a failed read) or quietly
+    (`res.stopped`) during the 6 h back-off after one, when less than 10 minutes remain before the write deadline, or
+    when the day's TA request budget holds the read back: no room for its pages + 2 (from the last read's size,
+    `read_requests`), or a request refused during it (TAPaused). That one stamps no back-off: the next run with room
+    reads."""
+    handed = _handed_over(run, now)
+    if handed is not None:
+        fetched, rows = handed
+        state.ta_collection = {"fetched": fetched.isoformat(), "rows": [asdict(r) for r in rows]}
+        run.say(f"collection: TrueAchievements collection from this run's library read ({len(rows)} titles)")
+        return rows
     cached = state.ta_collection or {}
     fetched = _parse(cached.get("fetched")) if cached.get("fetched") else None
     if fetched is not None and _ta_fresh(fetched, now, run.cfg.ta_read_after):
@@ -341,8 +354,19 @@ def _ta_rows(run, ta, state, now: datetime, res: "StepResult") -> list[OwnedRow]
         run.say("collection: step not started, too close to the write deadline for a TrueAchievements "
                 "collection read; next run", logging.WARNING)
         return None
+    cost = read_requests(len(cached["rows"]) if isinstance(cached.get("rows"), list) else None)
+    if not run.ta_admit(cost):
+        res.stopped = "TrueAchievements request budget"
+        run.say(f"collection: no room left in the day's TrueAchievements request budget for the collection read "
+                f"({cost} requests); read at a later run", logging.WARNING)
+        return None
     try:
         rows = ta.collection()
+    except TAPaused as e:
+        res.stopped = f"TrueAchievements requests paused ({type(e).__name__})"
+        run.say(f"collection: TrueAchievements collection not read ({_err(e)}); read at a later run",
+                logging.WARNING)
+        return None
     except TAError as e:
         err = run.scrub(_err(e))
         state.ta_collection = {**cached, "last_attempt": now.isoformat(), "error": err}
@@ -351,6 +375,26 @@ def _ta_rows(run, ta, state, now: datetime, res: "StepResult") -> list[OwnedRow]
     state.ta_collection = {"fetched": now.isoformat(), "rows": [asdict(r) for r in rows]}
     run.say(f"collection: read the TrueAchievements collection ({len(rows)} titles)")
     return rows
+
+
+def _handed_over(run, now: datetime) -> tuple[datetime, list[OwnedRow]] | None:
+    """The library step's TA collection read in this run (`run.library_read`: its time and rows) when this step may
+    take it as its own: the library started no TA write since (`run.library_wrote`) and the read is this period's
+    (`_ta_fresh`: made past the last WSYNC_TA_READ_AFTER time, i.e. after TA's own purchase import). None otherwise
+    (said when there is such a read), and the step goes on as without one: a write day costs a read of its own, so the
+    library's writes still reach Deku that day."""
+    if run.library_read is None:
+        return None
+    fetched, rows = run.library_read
+    declined = "collection: not using this run's library read of the TrueAchievements collection: "
+    if run.library_wrote:
+        run.say(declined + "the library wrote to TrueAchievements after it")
+        return None
+    after = run.cfg.ta_read_after
+    if not _ta_fresh(fetched, now, after):
+        run.say(declined + (f"made before the daily read time ({after:%H:%M} UTC)" if after else "not current"))
+        return None
+    return fetched, rows
 
 
 def _ta_fresh(fetched: datetime, now: datetime, read_after: dtime | None) -> bool:
@@ -538,8 +582,10 @@ class _Step:
 
 def run_collection_step(run, deku, ta, state, overrides: dict[int, dict], now: datetime) -> StepResult:
     """One run of the collection step. `run` is the wishlist run (`wsync.run._Run`): its `say`, `issue`,
-    `scrub`, `notify`, `sleep`, `past_deadline()`, `write_time_left()`, `checkpoint()` (save the state
-    now), `collection_dry` and `reporter`.
+    `scrub`, `notify`, `sleep`, `past_deadline()`, `write_time_left()`, `ta_admit(n)` (room for n more
+    TA requests today), `checkpoint()` (save the state now), `collection_dry`, `reporter`, and the
+    library step's `library_read` and `library_wrote` (its TA collection read in this run, taken as this
+    step's own when the library wrote nothing since: `_handed_over`).
 
     Failures that leave nothing to report become `run.issue` (exit 1); a Deku 429, a network error or
     the write deadline end the step quietly. Exceptions other than Deku/TA errors propagate.

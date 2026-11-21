@@ -51,8 +51,9 @@ from .flaresolverr import FlareSolverrError
 from .overrides import SKIP
 from .owned import (BARE_PLATFORM, PLATFORM_SUFFIX, PLATFORM_TAG, TIER_PLAIN, OwnedGame, game_key, hint, match_keys,
                     owned_games, same_game, shown_title)
-from .ta import ONE, SERIES, AlreadyListed, AuthError, ChangedOnTA, PageUnavailable, TAGame, Unreachable
-from .ta_coll import OwnedRow
+from .ta import (ONE, SERIES, AlreadyListed, AuthError, BudgetSpent, ChangedOnTA, PageUnavailable, TAGame, TAPaused,
+                 Unreachable)
+from .ta_coll import OwnedRow, read_requests
 from .xbox import SignInNeeded, TokenStore, XboxError, catalog_lookup, fetch_collections, fetch_orders, open_session
 
 OWNED, GWG, DIGITAL = "Owned", "Games with Gold", "Digital"
@@ -454,7 +455,6 @@ def plan_library(games: list[OwnedGame], ta_rows: list[OwnedRow], pages: dict[st
 
 # ================================================================ the step
 
-PACE = 4.0  # seconds before each TrueAchievements request the step makes
 READ_RETRY = timedelta(hours=6)  # after a failed Microsoft or TA read, no new read for this long
 # How long a game's looked-up pages are reused, in days: a base plus a stable per-product offset of 0..spread days
 # (`lookup_lifetime`), so that results looked up together don't all expire together.
@@ -462,12 +462,19 @@ LIFETIMES = {"found": (7, 3),  # pages found for a product not seen at go-live (
              "seen": (30, 14),  # pages found for a product seen at go-live (decision A)
              "no-page": (90, 30)}  # no TA page at any address
 PAGES_KEEP = timedelta(days=180)  # a cached lookup older than this is dropped (its game is gone, or its key changed)
-LISTS_FRESH = timedelta(days=7)  # TA's Games with Gold and EA Play lists are read at most weekly
 MAX_WRITE_ERRORS = 3  # TA write errors without a successful write between them: the pass's writes stop
 MAX_LOOKUP_ERRORS = 3  # failed page lookups without a successful one between them: the pass's lookups stop
 QUIET_STOPS = 3  # quiet stops at one game (TA unavailable at its address), across runs and passes: its lookup failure
+# The TA requests a write is admitted with: an add's game page, AJAX add and re-read, then an EditOptions per field and
+# an UpdateGame for each it changes (6; 7 for a Games with Gold add). A page lookup is admitted with its addresses, a
+# collection read with its pages + 2 (`ta_coll.read_requests`).
+WRITE_REQUESTS = 7
 NEW_ENTRY = {"ownership": [OWNED], "media": [""]}  # what TA shows for an entry just added (compare-and-set)
 GWG_LIST, EA_LIST = "games-with-gold", "ea-play"
+# How long a TA list's copy in state is used before it is read again: Games with Gold's never (None: the programme ended
+# in 2023, so the list is frozen; delete state.library["lists"]["games-with-gold"] to read it again), EA Play's 30 days.
+LIST_REFRESH = {GWG_LIST: None, EA_LIST: timedelta(days=30)}
+LIST_RETRY = timedelta(hours=24)  # after a failed refresh of a list that has a copy, the next try waits this long
 
 
 @dataclass
@@ -516,6 +523,27 @@ def _unreachable(e: BaseException) -> bool:
     return isinstance(e, (Unreachable, FlareSolverrError))
 
 
+def _paused(e: TAPaused) -> str:
+    """`res.stopped` when TA requests are held back (TAPaused)."""
+    return f"TrueAchievements requests paused ({type(e).__name__})"
+
+
+def _known_size(state) -> int | None:
+    """The titles of the last TA collection read in state (the Deku collection step's; the library never plans from
+    it), to admit a new read with; None without one."""
+    rows = (state.ta_collection or {}).get("rows")
+    return len(rows) if isinstance(rows, list) else None
+
+
+def _first_unit(lib: dict, state, today: str) -> int:
+    """The TA requests the step needs room for to start: today's collection read (pages + 2) until the day's pass has
+    made it, so no sign-in or list read happens for a pass that couldn't read the collection; then one."""
+    stored = lib.get("pass")
+    if isinstance(stored, dict) and stored.get("day") == today and isinstance(stored.get("rows"), list):
+        return 1
+    return read_requests(_known_size(state))
+
+
 def _name(g: OwnedGame) -> str:
     """The game as a log line names it: never by its product ID (`shown_title`)."""
     return shown_title(g.title, g.pids)
@@ -535,18 +563,29 @@ def _everywhere(e: BaseException) -> bool:
 
 def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: datetime) -> LibraryResult:
     """One run of the library step. `run` is the wishlist run (`wsync.run._Run`): its `cfg`, `say`, `issue`,
-    `scrub`, `sleep`, `past_deadline()`, `checkpoint()` (save the state now) and `library_dry`. `ta` is the
-    TAClient, `http` the Microsoft transport, `overrides` the `library` section.
+    `scrub`, `sleep`, `past_deadline()`, `checkpoint()` (save the state now), `ta_admit(n)` (room for n more TA
+    requests today) and `library_dry`; the step sets its `library_read` (this run's TA collection read, `_pass_rows`)
+    and `library_wrote` (a TA write started in this run, `_Writer`) for the Deku collection step. `ta` is the TAClient,
+    `http` the Microsoft transport, `overrides` the `library` section.
 
     Once a day, at the first run past `cfg.library_after` (UTC), a pass: sign in; read the licences, orders and
-    catalog; TA's subscription lists (weekly) and the TA collection; plan; look up pages; plan again; write
-    (live): unfinished writes first, then the plan's. A pass that doesn't finish (lookups or writes left, a stop, a
-    failed write) goes on at the next run, with the TA collection its first run read and without the writes it has
-    made. A failed Microsoft or TA read is an issue; the runs within 6 h of it make no new read and only warn. A
-    Microsoft sign-in that needs a new token is not an issue: it isn't tried again before the next day's pass unless
-    XBOX_REFRESH_TOKEN changes. A TA write or page-lookup error is an issue about that game only; Cloudflare or
-    network trouble and the write deadline stop the lookups and writes quietly, as TA unavailable at a game's
-    address does (its QUIET_STOPS-th time at that game is that game's lookup error). Other exceptions propagate.
+    catalog; TA's subscription lists (Games with Gold once, EA Play every 30 days) and the TA collection; plan; look
+    up pages; plan again; write (live): unfinished writes first, then the plan's. A pass that doesn't finish (lookups
+    or writes left, a stop, a failed write) goes on at the next run, with the TA collection its first run read and
+    without the writes it has made; the owned games are kept from its first Microsoft read, also when its TA reads
+    have to wait, so a pass signs in once. A failed Microsoft or TA read is an issue; the runs within 6 h of it make
+    no new read and only warn. A Microsoft sign-in that needs a new token is not an issue: it isn't tried again before
+    the next day's pass unless XBOX_REFRESH_TOKEN changes. A TA write or page-lookup error is an issue about that game
+    only; Cloudflare or network trouble and the write deadline stop the lookups and writes quietly, as TA unavailable
+    at a game's address does (its QUIET_STOPS-th time at that game is that game's lookup error). Other exceptions
+    propagate.
+
+    The day's TA request budget: the step starts only with room for its first unit (`_first_unit`), and admits a
+    collection read with its pages + 2, a page lookup with its addresses and a write with WRITE_REQUESTS
+    (`run.ta_admit`). A unit without room,
+    or held-back TA requests met on the way (`TAPaused`), stop the step's TA work quietly and stamp nothing: no failed
+    read (no back-off), no list `tried`, no lookup failure or quiet stop against a game, and the lookup it stopped
+    doesn't count toward the day's cap. The pass goes on at a later run with room.
     """
     if now.tzinfo is None:
         raise ValueError("run_library_step needs a timezone-aware `now`")
@@ -577,10 +616,21 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
                 "next run once XBOX_REFRESH_TOKEN changes", logging.WARNING)
         library_report.signin_failed(run, lib, new=False)
         return res
+    need = _first_unit(lib, state, today)
+    if not run.ta_admit(need):
+        res.stopped = "TrueAchievements request budget"
+        run.say(f"library: no room left in the day's TrueAchievements request budget for the library step ({need} "
+                "requests); the pass goes on at a later run", logging.WARNING)
+        return res
     try:
         games = _owned(run, http, lib, today)
         gwg, ea_play = _lists(run, ta, lib, now)
-        rows = _pass_rows(run, ta, lib, today)
+        rows = _pass_rows(run, ta, lib, today, now, read_requests(_known_size(state)))
+    except TAPaused as e:  # a TA read held back: nothing planned or written, nothing stamped (the owned games kept)
+        res.stopped = _paused(e)
+        run.say(f"library: TrueAchievements read stopped ({_err(e)}); nothing planned or written, the pass goes on "
+                "at a later run", logging.WARNING)
+        return res
     except SignInNeeded as e:
         lib["signin_failed"] = {**signin, "day": today, "seed": seed}
         res.stopped = "Microsoft sign-in needed"
@@ -595,7 +645,6 @@ def run_library_step(run, ta, http, state, overrides: dict[str, dict], now: date
         run.issue(text)
         return res
     lib.pop("failed", None)
-    lib["pass"]["owned"] = [asdict(g) for g in games]  # the pass's later runs reuse them: no sign-in, no read
     done = set(lib["pass"].get("done") or ())
     plan = _without(done, plan_library(games, rows, _cached_pages(lib, games, overrides, now), overrides, gwg,
                                        ea_play))
@@ -649,7 +698,9 @@ def _end(run, res: LibraryResult, lib: dict, today: str) -> LibraryResult:
 
 def _owned(run, http, lib: dict, today: str) -> list[OwnedGame]:
     """The owned games: those today's pass read in its first run (kept in state.library["pass"]["owned"]), else
-    from a Microsoft sign-in, the licences, orders and the Store catalog. Every token, the XUID and the gamertag go
+    from a Microsoft sign-in, the licences, orders and the Store catalog, kept there at once (`_keep_owned`): before
+    any TA read, so a pass whose TA collection read waits (a held login, a spent budget, a failed read's back-off)
+    doesn't sign in again at each later run. Every token, the XUID and the gamertag go
     to the scrubber the moment they exist; a working sign-in clears a recorded failed one, and closes the sign-in
     task (a later run of the pass retries a close that failed, without signing in). SignInNeeded passes through;
     any other failure is a _ReadFailed: nothing is planned from a partial read. Data that can't be classified is one
@@ -681,7 +732,18 @@ def _owned(run, http, lib: dict, today: str) -> list[OwnedGame]:
                           "nothing planned or written; retried after 6 h") from None
     run.say(f"library: Microsoft: {len(items)} licences, {len(orders)} orders, {len(catalog)} catalog products; "
             f"{len(games)} games owned")
+    _keep_owned(lib, today, games)
     return games
+
+
+def _keep_owned(lib: dict, today: str, games: list[OwnedGame]) -> None:
+    """Keep the owned games in today's pass state, started here when the pass has no state yet; an older pass's quiet
+    stops go into it, for `_pass_rows` to take over as from that pass."""
+    stored = lib.get("pass")
+    if not (isinstance(stored, dict) and stored.get("day") == today):
+        quiet = stored.get("quiet") if isinstance(stored, dict) else None
+        stored = lib["pass"] = {"day": today, **({"quiet": dict(quiet)} if isinstance(quiet, dict) and quiet else {})}
+    stored["owned"] = [asdict(g) for g in games]
 
 
 def _stored_games(raw) -> list[OwnedGame] | None:
@@ -705,26 +767,37 @@ def _product_ids(items: list, orders: list) -> list[str]:
 
 
 def _lists(run, ta, lib: dict, now: datetime) -> tuple[set[int], set[int]]:
-    """TA's Games with Gold and EA Play lists (TA game ids), read at most weekly into state.library["lists"]. A
-    failed refresh keeps the copy in state (a warning; the next try waits READ_RETRY); with no copy, _ReadFailed."""
+    """TA's Games with Gold and EA Play lists (TA game ids), kept in state.library["lists"]: Games with Gold read only
+    when there is no copy, EA Play again once its copy is 30 days old (LIST_REFRESH). A failed refresh keeps the copy
+    in state (a warning; the next try waits LIST_RETRY); with no copy, _ReadFailed. Held-back TA requests (TAPaused)
+    use the copy without a back-off stamp; with no copy, TAPaused passes through."""
     lists = lib.setdefault("lists", {})
     out: list[set[int]] = []
     for slug in (GWG_LIST, EA_LIST):
         entry = lists.get(slug) if isinstance(lists.get(slug), dict) else {}
         ids = entry.get("ids") if isinstance(entry.get("ids"), list) else None
-        if ids is not None and (_within(entry.get("fetched"), now, LISTS_FRESH)
-                                or _within(entry.get("tried"), now, READ_RETRY)):
+        fresh = LIST_REFRESH[slug]
+        if ids is not None and (fresh is None or _within(entry.get("fetched"), now, fresh)
+                                or _within(entry.get("tried"), now, LIST_RETRY)):
             out.append(set(ids))
             continue
         try:
-            got = ta.property_list(slug, pause=lambda: run.sleep(PACE))  # PACE before each of its pages
+            got = ta.property_list(slug)
+        except TAPaused as e:
+            if ids is None:
+                raise
+            run.say(f"library: TrueAchievements {slug} list not refreshed ({_err(e)}); using the copy read "
+                    f"{str(entry.get('fetched') or '?')[:10]}", logging.WARNING)
+            out.append(set(ids))
+            continue
         except TAError as e:
             if ids is None:
                 raise _ReadFailed(f"library step: TrueAchievements {slug} list read failed, nothing planned or "
                                   f"written: {_err(e)}; retried after 6 h") from None
             lists[slug] = {**entry, "tried": now.isoformat()}
             run.say(f"library: TrueAchievements {slug} list refresh failed ({_err(e)}); using the copy read "
-                    f"{str(entry.get('fetched') or '?')[:10]}, next try in 6 h", logging.WARNING)
+                    f"{str(entry.get('fetched') or '?')[:10]}, next try in {LIST_RETRY.total_seconds() / 3600:.0f} h",
+                    logging.WARNING)
             out.append(set(ids))
             continue
         lists[slug] = {"fetched": now.isoformat(), "ids": list(got)}
@@ -733,31 +806,44 @@ def _lists(run, ta, lib: dict, now: datetime) -> tuple[set[int], set[int]]:
     return out[0], out[1]
 
 
-def _pass_rows(run, ta, lib: dict, today: str) -> list[OwnedRow]:
-    """The TA collection for today's pass. A day's pass reads it once, in its first run, never from the Deku
-    collection step's cache, and keeps it in state.library["pass"] = {"day", "rows", "done"}, where "done" lists
-    the TA ids the pass has since written, found already written or changed, or failed to write: never planned
-    again in the pass. Its later runs reuse it; a new day's pass reads it again, and takes over the quiet stops
-    ("quiet") of an earlier pass that didn't complete. Any failed read, an incomplete one included, is a
-    _ReadFailed, so nothing is planned or written from it."""
+def _pass_rows(run, ta, lib: dict, today: str, now: datetime, cost: int) -> list[OwnedRow]:
+    """The TA collection for today's pass. A day's pass reads it once, in its first run that gets to read it, never
+    from the Deku collection step's cache, and keeps it in state.library["pass"] = {"day", "rows", "done", "owned"},
+    where "done" lists the TA ids the pass has since written, found already written or changed, or failed to write:
+    never planned again in the pass, and "owned" holds the owned games `_owned` kept there before the read. Its later
+    runs reuse it; a new day's pass reads it again, and takes over the quiet stops ("quiet") of an earlier pass that
+    didn't complete. Any failed read, an incomplete one included, is a _ReadFailed, so nothing is planned or written
+    from it. A read is admitted with `cost` requests: without room, or when TA requests are held back during it,
+    TAPaused (BudgetSpent) passes through instead.
+
+    A read made in this run is also handed to the Deku collection step, in memory: `run.library_read` = (`now`, the
+    rows). The step takes it as its own read unless the library starts a TA write later in the run
+    (`run.library_wrote`). Not through the pass state: `_end` drops that when the pass completes in this run."""
     stored = lib.get("pass")
     if isinstance(stored, dict) and stored.get("day") == today:
         try:
             rows = [OwnedRow(**r) for r in stored["rows"]]
         except (KeyError, TypeError):
-            rows = None  # unreadable: read again
+            rows = None  # not read yet (only the owned games kept), or unreadable: read again
         if rows is not None:
             run.say(f"library: the TrueAchievements collection as this pass read it ({len(rows)} titles)")
             return rows
+    if not run.ta_admit(cost):
+        raise BudgetSpent(f"no room left in the day's TrueAchievements request budget for the collection read "
+                          f"({cost} requests)")
     try:
-        run.sleep(PACE)
         rows = ta.collection()
+    except TAPaused:
+        raise
     except TAError as e:
         raise _ReadFailed(f"library step: TrueAchievements collection read failed, no library writes this run: "
                           f"{_err(e)}; retried after 6 h") from None
     lib["pass"] = {"day": today, "rows": [asdict(r) for r in rows], "done": []}
+    if isinstance(stored, dict) and stored.get("day") == today and isinstance(stored.get("owned"), list):
+        lib["pass"]["owned"] = stored["owned"]  # kept by `_owned` before the read: no Microsoft read in later runs
     if isinstance(stored, dict) and isinstance(stored.get("quiet"), dict) and stored["quiet"]:
         lib["pass"]["quiet"] = dict(stored["quiet"])  # they count across passes until the game's lookup is done
+    run.library_read = (now, rows)
     run.say(f"library: read the TrueAchievements collection ({len(rows)} titles)")
     return rows
 
@@ -848,11 +934,13 @@ def _look_up(run, ta, lib: dict, plan: LibraryPlan, overrides: dict[str, dict], 
     lookup for the pass: an issue naming it and its product ids, the game out of the pass's lookups
     (`pass["lookup_failed"]`, tried again from the next day's pass), and the next game goes on, until
     MAX_LOOKUP_ERRORS failures come without a successful lookup between them (`pass["lookup_errors"]`): then the pass
-    looks nothing more up.
+    looks nothing more up. Held-back TA requests (TAPaused), or no room in the day's request budget for the game's
+    addresses, stop the lookups quietly for this run too, and count against nothing: not a quiet stop at the game, not
+    its failure, not a lookup made.
 
     Order and limits: games never looked up first, the newest purchase first, then the expired re-lookups, the
     oldest first (`_queue`); at most cfg.library_lookups games a run and cfg.library_lookups_per_day a UTC day across
-    its runs (every lookup started counts, kept in the pass's "lookups")."""
+    its runs (every lookup started counts, but one the request budget stopped; kept in the pass's "lookups")."""
     stored = lib["pass"]  # today's pass: read or made by _pass_rows before any lookup
     failed = stored.setdefault("lookup_failed", [])
     quiet = _quiet(stored, plan)
@@ -877,12 +965,20 @@ def _look_up(run, ta, lib: dict, plan: LibraryPlan, overrides: dict[str, dict], 
         slugs: list[str] = []
         try:
             slugs = candidate_slugs(g, override_for(g, overrides))
+            if not run.ta_admit(len(slugs)):
+                raise BudgetSpent(f"no room left in the day's TrueAchievements request budget for its {len(slugs)} "
+                                  "addresses")
             for slug in slugs:
-                run.sleep(PACE)
                 page = ta.game_page_or_none(slug)
                 if page is not None:
                     found.append(page)
         except Exception as e:  # noqa: BLE001 - whatever stops one game's lookup is that game's, unless it's TA's
+            if isinstance(e, TAPaused):  # held back: not a lookup made, nor a quiet stop or failure at the game
+                stored["lookups"] -= 1
+                res.stopped = _paused(e)
+                run.say(f"library: looking up {_name(g)} stopped ({_said(g, e)}); lookups stopped, the rest at a later "
+                        "run", logging.WARNING)
+                return
             if isinstance(e, PageUnavailable):
                 _quiet_stop(run, res, lib, quiet, g, e, slugs, now)
                 return
@@ -983,8 +1079,10 @@ def _reached(entry: dict) -> bool:
 class _Writer:
     """The write phase (live): unfinished writes first, then the plan's.
 
-    - At most cfg.library_budget games a run, PACE seconds before each TA request, none started past the write
-      deadline; Cloudflare or network trouble stops the writes quietly (what was started stays for the next run).
+    - At most cfg.library_budget games a run (the TA meter paces the requests), none started past the write
+      deadline, each admitted with WRITE_REQUESTS of the day's TA request budget; Cloudflare or network trouble, no
+      room for a write and held-back TA requests (TAPaused) stop the writes quietly (what was started stays for the
+      next run).
     - Write-ahead: a write goes into state.library["writing"] with what the plan saw of the entry ("expect"), saved
       before its first request; its progress ("added", "sets_done") is saved after each request; it leaves after
       its last. One left there (a crash, a stop, a partial failure) is completed at most once a pass, from where it
@@ -1001,6 +1099,9 @@ class _Writer:
       the pass's state, "errors"): then the pass writes nothing more before the next day's pass. A failed write
       that reached nothing on TA is dropped; a partial one stays for the next pass.
     - Every write made, failed or found already made goes into the pass's "done": the pass never plans it again.
+    - Every write started in this run (past its admission and write-ahead), the rest of an unfinished one included,
+      sets `run.library_wrote`: whether it completes, stops part-way (`_reached`), fails or turns out to post nothing,
+      the Deku collection step then reads the TA collection itself rather than take this run's library read.
     """
 
     def __init__(self, run, ta, lib: dict, overrides: dict[str, dict], now: datetime, res: LibraryResult):
@@ -1096,6 +1197,11 @@ class _Writer:
             res.stopped = "write deadline"
             run.say("library: writes stopped at the write deadline; the rest next run", logging.WARNING)
             return False
+        if not run.ta_admit(WRITE_REQUESTS):  # before the write-ahead: nothing is left to complete
+            res.stopped = "TrueAchievements request budget"
+            run.say(f"library: no room left in the day's TrueAchievements request budget for a write "
+                    f"({WRITE_REQUESTS} requests); the writes go on at a later run", logging.WARNING)
+            return False
         if ahead:
             self.writing[key] = entry
             if not self._save(entry, before=True):
@@ -1103,13 +1209,13 @@ class _Writer:
                 return False
         else:
             run.say(f"library: completing the unfinished TA write of {entry.get('title')}")
+        run.library_wrote = True  # from here TA may change: this run's collection read no longer shows it
         game_id = entry.get("ta_id")
         try:
             game_id = int(game_id)
             # an add's fields compare with TA's defaults for a new entry, even when its write-ahead lacks them
             expect = entry.get("expect") or (NEW_ENTRY if entry["kind"] == "add" else {})
             if entry["kind"] == "add" and not entry.get("added"):
-                run.sleep(PACE)
                 # a fresh add refuses a game TA already lists (AlreadyListed); an unfinished one may have reached TA
                 # before it was recorded (a stop during its post): found listed, it goes on to its field sets
                 self.ta.collection_add(entry["slug"], game_id=game_id, new=ahead)
@@ -1119,7 +1225,6 @@ class _Writer:
             for field_name, label in entry["sets"]:
                 if field_name in (entry.get("sets_done") or ()):
                     continue
-                run.sleep(PACE)
                 seen = expect.get(field_name)
                 self.ta.collection_set(game_id, field_name, label, expect=set(seen) if seen is not None else None)
                 entry.setdefault("sets_done", []).append(field_name)
@@ -1133,6 +1238,11 @@ class _Writer:
             self._left_alone(key, game_id, f"{entry['title']} changed on TrueAchievements since the read; left as is")
             return True
         except Exception as e:  # noqa: BLE001 - whatever stops one game's write is that game's
+            if isinstance(e, TAPaused):  # held back: what was started stays for a later run, without "tried"
+                res.stopped = _paused(e)
+                run.say(f"library: writing {entry['title']} stopped ({_err(e)}); retried at a later run",
+                        logging.WARNING)
+                return False
             if _unreachable(e):
                 res.stopped = f"TrueAchievements unreachable ({type(e).__name__})"
                 run.say(f"library: writing {entry['title']} stopped ({_err(e)}); retried next run", logging.WARNING)

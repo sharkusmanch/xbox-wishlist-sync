@@ -27,6 +27,7 @@ import urllib.parse
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from typing import Protocol
 
 from wsync.errors import ReportError
@@ -48,9 +49,11 @@ LIBRARY_CHECK_KEY = "library-check"
 LIBRARY_CHECK_TITLE = "Library sync: check by hand"
 LIBRARY_SIGNIN_KEY = "library-signin"
 LIBRARY_SIGNIN_TITLE = "Library sync: Microsoft sign-in needed"
+TA_BUDGET_KEY = "ta-budget"
+TA_BUDGET_TITLE = "TrueAchievements request budget spent"
 # Tasks that aren't problem tasks: the problem sync never closes them.
 _REVIEW_KEYS = frozenset({PLAN_REVIEW_KEY, COLLECTION_REVIEW_KEY, COLLECTION_360_REVIEW_KEY, LIBRARY_REVIEW_KEY,
-                          LIBRARY_CHECK_KEY, LIBRARY_SIGNIN_KEY})
+                          LIBRARY_CHECK_KEY, LIBRARY_SIGNIN_KEY, TA_BUDGET_KEY})
 _MARKER = re.compile(r"^wsync-key:\s*(\S+)\s*$", re.MULTILINE)
 _HINT = ("add an override in the xbox-wishlist-sync overrides ConfigMap (overrides.json): "
          "`\"{pid}\": {{\"{field}\": \"<slug>\"}}`, or `\"skip\"` as the value to stop mirroring it there")
@@ -406,6 +409,34 @@ def library_task(vk: Vikunja, key: str, title: str, body: str | None) -> bool:
     changed = vk.upsert(key, title, body)
     vk.close_duplicates(key)
     return changed
+
+
+def ta_budget_task(vk: Vikunja, body: str | None) -> bool:
+    """Keep the "request budget spent" task current, or close it (body None). True when its text changed. The run
+    opens it once a UTC day while the wishlist share or the day's ceiling is spent, and closes it at the first run of
+    a later day that has room; the problem sync never closes it (`_REVIEW_KEYS`)."""
+    if body is None:
+        vk.close(TA_BUDGET_KEY)
+        return False
+    changed = vk.upsert(TA_BUDGET_KEY, TA_BUDGET_TITLE, body)
+    vk.close_duplicates(TA_BUDGET_KEY)
+    return changed
+
+
+def ta_budget_body(day: str, usage: list[tuple[str, int, int]]) -> str:
+    """The budget task's text: what is spent on the UTC day `day`, as (share or "ceiling", requests, limit)."""
+    spent = ", ".join(f"{name} {used}/{limit}" for name, used, limit in usage)
+    reset = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+    return "\n".join([
+        f"TrueAchievements request budget spent: {spent}; TA work paused until {reset} 00:00 UTC.",
+        "The wishlist share covers the TrueAchievements side of the wishlist mirror and the Disc to Digital lists; "
+        "the ceiling covers every TrueAchievements request of the day. A step without room stops quietly: no request, "
+        "and no task opened or closed for it. Its work goes on after 00:00 UTC, and this task closes itself at the "
+        "first run of a later day that has room.",
+        "If it comes back, something sends more TrueAchievements requests than it should (TrueAchievements limits "
+        "clients that send too many): the job's `ta requests:` log lines count them per step. The limits are "
+        "`WSYNC_TA_BUDGET_WISHLIST` (the wishlist share) and `WSYNC_TA_DAILY_BUDGET` (the ceiling).",
+    ])
 
 
 def summary(plan: Plan, applied: bool) -> str | None:

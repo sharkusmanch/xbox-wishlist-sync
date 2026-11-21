@@ -84,3 +84,12 @@ def test_state_round_trips_the_library_section_and_old_files_load(tmp_path):
     assert load_state(path).library == library
     path.write_text(json.dumps({"mapping": {}, "collection_review": "abc"}))
     assert load_state(path).library == {}
+
+
+def test_state_round_trips_the_ta_budget_task_day_and_old_files_load(tmp_path):
+    path = tmp_path / "state.json"
+    state = State(ta_budget_task="2026-11-20", ta_requests={"day": "2026-11-20", "total": 80, "by": {"wishlist": 80}})
+    save_state(path, state)
+    assert load_state(path) == state
+    path.write_text(json.dumps({"mapping": {}}))
+    assert load_state(path).ta_budget_task is None

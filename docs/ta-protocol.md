@@ -307,3 +307,77 @@ Old layout:
 - Packs include title updates (`<span>Update</span>`, e.g. "Hardcore Mode") as well as add-ons.
 - A game without DLC answers the same page with no `game dlc` panels.
 - `/dlc.aspx?dlcid=<id>` redirects to `/game/<slug>/dlc/<dlc slug>`.
+
+## Request budget
+
+TrueAchievements limits clients that send too many requests, and the job shares the home IP with the
+owner's own browsing, so every TA request of a run goes through one meter (`wsync/meter.py`). It is
+the only place that counts and paces; a second client of the same run can't restart either.
+
+- **What counts.** Each request that reaches TA: every redirect hop, login page, page read, AJAX
+  call and every FlareSolverr clearance. Counts are kept per UTC day in `state.ta_requests`
+  (`day`, `total`, `by` step) and start again at the first run of a new day. The requests are counted
+  under the step running at the time: `wishlist`, `d2d`, `library`, `collection`, or `other` outside
+  any step. A clearance is counted as `clearance`: it adds to the ceiling and never to a share, and
+  it is never refused (the request that needed it is the one the budget governs).
+- **Pacing.** Requests start 4 s plus 0-3 s at random after the one before (`WSYNC_TA_GAP`,
+  `WSYNC_TA_JITTER`), counted start to start, so a slow answer doesn't add to the wait and the
+  rhythm isn't regular.
+- **Shares and ceiling.** The day has a ceiling (`WSYNC_TA_DAILY_BUDGET`, 300) and a share per step
+  (`WSYNC_TA_BUDGET_*`: wishlist 80, library 160, collection 60, other 20). The Disc to Digital lists
+  count in the wishlist share. A request is refused when it would pass its step's share or the
+  ceiling. A share or ceiling of 0 turns those requests off: each is refused, quietly, and a 0 limit
+  is never reported as spent (no warning, no task).
+- **Admission.** A unit of several requests asks first (`ta_admit`, which counts nothing) and is
+  skipped whole when it doesn't fit, so the budget isn't spent on half a unit: a wishlist item's
+  lookup (4 requests, and only while 10 more of the wishlist share stay free for the TA adds and
+  removes and the re-read after them, so lookups never spend what the writes need), the collection
+  read (its pages plus 2, from the last read's size), a library page lookup (one per address tried)
+  and a library write (7: an add takes 6 requests, a Games with Gold add 7, a fix at most 4).
+- **A spent budget is a quiet stop.** A refused request raises `BudgetSpent`, a `TAPaused`: nothing
+  was sent, and the step stops its TA work without an issue, a back-off stamp or a failure counted
+  against a game; it goes on at a later run with room. The run logs a warning per spent share. While
+  the wishlist share or the ceiling is spent, one Vikunja task a UTC day ("TrueAchievements request
+  budget spent") and one ping say so, and the first run of a later day with room closes it. The
+  other shares being spent only log. The log's `ta requests:` line gives the run's and the day's
+  counts per step.
+- **Login back-off.** A failed login (a wrong password, a server error, a Cloudflare block) is not
+  tried again for 24 h while the TA password and the session file are unchanged
+  (`state.ta_login`: the time, a hash of the two, and whether the issue was raised). The guard
+  refuses with `LoginBackoff`, another `TAPaused`, so every TA step stops quietly, but only at the
+  login: each step still sends the first page request of its work every run, and that request is
+  what finds the session not accepted (about 24 a day for the wishlist and, with both daily read
+  times at 12:30, 11 each for the library and collection steps). The guard raises its issue once
+  per episode, at the first failure. The login retried after 24 h fails the TA wishlist read while
+  TA still refuses it, an issue of its own, so a failing episode pings once a day (the runs in
+  between exit 0). A new password, a re-seeded session file (the cookies of a working browser login
+  in `/state/ta-session`; see "Session") or a login that works ends it at once. A request the meter
+  refused during a login is not a failed login.
+- **Stored wishlist misses.** A lookup that found nothing to add (no page, only a placeholder, an
+  ambiguous result, a search cut off by the page cap) is kept under `mapping[productId]["ta_miss"]`
+  with its candidates, the check time and a key: the base title, the feed's kind, the product kind and
+  the TA override. It is reused without a request until due; a changed key looks up at once, a match
+  clears it. An override page that is still a placeholder is kept the same way as `ta_override_miss`.
+  Due is the start of the product's first slot at least a day after the hour it was checked in: a
+  released game's slot is its own hour of the day (daily), a game not out yet has its own hour of
+  the week (weekly), both from a hash of the product id, so lookups made together don't come back
+  together. A lookup that failed is retried at once only for a FlareSolverr failure; otherwise the
+  item backs off 1, 2, 4 ... hours (at most 24, ending on the hour) under `ta_backoff`, kept with the
+  same key: a changed key looks up at once (its failures count from 1 again), and a lookup that got
+  an answer clears it. A lookup without budget is deferred, never kept or backed off.
+- **Disc to Digital lists.** The two TA lists are read once a week (`state.ta_lists`), not daily.
+  A failed refresh with a copy serves the copy and waits another week; with no copy it waits 24 h
+  and that run raises an issue. The runs inside the wait have no lists either (`D2DWaiting`, nothing
+  sent): they keep the cached verdicts, make no Deku format changes and keep the `d2d-disputed`
+  tasks, with a warning only, so nothing is judged on XCT.live alone. A refused read (`TAPaused`)
+  stamps nothing: it serves the copy when there is one, and without one the run goes on as in the
+  wait.
+- **Games with Gold and EA Play lists.** The library step reads Games with Gold only when it has no
+  copy (the programme ended, so the list is frozen) and EA Play when its copy is 30 days old. A failed
+  refresh keeps the copy and waits 24 h; a refused one (`TAPaused`) uses the copy and stamps nothing.
+- **The collection hand-off.** The library step's collection read is the pass's first run's, and the
+  Deku collection step takes it as its own when it is past `WSYNC_TA_READ_AFTER` and the library
+  started no TA write in that run, so one read serves both. It is per run: a library write in the
+  run that read the collection makes the Deku step read again, and writes in the pass's later runs
+  reach Deku with the next day's read. `WSYNC_LIBRARY_AFTER` defaults to 12:30 UTC, the time TA
+  imports purchases itself, so that read and the Deku step's daily one fall in the same run.

@@ -30,7 +30,8 @@ python -m wsync [--only deku|ta|collection|library] [--dry-run | --apply] [--no-
 - Exit code 0 means a clean run; 1 means a list-level failure (feed, state or overrides
   rejected, a wishlist read, a login, a write, or a post-write check failed); 2 is a bad command
   line or environment value. A failed lookup for a single game is only a warning: the game counts
-  as ambiguous for that run (removals pause) and is retried next run.
+  as ambiguous for that run (removals pause) and is retried at a later run (a TrueAchievements
+  lookup after a back-off; see [DRY_RUN warning](#dry_run-warning)).
 - Apprise gets a failure ping only when the set of failures differs from the last run's (numbers
   in the messages are ignored), so a persistent problem pings once, not hourly. A clean run
   resets it.
@@ -62,12 +63,15 @@ report.
 | `DRY_RUN` | `true` (default) plans only; `false` applies changes |
 | `COLLECTION_DRY_RUN` | The collection step's own switch: `true` (default) plans only; `false` adds to the Deku collection. A dry run (`DRY_RUN` or `--dry-run`) is always dry here too |
 | `LIBRARY_DRY_RUN` | The library step's own switch: `true` (default) plans only; `false` writes to the TrueAchievements Game Collection. A dry run (`DRY_RUN` or `--dry-run`) is always dry here too |
-| `WSYNC_LIBRARY_AFTER` | `HH:MM` (UTC, default `11:30`): the library step's daily pass starts at the first run past this time (before TA's own purchase import and the collection step's read) |
+| `WSYNC_LIBRARY_AFTER` | `HH:MM` (UTC, default `12:30`): the library step's daily pass starts at the first run past this time. Keep it just after TA's own daily purchase import (about 12:30 UTC), so the pass doesn't look up and write games TA adds itself, and at `WSYNC_TA_READ_AFTER`: the pass and the collection step's daily read then fall in the same run and share one TA collection read (see "Library step") |
 | `XBOX_REFRESH_TOKEN` | The Microsoft sign-in's **seed**: a refresh token used only when the token file has none that works, or when it is new (see "Microsoft sign-in") |
 | `WSYNC_XBOX_TOKEN` | The rotating Microsoft refresh token's file (default `/state/xbox-token.json`, mode 600) |
 | `WSYNC_LIBRARY_LOOKUPS` | The library step's TA page lookups per run, in games (default 10) |
 | `WSYNC_LIBRARY_LOOKUPS_PER_DAY` | The same per UTC day, across the day's runs (default 40) |
 | `WSYNC_LIBRARY_BUDGET` | The library step's TA writes per run, in games (default 25) |
+| `WSYNC_TA_GAP`, `WSYNC_TA_JITTER` | Seconds from one TrueAchievements request's start to the next: the gap (default 4.0) plus up to the jitter at random (default 3.0). One meter paces every TA request of a run, redirect hops, login pages and Cloudflare clearances included |
+| `WSYNC_TA_DAILY_BUDGET` | The most TA requests a UTC day, across its runs, clearances included (default 300); counted in the state file |
+| `WSYNC_TA_BUDGET_WISHLIST`, `WSYNC_TA_BUDGET_LIBRARY`, `WSYNC_TA_BUDGET_COLLECTION`, `WSYNC_TA_BUDGET_OTHER` | Each step's share of that day (defaults 80, 160, 60, 20); the wishlist share also covers the Disc to Digital lists. A step without room for its next unit of TA work stops quietly (a warning: no issue, no back-off, its problem tasks left as they are); while the wishlist share or the ceiling is spent, one Vikunja task a UTC day, "TrueAchievements request budget spent", says so (it closes at the first run of a later day with room). A share or ceiling of 0 turns those requests off: they are refused quietly and never reported as spent (no task) |
 | `COLLECTION_360_DRY_RUN` | Xbox 360 games in the collection step: `true` (default) lists them in their own review task; `false` adds them. A dry collection step is always dry here too |
 
 Credentials come only from the environment. They are never logged, put in a notification or task,
@@ -103,10 +107,35 @@ titles but only counts failed or deferred lookups ("2 lookups retried next run")
 flaked this hour doesn't change the dry-run review task or send a "plan ready" ping. A Deku entry that is on
 the wishlist but hidden from the share page gets a task and pauses Deku removals for the run.
 
-Lookups are retried once after a failure (a Cloudflare challenge or a slow FlareSolverr clearance
-can fail at random); Deku Deals GETs back off and retry on HTTP 429. TrueAchievements gives unreleased games a
-negative placeholder id that can't be wishlisted yet: such games are listed with the "no page
-yet" skips and retried every run.
+A failed Deku Deals lookup is retried once at once, and Deku Deals GETs back off and retry on HTTP 429. A failed
+TrueAchievements lookup is retried at once only when FlareSolverr failed (its clearances time out at random); anything
+else waits for a later run, so a throttling TrueAchievements isn't asked twice. The game then backs off 1, 2, 4 … hours
+after each failure in a row (at most 24 h, ending on the hour) and stays ambiguous meanwhile: removals pause, its task
+is kept.
+
+TrueAchievements gives unreleased games a negative placeholder id that can't be wishlisted yet: such games are listed
+with the "no page yet" skips. A TrueAchievements lookup that found nothing to add (no page, only a placeholder page, an
+ambiguous result, or a search cut off by the page cap) is kept in the state and reused without a request until it's
+due: at the start of the product's first re-check slot at least a day after the hour it was checked in. A released
+game's slot is its own hour of the day, so it's looked up daily. A game not out yet (feed `kind` other than `released`)
+has its own hour of the week (a hash of its productId, mod 168 hours from Monday 00:00 UTC; the same hour of the day),
+so it's looked up weekly: 1-8 days after a check outside the slot, then every 7 days. The re-checks of games first
+looked up in one run thus spread over the day and the week. A change to the game's base title, release state
+(`kind`), product kind or TrueAchievements override, an override's removal included, means a lookup at once, also
+during a back-off (whose failures then count from 1 again), and a match ends it. The ambiguity rule above still runs
+on kept results every run. An override whose page is still a placeholder is kept for its slug and the game's release
+state on the same schedule (it pauses TA removals, as before).
+A lookup waits for a later run while the day's TrueAchievements request budget has no room for its 4 requests plus 10
+more kept for the TA adds and removes: no request, nothing kept, no back-off.
+
+After a failed TrueAchievements login none is tried for 24 h while the password and the session file are unchanged
+(`state.ta_login`). The TA steps stop quietly meanwhile, but only at the login: each still sends the first page request
+of its work every run, the one that finds the session not accepted (about 24 a day for the wishlist and, with both
+daily read times at 12:30, 11 each for the library and collection steps). The episode's own issue is raised once, at
+the first failure, but the login retried every 24 h fails the TrueAchievements wishlist read again while TA still
+refuses it, so a failing episode pings once a day (the runs in between exit 0). A new password, a re-seeded session
+file (`ta-session` next to the state file, holding the cookies of a working browser login; see `docs/ta-protocol.md`,
+"Session") or a login that works ends it at once.
 
 ## Overrides
 
@@ -177,14 +206,32 @@ Microsoft licences, orders and the Store catalog -> TA -> Deku. It adds owned ga
 the collection and fixes entries with the wrong ownership; it never removes anything. Its own
 failures never affect the wishlist or Deku collection steps.
 
-**When.** One *pass* a day: the first run past `WSYNC_LIBRARY_AFTER` (UTC). A pass that has more to
-do than one run allows (page lookups, writes) goes on over the following hourly runs until nothing
-is left, and then it is complete for the day. A pass reads the TA collection **once**, in its first
-run (it needs its own read; the Deku collection step's cache is not used), keeps the rows in state
-for its later runs, and remembers which TA games it has already written so that re-planning never
-repeats a write. Microsoft is read once a pass too: the first run signs in and reads the licences,
-orders and catalog, and the later runs reuse the owned games it found (no sign-in). TA's Games with
-Gold and EA Play lists are read at most weekly.
+**When.** One *pass* a day: the first run past `WSYNC_LIBRARY_AFTER` (UTC, default 12:30, just
+after TA's own daily purchase import, so the pass doesn't spend lookups and writes on purchases TA
+imports itself). A pass that has more to do than one run allows (page lookups, writes) goes on over
+the following hourly runs until nothing is left, and then it is complete for the day. A pass reads
+the TA collection **once**, in its first run (it needs its own read; the Deku collection step's
+cache is not used), keeps the rows in state for its later runs, and remembers which TA games it has
+already written so that re-planning never repeats a write. Microsoft is read once a pass too: the
+first run signs in and reads the licences, orders and catalog, and the later runs reuse the owned
+games it found (no sign-in), also while the pass's TA collection read waits (a held TA login, a spent
+request budget). TA's Games with Gold list is read only when the state has no copy (the
+programme ended in 2023, so the list no longer changes; to read it again, delete
+`library.lists.games-with-gold` from the state), and its EA Play list every 30 days.
+
+**One collection read a day.** The Deku collection step runs after the library step in the same run.
+When the pass's first run has read the TA collection and the library starts no TA write in that run
+(any write counts, the rest of an unfinished one included, whether it completes, stops part-way,
+fails or finds nothing to post), the Deku step takes that read as its own, provided it is past the
+step's `WSYNC_TA_READ_AFTER` time: it stores it as its cached read, with the library's read time,
+and logs `collection: TrueAchievements collection from this run's library read (N titles)`. With
+`WSYNC_LIBRARY_AFTER` and `WSYNC_TA_READ_AFTER` both at 12:30, the 13:07 run then reads the
+collection once instead of twice. A run in which the library wrote costs a second read (the log says the
+library's read is not used, and why), so what the library wrote still reaches Deku in that run. The
+handover is in memory, within one run: it survives the pass completing in that run, which drops the
+pass's stored rows. The rule is per run, not per day: a library write in the run that read the
+collection makes the Deku step read again; writes in the pass's later runs reach Deku with the next
+day's read (see "Deku collection step").
 
 ### Microsoft sign-in
 
@@ -261,7 +308,7 @@ trailing tiers stripped; at most **6 candidates** per game; Windows too for a PC
 UTC day** across the day's runs (`WSYNC_LIBRARY_LOOKUPS_PER_DAY`) are looked up: games never looked
 up first, the **newest purchase first** (the latest licence or order date of the game's products;
 a game with no known date last), so a game bought today doesn't wait behind the backlog; then the
-expired re-lookups, the oldest first; **4 s** before every TA request, none past the 45-minute
+expired re-lookups, the oldest first; **4 s plus jitter** before every TA request, none past the 45-minute
 write deadline. Results are cached per game, each lifetime with a stable offset per
 product (from a hash of its first product id) so that games looked up together don't expire
 together: found pages **30-44 days** for a product seen at go-live and **7-10 days** otherwise (every
@@ -286,8 +333,8 @@ change is at most 3 issues a day.
 
 ### Writes
 
-Live only (`LIBRARY_DRY_RUN` `false`). At most **25 games a run** (`WSYNC_LIBRARY_BUDGET`), 4 s
-before each TA request, none started past the write deadline. Each write goes into state
+Live only (`LIBRARY_DRY_RUN` `false`). At most **25 games a run** (`WSYNC_LIBRARY_BUDGET`), a paced
+gap (4 s plus jitter) before each TA request, none started past the write deadline. Each write goes into state
 **before** its first request (write-ahead, with what the plan saw), is checkpointed after each
 request, and removed after its last; one left behind by a crash or stop is completed **at most once
 per pass** and never blocks the reads, the plan or other writes. A new add whose game TA already
@@ -333,27 +380,34 @@ retried for 6 hours**: the runs in between make no new read and only log a warni
 they don't fail the run or trip the stale-sync alert), as the Deku collection step's back-off does.
 Nothing is planned or written from a partial read: a Microsoft answer that isn't JSON, or a
 Collections or orders page without its items, is a failed read, never the end of the list. A failed
-refresh of TA's Games with Gold / EA Play list keeps the copy in state for up to a week (a warning).
+refresh of TA's EA Play list keeps the copy in state (a warning) and is tried again 24 hours later,
+so in practice at the next day's pass; a list read failure with no copy in state is a failed read.
 A sign-in that needs a new token is the task above, not a failure. Reporting trouble (Vikunja) is
 an issue of its own and never breaks the step.
 
 ### TA traffic it adds
 
-Every TA request is paced 4 s after the one before. A day's pass reads the Game Collection once
-(about 17 pages) and, at most weekly, TA's Games with Gold (about 5 pages) and EA Play lists. Page
+Every TA request is paced 4 s plus 0-3 s of jitter after the one before, and counted against the
+day's request budget (see `docs/ta-protocol.md`, "Request budget"). A day's pass reads the Game
+Collection once (the collection page and one list page per 100 titles), which the Deku collection
+step reuses in a run in which the library wrote nothing to TA, and TA's
+EA Play list every 30 days (the Games with Gold list, about 5 pages, only when there's no copy). Page
 lookups: at most `WSYNC_LIBRARY_LOOKUPS` games a run (default 10) and `WSYNC_LIBRARY_LOOKUPS_PER_DAY`
 a UTC day (default 40), at most 6 addresses each. Writes: at most `WSYNC_LIBRARY_BUDGET` games a run
-(default 25), about **5 requests** each (an add: the game page, its postback, then per field an
-EditOptions read and, when the field changes, an UpdateGame; a fix: the same per field). All three
-take a whole number, 0 or more.
+(default 25), each admitted with **7 requests** of the day's budget (an add: the game page, TA's AJAX
+add and a re-read of the page, then per field an EditOptions read and, when the field changes, an
+UpdateGame: 6 requests, 7 for a Games with Gold add; a fix: the same per field). All three take a
+whole number, 0 or more.
 
 The first pass over the current library has about 200 games to look up (about 800 addresses): at 40
-games a day it fills in over about 5 days, about 160 page requests a day (at most 240, and at most
-60 in one run). The results then expire spread out by product rather than together: found pages
-after 30-44 days (7-10 for products not seen at go-live, so every product while the step is dry), no
-page after 90-120 days, all under the same daily cap. A steady day reads the collection once plus a
-few re-lookups. TA withheld won/not-won data from this IP after heavy automated traffic
-(2026-11-15), so keep these budgets.
+games a day, about 160 page requests a day (at most 60 in one run), it fills in over about 5 days,
+or a day or two more: the library's share of the day's TA request budget (`WSYNC_TA_BUDGET_LIBRARY`,
+160, which also pays for the pass's collection read and its writes) stops a day's lookups well before
+the 240 addresses the lookup limits would allow. The results then expire spread out by product
+rather than together: found pages after 30-44 days (7-10 for products not seen at go-live, so every
+product while the step is dry), no page after 90-120 days, all under the same daily cap. A steady
+day reads the collection once plus a few re-lookups. TA withheld won/not-won data from this IP after
+heavy automated traffic (2026-11-15), so keep these budgets.
 
 ### Rolling back
 
@@ -377,7 +431,9 @@ run:
    means no adds that run and a failure; a failed TrueAchievements read is retried 6 h later (the
    runs in between make no new read and only log a warning: no issue, no ping). A fresh TrueAchievements
    read is not started with less than 10 minutes left before the write deadline (the step waits
-   for the next run);
+   for the next run). The library step's read in the same run, when the library wrote nothing to TA
+   after it and it is past `WSYNC_TA_READ_AFTER`, takes the place of a read of its own (see "One
+   collection read a day" under the library step);
 2. keeps the games TA marks **Owned** on Xbox Series X|S or Xbox One, and the Xbox 360 games it
    marks **Owned** or **Games with Gold** (see "Xbox 360 games" below). Windows, mobile and Switch
    rows are skipped without any Deku request, as are not-owned statuses (Game Pass, EA Play, "No
@@ -474,10 +530,14 @@ must never read as "remove everything"). If the wishlist really did shrink that 
 ## State
 
 `/state/state.json` keeps the last feed count (recorded only after a run that read the lists), the
-last failure's digest, the resolved productId → Deku slug / TA game (and
-DLC) ids, TA game ids for DLC rows, the TrueAchievements Disc to Digital lists (24 h) and XCT.live
+last failure's digest, the day's TrueAchievements request counts (`ta_requests`), the day the "request
+budget spent" task was opened for (`ta_budget_task`), the TA login back-off (`ta_login`), the resolved productId → Deku slug / TA game (and
+DLC) ids, the TrueAchievements lookups that found nothing to add (kept until due) and the failed
+ones' back-offs (all under the productId in `mapping`: `ta_miss` with its key and check time, `ta_override_miss`,
+`ta_backoff`),
+TA game ids for DLC rows, the TrueAchievements Disc to Digital lists (a week, tried again after 24 h when a refresh fails with no copy) and XCT.live
 answers (7 days; at most 10 lookups a run, oldest attempt first), and for the collection step the
-last TrueAchievements collection read (until the next `WSYNC_TA_READ_AFTER` time, or 24 h) and each owned game's Deku outcome (`matched`,
+last TrueAchievements collection read (its own, or the library step's from the same run with that read's time; until the next `WSYNC_TA_READ_AFTER` time, or 24 h) and each owned game's Deku outcome (`matched`,
 `added`, `found` = dry-run match, `none` = retried after 7 days, `adding` / `partial` = an add
 that may have left an entry) and the Deku items whose collection add is unconfirmed (never added
 again until their page shows an Xbox entry). Deleting it is safe for the caches: the next run
@@ -488,7 +548,8 @@ on Deku first.
 The **library step**'s state lives under `library` in the same file. Don't delete it whole; by key:
 
 - **Safe cache resets:** `pages` (the cached page lookups and failed-lookup stamps: looked up
-  again, within the lookup limits), `lists` (TA's Games with Gold / EA Play lists: read again), `pass` (today's pass: the TA
+  again, within the lookup limits), `lists` (TA's Games with Gold / EA Play lists: read again; deleting
+  `lists.games-with-gold` is the only way the frozen Games with Gold list is read again), `pass` (today's pass: the TA
   collection rows and owned games its first run read, the TA ids written since, the error streaks,
   the day's lookup count and the quiet stops counted against games; the next run reads Microsoft
   and TA again, its fresh read shows what was written, and the day's failed lookups and writes, its

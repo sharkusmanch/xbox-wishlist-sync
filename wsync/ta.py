@@ -83,6 +83,21 @@ class Unreachable(TAError):
     (maintenance, a throttle page). Every other address would meet it too; a later run may get through."""
 
 
+class TAPaused(Unreachable):
+    """The job holds its own TA requests back for now (a spent request budget, a login back-off): nothing was sent.
+    Every step stops quietly on it: no issue, no task opened or closed for it, no back-off stamp and no failure
+    counted against a game; the work goes on at a later run. Not a PageUnavailable: no game's address is at fault."""
+
+
+class BudgetSpent(TAPaused):
+    """The run's TA request meter refused a request, or a unit of several (admission): the step's share of the day's
+    budget, or the day's ceiling, has no room for it."""
+
+
+class LoginBackoff(TAPaused):
+    """A login failed less than 24 h ago (same password and session file): no login is tried, nothing is sent."""
+
+
 class PageUnavailable(Unreachable):
     """A game page lookup's answer at its address said TA is unavailable or throttling: an HTTP 429, 502-504 or
     Cloudflare 52x answer, or a page with no game id that isn't TA's page-not-found page. Usually every address meets
@@ -590,7 +605,11 @@ class TAClient:
         *,
         http: HttpTransport | None = None,
         game_ids: dict[str, int] | None = None,
+        meter=None,
+        login_guard=None,
     ):
+        self._guard = login_guard  # allowed() / failed(exc) / succeeded(): the run's login back-off (None: always try)
+        self._meter = meter  # the run's TAMeter: paces and counts every request (None: unmetered)
         self._tag = gamertag
         self._password = password
         self._fs = fs
@@ -640,6 +659,8 @@ class TAClient:
 
     def _refresh_clearance(self) -> None:
         """A fresh cf_clearance and user agent from an anonymous FlareSolverr GET (no cookies, no body)."""
+        if self._meter:
+            self._meter.count_clearance()
         s = self._fs.get(CLEARANCE_URL)
         if s.status >= 400:
             raise Unreachable(f"FlareSolverr's clearance fetch answered HTTP {s.status}")
@@ -678,6 +699,8 @@ class TAClient:
               follow: bool) -> tuple[HttpResponse, str]:
         """One request, following same-site redirects (each hop's cookies are kept)."""
         for _ in range(MAX_REDIRECTS + 1):
+            if self._meter:
+                self._meter.before_request()
             r = self._http.request(method, url, body, self._headers(headers))
             self._absorb(r)
             if not follow or r.status not in _REDIRECTS or not r.header("location"):
@@ -729,20 +752,38 @@ class TAClient:
     # ---- session
 
     def login(self) -> None:
-        self._cookies = {}
-        page = self._page("GET", BASE + "/login")
-        form = login_form(page.html)
-        form.update({"txtGamerTag": self._tag, "txtPassword": self._password,
-                     "Command": "btnLogin_click", "Argument": ""})
-        self._page("POST", BASE + "/login", urlencode(form), {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": BASE,
-            "Referer": BASE + "/login",
-        })
-        if not self._cookies.get("GamerToken"):
-            self._cookies = {}
-            raise AuthError("TrueAchievements login failed (check the gamertag and password)")
+        """Log in afresh. The saved session stays until a login succeeds; after a failed one (AuthError or an HTTP
+        error, or a Cloudflare block) the guard refuses further logins for 24 h (LoginBackoff, nothing sent)."""
+        guard = self._guard
+        if guard is not None and not guard.allowed():
+            raise LoginBackoff("TrueAchievements login skipped: the last one failed less than 24 h ago")
+        old, self._cookies = self._cookies, {}
+        try:
+            page = self._page("GET", BASE + "/login")
+            form = login_form(page.html)
+            form.update({"txtGamerTag": self._tag, "txtPassword": self._password,
+                         "Command": "btnLogin_click", "Argument": ""})
+            self._page("POST", BASE + "/login", urlencode(form), {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": BASE,
+                "Referer": BASE + "/login",
+            })
+            if not self._cookies.get("GamerToken"):
+                raise AuthError("TrueAchievements login failed (check the gamertag and password)")
+        except TAPaused:  # refused before it was sent (the meter): not a failed login
+            self._cookies = old
+            raise
+        except TAError as e:  # a rejected login, or the Cloudflare 403 on the form POST (an Unreachable)
+            self._cookies = old
+            if guard is not None:
+                guard.failed(e)
+            raise
+        except BaseException:
+            self._cookies = old
+            raise
         self._save()
+        if guard is not None:
+            guard.succeeded()
 
     # ---- reads
 

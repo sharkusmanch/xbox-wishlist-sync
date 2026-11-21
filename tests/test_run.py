@@ -7,13 +7,16 @@ from datetime import datetime, time as dtime, timedelta, timezone
 
 import pytest
 
+from wsync import d2d
 from wsync.deku import DekuError, DekuItem, OwnedDetail, OwnedEntry
 from wsync.errors import TAError
-from wsync.match import norm
+from wsync.flaresolverr import FlareSolverrError
+from wsync.match import base_title, norm
 from wsync.plan import Entry
-from wsync.run import Config, ConfigError, Deps, config_from, run
+from wsync.run import PLACEHOLDER, Config, ConfigError, Deps, config_from, run
 from wsync.state import State, load_state, save_state
-from wsync.ta import AlreadyListed, AuthError as TAAuthError, ChangedOnTA, IncompleteRead, TAGame
+from wsync.ta import AlreadyListed, AuthError as TAAuthError, BudgetSpent, ChangedOnTA, HttpError, IncompleteRead, LoginBackoff, TAGame
+from wsync.ta import PageUnavailable, Unreachable
 from wsync.ta_coll import OwnedRow
 
 NOW = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
@@ -155,8 +158,16 @@ class FakeTA:
         self.on_add = None  # called with the slug before an add is made
         self.on_set = None  # called with (game id, field) when a field set is asked for; may raise
         self.unlisted = set()  # TA game ids in the collection that the collection read doesn't show
+        self.meter = None  # the run's TAMeter when the test meters the fake (Harness.metered): one request a call
+
+    def _hit(self):
+        """One TA request: a metered fake asks the run's meter first, which counts it or refuses it (BudgetSpent),
+        as TAClient does before sending; a refused call is not made (nothing recorded)."""
+        if self.meter is not None:
+            self.meter.before_request()
 
     def collection(self):
+        self._hit()
         self.collection_calls += 1
         self.calls.append(("collection",))
         if self.fail_collection:
@@ -168,18 +179,21 @@ class FakeTA:
         for _ in range(self.list_pages.get(slug, 1)):
             if pause:
                 pause()
+            self._hit()
             self.calls.append(("list", slug))
             if slug in self.fail_list:
                 raise self.fail_list[slug]
         return list(self.list_ids.get(slug, []))
 
     def game_page_or_none(self, slug):
+        self._hit()
         self.calls.append(("page", slug))
         if slug in self.fail_page:
             raise self.fail_page[slug]
         return self.pages.get(slug)
 
     def collection_add(self, slug, *, game_id=None, new=False):
+        self._hit()
         self.calls.append(("gc-add", slug))
         if slug in self.fail_add:
             raise self.fail_add[slug]
@@ -201,6 +215,7 @@ class FakeTA:
     def collection_set(self, game_id, field_name, label, expect=None):
         """Compare-and-set, as the client: nothing posted when the entry already shows `label`; ChangedOnTA when it
         shows something `expect` doesn't hold."""
+        self._hit()
         self.calls.append(("gc-set", game_id, field_name, label))
         if self.on_set:
             self.on_set(game_id, field_name)
@@ -219,6 +234,7 @@ class FakeTA:
         return True
 
     def wishlist(self):
+        self._hit()
         self.wishlist_calls += 1
         if self.fail_read:
             raise self.fail_read
@@ -227,6 +243,7 @@ class FakeTA:
         return {k: Entry(k, t) for k, t in self.list.items()}
 
     def search(self, q):
+        self._hit()
         self.searches.append(q)
         key = norm(q)
         out = []
@@ -237,16 +254,19 @@ class FakeTA:
         return out
 
     def game(self, slug):
+        self._hit()
         self.fetched.append(slug)
         return self.pages[slug]
 
     def dlc(self, game):
+        self._hit()
         return self.dlcs.get(game, [])
 
     def get_html(self, url):
         raise AssertionError("D2D is faked in these tests")
 
     def add(self, game_id, dlc_id=0):
+        self._hit()
         key = str(game_id) if not dlc_id else f"{game_id}:{dlc_id}"
         if key in self.already:
             raise AlreadyListed("already")
@@ -255,6 +275,7 @@ class FakeTA:
         self.list[key] = key
 
     def remove(self, game_id, dlc_id=0):
+        self._hit()
         key = str(game_id) if not dlc_id else f"{game_id}:{dlc_id}"
         self.writes.append(("remove", key))
         self.journal.append(("ta", "remove", key))
@@ -272,6 +293,11 @@ class FakeReporter:
         self._collection_360_body = None
         self.library_tasks = []  # (key, title, body)
         self._library_bodies = {}  # key -> the open task's text
+        self.budget_tasks = []  # the TA request budget task's text at each upsert, or None when it is closed
+
+    def ta_budget_task(self, body):
+        self.budget_tasks.append(body)
+        return body is not None
 
     def sync_problems(self, problems, keep_kinds, keep_keys=frozenset()):
         self.problem_syncs.append((list(problems), set(keep_kinds)))
@@ -341,20 +367,26 @@ class Harness:
         self.tmp = tmp_path
         self.deku, self.ta, self.reporter = deku, ta, FakeReporter()
         self.made = []
+        self.meters = []
+        self.guards = []
         self.verdicts = verdicts or {}
         self.verdict_error = None
         feed = write_feed(tmp_path, records) if records is not None else tmp_path / "feed.json"
         ov = tmp_path / "overrides.json"
         if overrides is not None:
             ov.write_text(json.dumps(overrides))
-        # The library step is off unless a test opts in (library=True and a FakeXbox in `xbox`).
+        # The library step is off unless a test opts in (library=True and a FakeXbox in `xbox`); its daily pass starts
+        # after 11:30 here, so it is due at NOW (12:00; the production default is 12:30). The TA meter doesn't pace
+        # here (tests/test_meter.py covers pacing), so a metered fake never sleeps.
         self.cfg = Config(feed=feed, state=tmp_path / "state" / "state.json", overrides=ov,
                           flaresolverr_url="http://fs.invalid/v1", vikunja_url="http://vk.invalid",
-                          **{**SECRETS, "collection": False, "library": False,
-                             "xbox_token": tmp_path / "state" / "xbox-token.json", **cfg})
+                          **{**SECRETS, "collection": False, "library": False, "library_after": dtime(11, 30),
+                             "ta_gap": 0.0, "ta_jitter": 0.0, "xbox_token": tmp_path / "state" / "xbox-token.json",
+                             **cfg})
         self.clock = 0.0
         self.now = NOW
         self.xbox = None
+        self.metered = False  # True: every FakeTA call is a request the run's TA meter counts or refuses
 
     def make_xbox_http(self):
         if self.xbox is None:
@@ -371,9 +403,12 @@ class Harness:
             self.made.append("deku")
             return self.deku
 
-        def make_ta(cfg, game_ids):
+        def make_ta(cfg, game_ids, meter=None, login_guard=None):
+            self.meters.append(meter)
+            self.guards.append(login_guard)
             self.made.append("ta")
             self.ta.game_ids.update(game_ids)
+            self.ta.meter = meter if self.metered else None
             return self.ta
 
         def verdicts(items, state, fetch, http_get, now, **kw):
@@ -386,7 +421,7 @@ class Harness:
 
         return Deps(make_deku=make_deku, make_ta=make_ta, make_reporter=lambda cfg: self.reporter,
                     refresh_verdicts=verdicts, now=lambda: self.now, monotonic=mono,
-                    sleep=self.deku.sleep, make_xbox_http=self.make_xbox_http)
+                    sleep=self.deku.sleep, rand=lambda: 0.0, make_xbox_http=self.make_xbox_http)
 
     def run(self):
         return run(self.cfg, self.deps())
@@ -516,7 +551,7 @@ def test_transient_lookup_failure_is_retried_once(tmp_path):
     def flaky(q):
         calls.append(q)
         if len(calls) == 1:
-            raise TAError("FlareSolverr request.get failed: challenge timeout")
+            raise FlareSolverrError("FlareSolverr request.get failed: challenge timeout")
         return real(q)
 
     h.ta.search = flaky
@@ -937,7 +972,13 @@ def test_main_turns_sigterm_into_a_clean_failure(monkeypatch):
     before = signal.getsignal(signal.SIGTERM)
     env = {"DEKU_EMAIL": "e", "TA_GAMERTAG": "g"}
     monkeypatch.setattr(main_mod.os, "environ", env)
-    assert main_mod.main(["--no-report"]) == 1
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    try:
+        assert main_mod.main(["--no-report"]) == 1
+    finally:  # main() installs a root handler that redacts "e" and "g": never leave it to later tests' log lines
+        root.handlers[:] = handlers
+        root.setLevel(level)
     assert seen == {"terminated": True}
     assert signal.getsignal(signal.SIGTERM) == before  # restored
 
@@ -1127,7 +1168,8 @@ def test_config_library_switches():
     env = {"DEKU_EMAIL": "e", "TA_GAMERTAG": "g"}
     cfg = config_from([], env)
     assert cfg.library is True and cfg.library_dry_run is True
-    assert cfg.library_after == dtime(11, 30) and cfg.library_budget == 25 and cfg.library_lookups == 10
+    # 12:30: just after TA's own daily purchase import, so the pass doesn't look up and write what TA adds itself
+    assert cfg.library_after == dtime(12, 30) and cfg.library_budget == 25 and cfg.library_lookups == 10
     assert str(cfg.xbox_token) == "/state/xbox-token.json" and cfg.xbox_refresh_token == ""
     for value in ("false", "0", "no", "off", " FALSE "):
         assert config_from(["--apply"], {**env, "LIBRARY_DRY_RUN": value}).library_dry_run is False
@@ -1205,3 +1247,723 @@ def test_main_shares_one_live_scrubber_between_the_run_and_the_log_filter(monkey
     err = capsys.readouterr().err
     assert "seed <redacted>, token <redacted>" in err
     assert "rt-seed-Kq7" not in err and "tok-found-mid-run" not in err
+
+
+def test_one_meter_shared_by_every_client_in_a_run(tmp_path):
+    # the feed is missing, so the wishlist step returns early and the library and collection steps build their own
+    h = Harness(tmp_path, records=None, deku=FakeDeku({}, {}), ta=FakeTA({}, {}), library=True, collection=True)
+    h.run()  # the library step then fails at its Microsoft client; its TA client was built first
+    assert h.made.count("ta") == 2 and len(h.meters) == 2
+    assert h.meters[0] is not None and h.meters[0] is h.meters[1]
+    assert h.meters[0].counts is not None
+
+
+def test_run_logs_the_meter_summary(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    h = basic(tmp_path, dry_run=True)
+    h.run()
+    lines = [r.getMessage() for r in caplog.records if "this run" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].startswith("ta r")  # "ta requests: ", once per run (the test secrets scrub letters)
+    assert "this run 0; today 0 of 300" in lines[0]
+
+
+def test_meter_counts_are_saved_with_the_state_and_the_budgets_come_from_the_config(tmp_path):
+    h = basic(tmp_path, dry_run=True, ta_budget_wishlist=7, ta_daily_budget=9)
+    h.run()
+    meter = h.meters[0]
+    assert meter.admit(7, "wishlist") and not meter.admit(8, "wishlist") and not meter.admit(10, "library")
+    assert load_state(h.cfg.state).ta_requests == {"day": "2026-11-01", "total": 0, "by": {}}
+
+
+def test_config_reads_the_ta_meter_settings_from_the_environment():
+    cfg = config_from([], {"WSYNC_TA_GAP": "1.5", "WSYNC_TA_JITTER": "0", "WSYNC_TA_DAILY_BUDGET": "50",
+                           "WSYNC_TA_BUDGET_WISHLIST": "5", "WSYNC_TA_BUDGET_LIBRARY": "6",
+                           "WSYNC_TA_BUDGET_COLLECTION": "7", "WSYNC_TA_BUDGET_OTHER": "8"})
+    assert (cfg.ta_gap, cfg.ta_jitter, cfg.ta_daily_budget) == (1.5, 0.0, 50)
+    assert (cfg.ta_budget_wishlist, cfg.ta_budget_library, cfg.ta_budget_collection, cfg.ta_budget_other) == (5, 6, 7, 8)
+    default = config_from([], {})
+    assert (default.ta_gap, default.ta_jitter, default.ta_daily_budget) == (4.0, 3.0, 300)
+    assert (default.ta_budget_wishlist, default.ta_budget_library, default.ta_budget_collection,
+            default.ta_budget_other) == (80, 160, 60, 20)
+    with pytest.raises(ConfigError):
+        config_from([], {"WSYNC_TA_GAP": "fast"})
+
+
+# --------------------------------------------------------------------------- the TA request budget
+
+BUDGET_TITLE = "TrueAchievements request budget spent"
+
+
+def spent_today(**by):
+    """`state.ta_requests` for NOW's UTC day with these steps' requests already made (by earlier runs)."""
+    return {"day": "2026-11-01", "total": sum(by.values()), "by": dict(by)}
+
+
+def budget_pings(h):
+    return [b for t, b in h.reporter.notes if t == BUDGET_TITLE]
+
+
+def failure_pings(h):
+    return [b for t, b in h.reporter.notes if "failed" in t.lower()]
+
+
+def warnings(caplog, prefix):
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.getMessage().startswith(prefix)]
+
+
+def test_budget_spent_before_the_wishlist_read_leaves_the_ta_list_unsynced_and_its_tasks_untouched(tmp_path, caplog):
+    """A refusing meter (the day's wishlist share was spent by earlier runs): no TA read, lookup or write; the TA list
+    is left as --only leaves a disabled one, so its problem tasks are neither opened nor closed; the run exits 0;
+    one budget task opens."""
+    caplog.set_level(logging.INFO)
+    records = [feed_record("PA", "Alpha Quest"), feed_record("PB", "Beta Saga"), feed_record("PN", "Nowhere Game")]
+    h = basic(tmp_path, dry_run=False, records=records)
+    h.metered = True
+    save_state(h.cfg.state, State(ta_requests=spent_today(wishlist=80)))
+    assert h.run() == 0
+    assert h.ta.wishlist_calls == 0 and h.ta.searches == [] and h.ta.fetched == [] and h.ta.writes == []
+    problems, keep = h.reporter.problem_syncs[-1]
+    assert "unmatched-ta" in keep and not any(p.kind == "unmatched-ta" for p in problems)
+    assert [w[0] for w in h.deku.writes] == ["add", "update", "remove"]  # Deku is synced as usual
+    assert any(p.product_id == "PN" and p.kind == "unmatched-deku" for p in problems)
+    assert failure_pings(h) == []
+    assert warnings(caplog, "ta: not synced this run")
+    (body,) = h.reporter.budget_tasks
+    assert "wishlist 80/80" in body
+    assert len(budget_pings(h)) == 1
+    state = load_state(h.cfg.state)
+    assert state.ta_budget_task == "2026-11-01"
+    assert state.last_feed_count == 3  # a paused list is a disabled one for the shrink guard: Deku's read counts
+
+
+def test_a_ta_pause_met_by_the_wishlist_read_is_a_quiet_stop(tmp_path):
+    h = basic(tmp_path, dry_run=False)
+    h.ta.fail_read = BudgetSpent("the daily TrueAchievements request budget is spent (wishlist step)")
+    assert h.run() == 0
+    assert h.ta.searches == [] and h.ta.writes == []
+    problems, keep = h.reporter.problem_syncs[-1]
+    assert "unmatched-ta" in keep and not any(p.kind == "unmatched-ta" for p in problems)
+    assert failure_pings(h) == [] and [w[0] for w in h.deku.writes] == ["add", "update", "remove"]
+
+
+def test_budget_spent_during_ta_matching_leaves_the_ta_list_unsynced(tmp_path, caplog, monkeypatch):
+    """The share runs out inside a lookup (one that costs more than the 4 requests its admission asked room for): the
+    refused lookup isn't retried, the rest aren't looked up, and the TA list is left as a disabled one (no TA write,
+    its tasks untouched); what was looked up is kept for the next run, and the cut-short lookup is neither kept as a
+    miss nor backed off."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr("wsync.run.WRITE_RESERVE", 0)  # no room kept for the writes: a lookup can outrun the share
+    # the read, Alpha Quest's search and page, then Beta Saga's search and three of its four pages
+    h = basic(tmp_path, dry_run=False, ta_budget_wishlist=7)
+    for slug, gid, title, platform in (("beta-saga-one", 103, "Beta Saga (Xbox One)", ONE),
+                                       ("beta-saga-win", 104, "Beta Saga (Windows)", "Windows"),
+                                       ("beta-saga-360", 105, "Beta Saga (Xbox 360)", "Xbox 360")):
+        h.ta.pages[slug] = tag(slug, gid, title, platform)
+    h.metered = True
+    asked = []
+    real = h.ta.search
+
+    def search(q):
+        asked.append(q)
+        return real(q)
+
+    h.ta.search = search
+    assert h.run() == 0
+    assert asked == ["Alpha Quest", "Beta Saga"]  # Beta Saga's lookup, refused its fourth page, was not retried
+    assert h.ta.fetched == ["alpha-quest", "beta-saga", "beta-saga-one", "beta-saga-win"]
+    assert h.ta.writes == [] and failure_pings(h) == []
+    problems, keep = h.reporter.problem_syncs[-1]
+    assert "unmatched-ta" in keep and not any(p.kind == "unmatched-ta" for p in problems)
+    assert not [m for m in warnings(caplog, "ta: lookup for") if "retrying" in m]
+    mapping = load_state(h.cfg.state).mapping
+    assert mapping["PA"]["ta"]["game"] == 101
+    assert "ta_miss" not in mapping.get("PB", {}) and "ta_backoff" not in mapping.get("PB", {})
+    assert len(h.reporter.budget_tasks) == 1 and "wishlist 7/7" in h.reporter.budget_tasks[0]
+
+
+def test_budget_spent_during_ta_writes_stops_writes_quietly(tmp_path, caplog):
+    """The share holds the read and one add (both games' matches are cached, so no lookup asks for room): the second add
+    finds it spent. The other writes stay planned for the next run; no issue opens per entry, nor for the skipped
+    re-read."""
+    caplog.set_level(logging.INFO)
+    h = basic(tmp_path, dry_run=False, ta_budget_wishlist=2)
+    h.metered = True
+    save_state(h.cfg.state, State(mapping={
+        pid: {"ta": {"game": gid, "dlc": 0, "slug": slug}, "ta_key": base_title(title), "ta_title": title}
+        for pid, gid, slug, title in (("PA", 101, "alpha-quest", "Alpha Quest"),
+                                      ("PB", 102, "beta-saga", "Beta Saga"))}))
+    assert h.run() == 0
+    assert h.ta.writes == [("add", "101")]
+    assert h.ta.wishlist_calls == 1  # the verification re-read needed a request too: skipped
+    assert failure_pings(h) == []
+    assert [w[0] for w in h.deku.writes] == ["add", "update", "remove"]
+    assert any("2 writes left for the next run" in m for m in warnings(caplog, "ta: "))
+    assert len(h.reporter.budget_tasks) == 1
+    h.now = NOW + timedelta(days=1)  # a new UTC day: the rest is planned again and written
+    h.cfg.ta_budget_wishlist = 6
+    assert h.run() == 0
+    assert h.ta.writes == [("add", "101"), ("add", "102"), ("remove", "999")]
+    assert h.reporter.budget_tasks[-1] is None  # a later day with room closes the budget task
+    assert failure_pings(h) == []
+
+
+def test_budget_spent_before_the_d2d_lists_holds_deku_format_changes_quietly(tmp_path):
+    """Without a cached copy of TA's Disc to Digital lists, a refused list read keeps the cached verdicts and holds the
+    Deku format changes, as a failed refresh does, but without an issue."""
+    h = basic(tmp_path, dry_run=False)
+    h.verdict_error = BudgetSpent("the daily TrueAchievements request budget is spent (d2d step)")
+    assert h.run() == 0
+    assert failure_pings(h) == []
+    assert not any(w[0] == "update" for w in h.deku.writes)
+    assert ("add", "alpha-quest") in [w[:2] for w in h.deku.writes]
+    _, keep = h.reporter.problem_syncs[-1]
+    assert "d2d-disputed" in keep
+
+
+def test_a_run_inside_the_d2d_wait_without_a_copy_changes_no_deku_format_and_keeps_the_disputed_tasks(tmp_path):
+    """No copy of TA's Disc to Digital lists, and the read failed an hour ago (that run's issue): the runs inside the
+    24 h wait have no lists, so nothing is judged on XCT.live alone. Cached verdicts, no Deku format change, the
+    d2d-disputed tasks kept, no issue; the rest of the run goes on as usual."""
+    h = basic(tmp_path, dry_run=False)
+    h.deku.list["beta-saga"] = ("either", frozenset({"xbox_series", "xbox_one"}))  # set by an earlier "yes" verdict
+    save_state(h.cfg.state, State(ta_lists={"tried": (NOW - timedelta(hours=1)).isoformat()},
+                                  d2d={"PB": {"verdict": "yes", "checked": (NOW - timedelta(days=8)).isoformat(),
+                                              "xct": None}}))
+    xct = []
+
+    def unlisted(url, params):  # XCT.live knows neither game
+        xct.append(params["q"])
+        return {"rows": [], "shown": 0, "total": 0}
+
+    deps = h.deps()
+    deps.refresh_verdicts, deps.http_get = d2d.refresh_verdicts, unlisted  # the real lists and XCT.live logic
+    assert run(h.cfg, deps) == 0
+    assert failure_pings(h) == []
+    assert not any(w[0] == "update" for w in h.deku.writes)  # Beta Saga stays "either"
+    assert [w[:2] for w in h.deku.writes] == [("add", "alpha-quest"), ("remove", "gamma-tale")]
+    _, keep = h.reporter.problem_syncs[-1]
+    assert "d2d-disputed" in keep
+    assert xct == []
+    assert h.ta.writes == [("add", "101"), ("add", "102"), ("remove", "999")]  # the TA side is synced as usual
+
+
+@pytest.mark.parametrize("spent, text", [
+    (dict(wishlist=80), "wishlist 80/80"),
+    (dict(library=150, collection=30, clearance=120), "ceiling 300/300"),
+], ids=["wishlist-share", "ceiling"])
+def test_budget_task_opens_once_a_day_and_closes_on_the_next_day_under_budget(tmp_path, spent, text):
+    h = basic(tmp_path, dry_run=False)
+    save_state(h.cfg.state, State(ta_requests=spent_today(**spent)))
+    assert h.run() == 0
+    (body,) = h.reporter.budget_tasks
+    assert text in body and "2026-11-02 00:00 UTC" in body
+    assert len(budget_pings(h)) == 1 and text in budget_pings(h)[0]
+    h.now = NOW + timedelta(hours=1)
+    assert h.run() == 0
+    assert len(h.reporter.budget_tasks) == 1 and len(budget_pings(h)) == 1  # once a UTC day
+    h.now = NOW + timedelta(hours=12, minutes=7)  # 00:07 UTC: the next day's first run has room
+    assert h.run() == 0
+    assert h.reporter.budget_tasks == [body, None] and len(budget_pings(h)) == 1
+    assert load_state(h.cfg.state).ta_budget_task is None
+    assert h.run() == 0 and h.reporter.budget_tasks == [body, None]  # closed once
+    state = load_state(h.cfg.state)  # spent again on that day: the day's task opens, with its ping
+    state.ta_requests = {**spent_today(**spent), "day": "2026-11-02"}
+    save_state(h.cfg.state, state)
+    assert h.run() == 0
+    assert len(h.reporter.budget_tasks) == 3 and "2026-11-03 00:00 UTC" in h.reporter.budget_tasks[-1]
+    assert len(budget_pings(h)) == 2
+    assert failure_pings(h) == []
+
+
+def test_a_failed_budget_task_update_is_an_issue_and_retried_at_the_next_run(tmp_path):
+    h = basic(tmp_path, dry_run=False)
+    save_state(h.cfg.state, State(ta_requests=spent_today(wishlist=80)))
+    real = h.reporter.ta_budget_task
+
+    def down(body):
+        raise RuntimeError("vikunja down")
+
+    h.reporter.ta_budget_task = down
+    assert h.run() == 1 and "Vikunja" in failure_pings(h)[0] and budget_pings(h) == []
+    assert load_state(h.cfg.state).ta_budget_task is None
+    h.reporter.ta_budget_task = real
+    h.now = NOW + timedelta(hours=1)
+    assert h.run() == 0 and len(h.reporter.budget_tasks) == 1 and len(budget_pings(h)) == 1
+    assert load_state(h.cfg.state).ta_budget_task == "2026-11-01"
+
+
+def test_a_run_without_a_reporter_leaves_the_budget_task_to_a_run_with_one(tmp_path):
+    from wsync.run import NullReporter
+
+    h = basic(tmp_path, dry_run=True)
+    save_state(h.cfg.state, State(ta_requests=spent_today(wishlist=80)))
+    deps = h.deps()
+    deps.make_reporter = lambda cfg: NullReporter()  # --no-report
+    assert run(h.cfg, deps) == 0
+    assert load_state(h.cfg.state).ta_budget_task is None  # no task was opened, so none is recorded
+    assert h.run() == 0 and len(h.reporter.budget_tasks) == 1  # the day's task opens at the next run with a reporter
+
+
+def test_a_wishlist_share_of_0_stops_the_ta_side_without_a_budget_task(tmp_path, caplog):
+    """WSYNC_TA_BUDGET_WISHLIST=0, a way to stop the TA wishlist traffic: the TA list sits out each run quietly, and a 0
+    share is a setting, not a budget used up: no budget task, no ping, no "spent" warning."""
+    caplog.set_level(logging.INFO)
+    h = basic(tmp_path, dry_run=False, ta_budget_wishlist=0)
+    h.metered = True
+    for hours in (0, 1):
+        h.now = NOW + timedelta(hours=hours)
+        assert h.run() == 0
+    assert h.ta.wishlist_calls == 0 and h.ta.writes == []
+    assert warnings(caplog, "ta: not synced this run")
+    assert not [m for m in warnings(caplog, "ta budget:") if "spent today" in m]
+    assert h.reporter.budget_tasks == [] and budget_pings(h) == [] and failure_pings(h) == []
+
+
+def test_login_backoff_is_a_quiet_stop_with_one_issue_per_episode(tmp_path):
+    h = basic(tmp_path, dry_run=False)
+    h.ta.fail_read = LoginBackoff("TrueAchievements login skipped: the last one failed less than 24 h ago")
+    assert h.run() == 0  # a held-back login is a quiet stop, as a spent budget is
+    assert failure_pings(h) == []
+    guard = h.guards[-1]
+    assert guard.allowed()
+    # the first failed login of an episode raises the one issue ...
+    guard.failed(HttpError("POST /login answered HTTP 403", 403))
+    assert len(guard._run.issues) == 1
+    state = guard._run.state.ta_login
+    assert set(state) == {"failed", "fingerprint", "issued"} and SECRETS["ta_password"] not in json.dumps(state)
+    assert not guard.allowed()
+    # ... a later failure of the same episode (after the 24 h) raises none
+    guard._run.issues.clear()
+    h.now = h.now + timedelta(hours=25)
+    assert guard.allowed()
+    guard.failed(HttpError("POST /login answered HTTP 403", 403))
+    assert guard._run.issues == []
+    # a working login ends the episode: the next failure is a new one
+    guard.succeeded()
+    assert guard._run.state.ta_login == {}
+    guard.failed(HttpError("POST /login answered HTTP 403", 403))
+    assert len(guard._run.issues) == 1
+
+
+# --------------------------------------------------------------------------- stored TA lookup results
+
+
+def at(day, hour, minute=0):
+    """A moment in November 2026 (UTC)."""
+    return datetime(2026, 11, day, hour, minute, tzinfo=timezone.utc)
+
+
+def run_at(h, when):
+    """One run at `when`: the TA searches and game page fetches it made."""
+    h.now = when
+    h.ta.searches.clear()
+    h.ta.fetched.clear()
+    assert h.run() == 0
+    return list(h.ta.searches), list(h.ta.fetched)
+
+
+def ta_entry(h, pid):
+    return load_state(h.cfg.state).mapping.get(pid, {})
+
+
+def test_placeholder_miss_is_reused_until_due_and_keeps_its_marker(tmp_path, caplog):
+    """A game with only a pre-release placeholder page on TA is looked up once, then its stored result is used without
+    a request until it's due, with the placeholder marker intact: a "no page yet" skip, no task, no hold on removals."""
+    caplog.set_level(logging.INFO)
+    h = basic(tmp_path, dry_run=True, records=[feed_record("PP", "Delta Dawn", kind="concrete")], lists=("ta",))
+    h.ta.pages["delta-dawn"] = tag("delta-dawn", -5150, "Delta Dawn")
+    assert run_at(h, NOW) == (["Delta Dawn"], ["delta-dawn"])
+    assert ta_entry(h, "PP")["ta_miss"] == {"status": "none", "candidates": [PLACEHOLDER], "checked": NOW.isoformat(),
+                                            "key": ["delta dawn", "concrete", "game", None]}
+    # PP's weekly slot is Sunday 21:00: the first one at least a day after the check (Sunday 11-01 12:00) is 11-08
+    caplog.clear()
+    assert run_at(h, at(8, 20, 59)) == ([], [])
+    assert "ta match: Delta Dawn -> none [pre-release placeholder page]" in caplog.text
+    plan = h.reporter.reviews[-1][0]
+    assert plan.skipped_unannounced == ["Delta Dawn"]
+    assert [e.target for e in plan.ta.removes] == ["999"] and plan.ta.paused_removes == []
+    assert not any(p.product_id == "PP" for p in h.reporter.problems) and h.reporter.keep_keys == set()
+    assert run_at(h, at(8, 21)) == (["Delta Dawn"], ["delta-dawn"])
+
+
+def test_released_miss_rechecks_daily_prerelease_weekly_in_its_hour_slot(tmp_path):
+    """A kept miss is due at the start of the product's first slot at least a day after the hour it was checked in. A
+    released game's slot is its hour of the day (sha256 of the productId, mod 24, UTC), that of a game not out yet its
+    hour of the week (mod 168, from Monday 00:00 UTC), in the same hour of the day. PT's daily slot is 02:00; PY's
+    weekly slot is Sunday 04:00."""
+    records = [feed_record("PT", "Nowhere Game"), feed_record("PY", "Delta Dawn", kind="estimated")]
+    h = basic(tmp_path, dry_run=True, records=records)
+    h.ta.pages["delta-dawn"] = tag("delta-dawn", -5150, "Delta Dawn")
+    assert run_at(h, NOW)[0] == ["Nowhere Game", "Delta Dawn"]  # 11-01 12:00
+    # released: a day after (11-02 12:00), rounded up to 02:00
+    assert run_at(h, at(3, 1, 59))[0] == []
+    assert run_at(h, at(3, 2, 7))[0] == ["Nowhere Game"]
+    # checked in its slot: due again a day later, at the next 02:00
+    assert run_at(h, at(4, 1, 59))[0] == []
+    assert run_at(h, at(4, 2))[0] == ["Nowhere Game"]
+    # not out yet: the first Sunday 04:00 at least a day after the check (Sunday 11-01 12:00) is 11-08
+    assert "Delta Dawn" not in run_at(h, at(8, 3, 59))[0]
+    assert "Delta Dawn" in run_at(h, at(8, 4, 7))[0]
+    # checked in its slot: due again exactly a week later
+    assert "Delta Dawn" not in run_at(h, at(15, 3, 59))[0]
+    assert "Delta Dawn" in run_at(h, at(15, 4))[0]
+
+
+def test_weekly_due_lands_on_the_products_slot_and_repeats_exactly_weekly():
+    """A game not out yet (any kind but "released") is re-checked in its hour of the week: PP's is Sunday 21:00, PY's
+    Sunday 04:00, PZ's Monday 08:00, PT's Tuesday 02:00. Re-checked in its slot (by the run at :07), it's due again
+    exactly a week later."""
+    from wsync.run import recheck_due
+
+    for pid, slot in {"PP": (6, 21), "PY": (6, 4), "PZ": (0, 8), "PT": (1, 2)}.items():
+        due = recheck_due(pid, "concrete", NOW)  # checked on Sunday 11-01 at 12:00
+        assert (due.weekday(), due.hour, due.minute, due.second) == (*slot, 0, 0)
+        assert timedelta(days=1) <= due - NOW < timedelta(days=8)
+        for kind in ("unannounced", "estimated", "concrete", ""):
+            nxt = recheck_due(pid, kind, due + timedelta(minutes=7))
+            assert nxt - due == timedelta(days=7)
+            due = nxt
+
+
+def test_weekly_recheck_after_a_check_outside_the_slot_comes_1_to_8_days_later_in_the_slot():
+    """Never sooner than a day after the hour of the check, so a check just before the slot waits for the week after.
+    PZ's slot is Monday 08:00 (11-02 and 11-09 are Mondays)."""
+    from wsync.run import recheck_due
+
+    assert recheck_due("PZ", "estimated", at(7, 12)) == at(9, 8)  # Saturday noon: 1 day 20 h later
+    assert recheck_due("PZ", "estimated", at(9, 7, 30)) == at(16, 8)  # half an hour before the slot: a week after
+    assert recheck_due("PZ", "estimated", at(9, 9)) == at(16, 8)  # an hour after the slot: 6 days 23 h later
+    for hours in range(2 * 7 * 24):  # a check at every hour of two weeks
+        checked = at(2, 0) + timedelta(hours=hours)
+        due = recheck_due("PZ", "estimated", checked)
+        assert (due.weekday(), due.hour, due.minute) == (0, 8, 0)
+        if (checked.weekday(), checked.hour) == (0, 8):
+            assert due - checked == timedelta(days=7)
+        else:
+            assert timedelta(days=1) <= due - checked < timedelta(days=8)
+
+
+def test_weekly_slots_spread_the_rechecks_of_one_run_over_the_week():
+    """20 games not out yet, all first looked up in one run (a deploy), come back on their own weekdays, the same ones
+    whatever hour that run was. 20 over 7 days is about 3 a day; these synthetic ids put at most 6 on one day (5 on
+    Tuesday, 6 on Friday in their slots) and at least one on every day. Before, all 20 came back on the same day each
+    week."""
+    from collections import Counter
+
+    from wsync.run import recheck_due
+
+    pids = [f"PX{i:02d}" for i in range(20)]
+    weekdays = None
+    for hour in range(24):  # the hour of the run that first looked them up
+        first = [recheck_due(pid, "concrete", at(1, hour, 7)) for pid in pids]
+        assert max(Counter(d.date() for d in first).values()) <= 6
+        days = Counter(d.weekday() for d in first)
+        assert len(days) == 7 and weekdays in (None, days)
+        weekdays = days
+
+
+def test_released_rechecks_keep_the_daily_hour_slot():
+    """A released game is re-checked daily in its hour of the day (PT's is 02:00): a day after a re-check made in the
+    slot, 1-2 days after a check outside it. It's the same hour of the day as its weekly slot before release."""
+    from wsync.run import recheck_due
+
+    assert recheck_due("PT", "released", at(3, 2, 7)) == at(4, 2)
+    assert recheck_due("PT", "released", at(3, 14, 7)) == at(5, 2)
+    for hours in range(2 * 24):
+        checked = at(3, 0, 30) + timedelta(hours=hours)
+        due = recheck_due("PT", "released", checked)
+        assert (due.hour, due.minute) == (2, 0)
+        assert timedelta(hours=23) < due - checked < timedelta(days=2)
+    for pid in ("PP", "PY", "PZ", "PT", "PA", "PN"):
+        assert recheck_due(pid, "released", NOW).hour == recheck_due(pid, "concrete", NOW).hour
+
+
+def test_changed_kind_title_or_override_forces_a_lookup(tmp_path):
+    """A stored miss is keyed on the base title, the feed's kind and product kind, and the TA override: a change to any
+    of them, an override's removal included, means a lookup at once."""
+    h = basic(tmp_path, dry_run=True, records=[feed_record("PY", "Delta Dawn", kind="estimated")])
+    h.ta.pages["delta-dawn"] = tag("delta-dawn", -5150, "Delta Dawn")
+
+    def feed(title="Delta Dawn", kind="estimated", product_kind="game"):
+        write_feed(tmp_path, [feed_record("PY", title, kind=kind, product_kind=product_kind)])
+
+    hour = iter(range(1, 100))
+    later = lambda: NOW + timedelta(hours=next(hour))  # noqa: E731 - one run an hour
+
+    assert run_at(h, NOW) == (["Delta Dawn"], ["delta-dawn"])
+    assert run_at(h, later()) == ([], [])
+    feed(kind="concrete")  # the release state
+    assert run_at(h, later()) == (["Delta Dawn"], ["delta-dawn"])
+    assert run_at(h, later()) == ([], [])
+    feed(title="Delta Dawn Deluxe Edition", kind="concrete")  # the same base title
+    assert run_at(h, later()) == ([], [])
+    feed(title="Delta Dawn II", kind="concrete")  # another title
+    assert run_at(h, later())[0] == ["Delta Dawn II"]
+    assert run_at(h, later()) == ([], [])
+    feed(title="Delta Dawn II", kind="concrete", product_kind="bundle")  # the product kind
+    assert run_at(h, later())[0] == ["Delta Dawn II"]
+    assert run_at(h, later()) == ([], [])
+    h.cfg.overrides.write_text(json.dumps({"PY": {"ta": "delta-dawn"}}))  # an override
+    assert run_at(h, later()) == ([], ["delta-dawn"])
+    assert run_at(h, later()) == ([], [])
+    h.cfg.overrides.write_text(json.dumps({}))  # the override removed
+    assert run_at(h, later())[0] == ["Delta Dawn II"]
+    assert run_at(h, later()) == ([], [])
+
+
+def test_related_to_stale_still_applies_to_reused_results(tmp_path):
+    """The stored result is the raw one, from before the ambiguity rule, and the rule still runs on it every run: a game
+    with no page that is related to an entry about to be removed is ambiguous while the entry is there, and a "no page
+    yet" skip once it's gone, without a new search."""
+    records = [feed_record("PB", "Beta Saga"), feed_record("PZ", "Zeta Unseen", kind="unannounced")]
+    h = basic(tmp_path, dry_run=True, records=records)
+    h.ta.list = {"102": "Beta Saga", "888": "Zeta Unseen Prologue"}
+    assert run_at(h, NOW)[0] == ["Beta Saga", "Zeta Unseen"]
+    miss = ta_entry(h, "PZ")["ta_miss"]
+    assert (miss["status"], miss["candidates"]) == ("none", [])
+    for hours in (1, 2):
+        assert run_at(h, NOW + timedelta(hours=hours)) == ([], [])
+        plan = h.reporter.reviews[-1][0]
+        assert plan.ta.removes == [] and [e.target for e in plan.ta.paused_removes] == ["888"]
+        assert any(p.product_id == "PZ" and "Zeta Unseen Prologue" in p.detail for p in h.reporter.problems)
+    del h.ta.list["888"]  # removed on TrueAchievements by hand
+    assert run_at(h, NOW + timedelta(hours=3)) == ([], [])
+    assert not any(p.product_id == "PZ" for p in h.reporter.problems)
+    assert h.reporter.reviews[-1][0].skipped_unannounced == ["Zeta Unseen"]
+
+
+def test_reused_results_ignore_match_budget_and_lst_stop(tmp_path):
+    """Stored and cached results need no request: they're used past the lookup time budget and after repeated lookup
+    errors stopped the list's lookups, while a game that needs a lookup waits (transient)."""
+    records = [feed_record("PN", "Nowhere Game"), feed_record("PA", "Alpha Quest")]
+    h = basic(tmp_path, dry_run=True, records=records, lists=("ta",), match_budget=10.0)
+    assert run_at(h, NOW)[0] == ["Nowhere Game", "Alpha Quest"]
+
+    def reused_as_before():
+        plan = h.reporter.reviews[-1][0]
+        assert [e.target for e in plan.ta.adds] == ["101"]
+        assert any(p.product_id == "PN" and p.detail == "no page found" for p in h.reporter.problems)
+
+    # past the lookup time budget (the read takes a minute)
+    write_feed(tmp_path, [feed_record("PQ", "Fresh Find"), *records])
+    real_read = h.ta.wishlist
+
+    def slow_read():
+        h.clock += 60
+        return real_read()
+
+    h.ta.wishlist = slow_read
+    assert run_at(h, NOW + timedelta(hours=1)) == ([], [])
+    reused_as_before()
+    assert h.reporter.keep_keys == {"PQ:unmatched-ta"}
+    h.ta.wishlist = real_read
+
+    # three lookup errors in a row stop the list's lookups
+    broken = [feed_record(f"PF{i}", f"Broken Game {i}") for i in range(3)]
+    write_feed(tmp_path, [*broken, feed_record("PQ", "Fresh Find"), *records])
+    real_search = h.ta.search
+
+    def search(q):
+        if q.startswith("Broken"):
+            h.ta.searches.append(q)
+            raise Unreachable("network error: OSError")
+        return real_search(q)
+
+    h.ta.search = search
+    assert run_at(h, NOW + timedelta(hours=2))[0] == ["Broken Game 0", "Broken Game 1", "Broken Game 2"]
+    reused_as_before()
+    assert h.reporter.keep_keys == {"PF0:unmatched-ta", "PF1:unmatched-ta", "PF2:unmatched-ta", "PQ:unmatched-ta"}
+
+
+@pytest.mark.parametrize("error, retried", [
+    (Unreachable("network error: OSError"), False),
+    (PageUnavailable("game page 'x' is neither a game page nor TA's page-not-found page (no game id)"), False),
+    (HttpError("GET /search-results answered HTTP 429", 429), False),
+    (HttpError("GET /search-results answered HTTP 503", 503), False),
+    (TAError("search page has no results area (layout changed?)"), False),
+    (FlareSolverrError("FlareSolverr request.get failed: challenge timeout"), True),
+], ids=["unreachable", "page-unavailable", "http-429", "http-503", "unreadable-page", "flaresolverr"])
+def test_ta_lookup_failure_is_not_retried_in_the_same_run_but_flaresolverr_errors_are(tmp_path, error, retried):
+    h = basic(tmp_path, dry_run=False)
+    real = h.ta.search
+    calls = []
+
+    def flaky(q):
+        calls.append(q)
+        if len(calls) == 1:
+            raise error
+        return real(q)
+
+    h.ta.search = flaky
+    assert h.run() == 0
+    if retried:  # FlareSolverr's clearances time out at random: one more try at once
+        assert calls == ["Alpha Quest", "Alpha Quest", "Beta Saga"]
+        assert h.ta.writes == [("add", "101"), ("add", "102"), ("remove", "999")]
+        assert "ta_backoff" not in ta_entry(h, "PA")
+    else:  # TrueAchievements isn't asked again this run: the game waits (removals pause, its task is kept)
+        assert calls == ["Alpha Quest", "Beta Saga"]
+        assert h.ta.writes == [("add", "102")]
+        assert h.reporter.keep_keys == {"PA:unmatched-ta"}
+        assert ta_entry(h, "PA")["ta_backoff"]["failures"] == 1
+
+
+def test_a_failed_deku_lookup_is_still_retried_once(tmp_path):
+    h = basic(tmp_path, dry_run=False)
+    real = h.deku.search
+    calls = []
+
+    def flaky(q):
+        calls.append(q)
+        if len(calls) == 1:
+            raise DekuError("HTTP 502")
+        return real(q)
+
+    h.deku.search = flaky
+    assert h.run() == 0
+    assert calls[:2] == ["Alpha Quest", "Alpha Quest"]
+    assert ("add", "alpha-quest") in [w[:2] for w in h.deku.writes]
+
+
+def test_transient_failure_backs_off_1_2_4_hours_up_to_a_day_and_stays_transient(tmp_path):
+    """After each failed lookup in a row the game waits 1, 2, 4 ... hours (at most 24), to the hour, so the hourly run
+    after the delay tries it. Meanwhile it's transient without a request: TA removals pause, its task is kept."""
+    h = basic(tmp_path, dry_run=True, records=[feed_record("PA", "Alpha Quest")])
+
+    def down(q):
+        h.ta.searches.append(q)
+        raise Unreachable("network error: OSError")
+
+    h.ta.search = down
+    tries = [(at(1, 12, 7), at(1, 13)), (at(1, 13, 7), at(1, 15)), (at(1, 15, 7), at(1, 19)), (at(1, 19, 7), at(2, 3)),
+             (at(2, 3, 7), at(2, 19)), (at(2, 19, 7), at(3, 19)), (at(3, 19, 7), at(4, 19))]
+    for n, (when, until) in enumerate(tries, start=1):
+        assert run_at(h, when)[0] == ["Alpha Quest"]
+        assert ta_entry(h, "PA")["ta_backoff"] == {"failures": n, "until": until.isoformat(),
+                                                   "key": ["alpha quest", "released", "game", None]}
+        assert run_at(h, until - timedelta(minutes=1)) == ([], [])
+        plan = h.reporter.reviews[-1][0]
+        assert plan.ta.removes == [] and [e.target for e in plan.ta.paused_removes] == ["999"]
+        assert not any(p.product_id == "PA" for p in h.reporter.problems)
+        assert h.reporter.keep_keys == {"PA:unmatched-ta"}
+
+
+def test_a_changed_key_ends_a_back_off_at_once(tmp_path):
+    """A failed lookup's back-off is kept with the item's key, as a kept miss is: a change to the base title, the feed's
+    kind or product kind, or the TA override means a lookup at once, and a new key's failures count from 1."""
+    h = basic(tmp_path, dry_run=True, records=[feed_record("PA", "Alpha Quest", kind="concrete")], lists=("ta",))
+    real = h.ta.search
+
+    def down(q):
+        h.ta.searches.append(q)
+        raise Unreachable("network error: OSError")
+
+    h.ta.search = down
+    assert run_at(h, at(1, 12, 7))[0] == ["Alpha Quest"]
+    assert ta_entry(h, "PA")["ta_backoff"] == {"failures": 1, "until": at(1, 13).isoformat(),
+                                               "key": ["alpha quest", "concrete", "game", None]}
+    assert run_at(h, at(1, 12, 30)) == ([], [])  # backed off: no request
+    write_feed(tmp_path, [feed_record("PA", "Alpha Quest", kind="released")])  # out now: another key
+    assert run_at(h, at(1, 12, 40))[0] == ["Alpha Quest"]
+    assert ta_entry(h, "PA")["ta_backoff"] == {"failures": 1, "until": at(1, 13).isoformat(),
+                                               "key": ["alpha quest", "released", "game", None]}
+    assert run_at(h, at(1, 12, 50)) == ([], [])
+    h.cfg.overrides.write_text(json.dumps({"PA": {"ta": "alpha-quest"}}))  # an override: at once too
+    h.ta.search = real
+    assert run_at(h, at(1, 12, 55)) == ([], ["alpha-quest"])
+    assert "ta_backoff" not in ta_entry(h, "PA")
+    assert [e.target for e in h.reporter.reviews[-1][0].ta.adds] == ["101"]
+
+
+def test_placeholder_override_reused_weekly(tmp_path):
+    """An override whose page is still a pre-release placeholder is fetched once, then reused on the stored-miss
+    schedule (weekly in PP's slot, Sunday 21:00, before release; daily at 21:00 after), keyed on its slug and the
+    release state. It stays transient for planning: TA removals pause and no task opens."""
+    h = basic(tmp_path, dry_run=True, records=[feed_record("PP", "Delta Dawn", kind="concrete")], lists=("ta",),
+              overrides={"PP": {"ta": "delta-dawn"}})
+    h.ta.pages["delta-dawn"] = tag("delta-dawn", -5150, "Delta Dawn")
+    assert run_at(h, NOW) == ([], ["delta-dawn"])
+    assert ta_entry(h, "PP")["ta_override_miss"] == {"slug": "delta-dawn", "title": "Delta Dawn", "kind": "concrete",
+                                                     "checked": NOW.isoformat()}
+    assert run_at(h, at(8, 20, 59)) == ([], [])
+    plan = h.reporter.reviews[-1][0]
+    assert plan.ta.removes == [] and [e.target for e in plan.ta.paused_removes] == ["999"]
+    assert not any(p.product_id == "PP" for p in h.reporter.problems) and h.reporter.keep_keys == {"PP:unmatched-ta"}
+    assert run_at(h, at(8, 21)) == ([], ["delta-dawn"])
+    write_feed(tmp_path, [feed_record("PP", "Delta Dawn", kind="released")])  # out: looked up at once, then daily
+    assert run_at(h, at(8, 21, 30)) == ([], ["delta-dawn"])
+    assert run_at(h, at(9, 20, 59)) == ([], [])
+    assert run_at(h, at(9, 21)) == ([], ["delta-dawn"])
+    h.cfg.overrides.write_text(json.dumps({"PP": {"ta": "delta-dawn-xs"}}))  # another page: at once
+    h.ta.pages["delta-dawn-xs"] = tag("delta-dawn-xs", 4242, "Delta Dawn (Xbox Series X|S)")
+    assert run_at(h, at(9, 21, 30)) == ([], ["delta-dawn-xs"])
+    assert [e.target for e in h.reporter.reviews[-1][0].ta.adds] == ["4242"]
+    assert "ta_override_miss" not in ta_entry(h, "PP")
+
+
+def test_match_clears_stored_miss_and_backoff(tmp_path):
+    h = basic(tmp_path, dry_run=True, records=[feed_record("PA", "Alpha Quest")])
+    page = h.ta.pages.pop("alpha-quest")
+    assert run_at(h, NOW)[0] == ["Alpha Quest"]  # no page on TA yet
+    assert ta_entry(h, "PA")["ta_miss"]["status"] == "none"
+    real = h.ta.search
+
+    def down(q):
+        h.ta.searches.append(q)
+        raise Unreachable("network error: OSError")
+
+    h.ta.search = down  # PA's hour slot is 18: due a day after the check (11-02 12:00), at 18:00; that lookup fails
+    assert run_at(h, at(2, 18))[0] == ["Alpha Quest"]
+    entry = ta_entry(h, "PA")
+    assert entry["ta_backoff"] == {"failures": 1, "until": at(2, 19).isoformat(),
+                                   "key": ["alpha quest", "released", "game", None]} and "ta_miss" in entry
+    h.ta.search = real
+    h.ta.pages["alpha-quest"] = page  # the page is there now
+    assert run_at(h, at(2, 19))[0] == ["Alpha Quest"]
+    entry = ta_entry(h, "PA")
+    assert entry["ta"]["game"] == 101 and "ta_miss" not in entry and "ta_backoff" not in entry
+    assert [e.target for e in h.reporter.reviews[-1][0].ta.adds] == ["101"]
+
+
+def test_a_lookup_without_room_in_the_ta_budget_is_deferred_not_stored_or_backed_off(tmp_path, caplog):
+    """Admission: a fresh lookup first asks the meter for room for its 4 requests under the wishlist step, plus the 10
+    kept for the TA writes. Without it the game waits for a later run (transient: no request, nothing stored, no
+    back-off); stored results are still used and the list is synced as far as it goes. A warning, no issue."""
+    caplog.set_level(logging.INFO)
+    h = basic(tmp_path, dry_run=True, records=[feed_record("PN", "Nowhere Game")], lists=("ta",))
+    h.metered = True
+    assert run_at(h, NOW)[0] == ["Nowhere Game"]
+    write_feed(tmp_path, [feed_record("PN", "Nowhere Game"), feed_record("PQ", "Fresh Find")])
+    h.cfg.ta_budget_wishlist = 4  # a new day: the read leaves room for 3
+    assert run_at(h, at(2, 1)) == ([], [])
+    state = load_state(h.cfg.state)
+    assert state.ta_requests["by"] == {"wishlist": 1}
+    assert "ta_miss" not in state.mapping.get("PQ", {}) and "ta_backoff" not in state.mapping.get("PQ", {})
+    assert any(p.product_id == "PN" and p.detail == "no page found" for p in h.reporter.problems)  # the list synced
+    assert h.reporter.keep_keys == {"PQ:unmatched-ta"}
+    assert any("1 lookup deferred" in m for m in warnings(caplog, "ta: "))
+    assert failure_pings(h) == [] and h.reporter.budget_tasks == []
+
+
+def test_a_lookup_leaves_10_requests_of_the_wishlist_share_for_the_writes(tmp_path, caplog):
+    """A fresh lookup is admitted only while 10 requests of the wishlist share stay free after its 4, so the lookups
+    can't spend what the TA adds and removes need: with 13 left after the read the new game waits for a later run and
+    the cached game's add still goes out; with 14 left the lookup is made."""
+    caplog.set_level(logging.INFO)
+    records = [feed_record("PA", "Alpha Quest"), feed_record("PQ", "Fresh Find")]
+    h = basic(tmp_path, dry_run=False, records=records, lists=("ta",), ta_budget_wishlist=14)
+    h.ta.pages["fresh-find"] = tag("fresh-find", 103, "Fresh Find")
+    h.metered = True
+    save_state(h.cfg.state, State(mapping={"PA": {"ta": {"game": 101, "dlc": 0, "slug": "alpha-quest"},
+                                                  "ta_key": base_title("Alpha Quest"), "ta_title": "Alpha Quest"}}))
+    assert h.run() == 0
+    assert h.ta.searches == [] and h.ta.writes == [("add", "101")]  # 999's removal waits while Fresh Find does
+    assert h.reporter.keep_keys == {"PQ:unmatched-ta"}
+    assert any("1 lookup deferred" in m for m in warnings(caplog, "ta: "))
+    assert load_state(h.cfg.state).ta_requests["by"] == {"wishlist": 3}  # the read, the add and its re-read
+    h.now = NOW + timedelta(days=1)  # a new UTC day
+    h.cfg.ta_budget_wishlist = 15
+    assert h.run() == 0
+    assert h.ta.searches == ["Fresh Find"]
+    assert h.ta.writes == [("add", "101"), ("add", "103"), ("remove", "999")]
+    assert failure_pings(h) == [] and h.reporter.budget_tasks == []
