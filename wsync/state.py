@@ -13,9 +13,9 @@ from pathlib import Path
 class State:
     # productId -> {"deku": uuid|None, "deku_slug": str|None, "ta": {"game": int, "dlc": int}|None}, plus the TA
     # lookups kept until due (see wsync.run): "ta_miss": {"status": "none"|"ambiguous", "candidates", "checked": iso,
-    # "key": [base title, kind, product kind, TA override or None]}; "ta_override_miss": {"slug", "title", "kind",
-    # "checked"} (an override page still a placeholder); "ta_backoff": {"failures": n, "until": iso, "key": as
-    # "ta_miss"'s} (a back-off for another key is ignored)
+    # "key": [base title, kind, product kind, TA override or None]} (an override page still a placeholder is a "none"
+    # under its override's key); "ta_backoff": {"failures": n, "until": iso, "key": as "ta_miss"'s} (a back-off for
+    # another key is ignored)
     mapping: dict[str, dict] = field(default_factory=dict)
     # productId -> {"verdict": str, "checked": iso}
     d2d: dict[str, dict] = field(default_factory=dict)

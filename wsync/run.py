@@ -550,10 +550,6 @@ def _ta_miss_key(item: XboxItem, ov: dict) -> list:
     return [base_title(item.title), item.kind, item.product_kind, override or None]
 
 
-def _placeholder_override(title: str) -> str:
-    return f"override page {title} is a pre-release placeholder"
-
-
 def _pid_hash(pid: str) -> int:
     return int(hashlib.sha256(pid.encode()).hexdigest(), 16)
 
@@ -1178,13 +1174,18 @@ class _Run:
         stale = [e for t, e in (lst.current or {}).items() if t not in desired]
         for item in lst.items:
             m = lst.matches.get(item.product_id)
-            if m is None or m.status != "none":
+            if m is None or m.status != "none" or self._pinned(lst, item):
                 continue
             clash = sorted({e.title for e in stale if related(item.title, e.title)})
             if clash:
                 lst.matches[item.product_id] = Match("ambiguous", None, clash)
                 self.say(f"{lst.name} match: {item.title} -> ambiguous (related to a listed entry: "
                          f"{'; '.join(clash)})")
+
+    def _pinned(self, lst: _List, item: XboxItem) -> bool:
+        """An override names the item's page on this list, so no listed entry with a similar title is the item's."""
+        ov = self.overrides.get(item.product_id, {})
+        return bool(ov.get("deku")) if lst.name == "deku" else bool(ov.get("ta") or ov.get("ta_dlc"))
 
     # Deku
 
@@ -1351,14 +1352,11 @@ class _Run:
         slug, dlc = ov.get("ta"), ov.get("ta_dlc")
         if slug:
             game_id, title = self._ta_game_id(item.product_id, slug)
-            if game_id < 1:  # transient for planning, but kept for its slug until due, like a stored miss
-                now = self.deps.now()
-                self.state.mapping.setdefault(item.product_id, {})["ta_override_miss"] = {
-                    "slug": slug, "title": title, "kind": item.kind, "checked": now.isoformat()}
-                due = recheck_due(item.product_id, item.kind, now)
-                self.say(f"ta: override page for {item.title} is a pre-release placeholder; looked up again from "
-                         f"{due:%Y-%m-%d %H:%M} UTC")
-                return transient(_placeholder_override(title))
+            if game_id < 1:
+                # "No page yet", as for an unannounced game: no task, and no removal pause, since the override pins
+                # the item. Kept like any miss (`_ta_looked_up`), keyed on the override, until due.
+                self.say(f"ta: override page for {item.title} is still a pre-release placeholder")
+                return Match("none", None, [PLACEHOLDER])
             if dlc:
                 return Match("matched", _ta_key(game_id, dlc), [title])
             if is_dlc(item):
@@ -1403,7 +1401,7 @@ class _Run:
         self._ta_looked_up(item, ov, m)
         return m
 
-    # TrueAchievements: kept results (`mapping[pid]`: "ta_miss", "ta_override_miss", "ta_backoff")
+    # TrueAchievements: kept results (`mapping[pid]`: "ta_miss", "ta_backoff")
 
     def _ta_reused(self, item: XboxItem) -> Match | None:
         """The item's TA result without a request, or None when it needs a lookup: an override whose page is cached, a
@@ -1427,15 +1425,13 @@ class _Run:
         if m is not None and entry:
             if m.status == "matched":  # a match ends the kept results
                 entry.pop("ta_miss", None)
-                entry.pop("ta_override_miss", None)
             if not is_transient(m):
                 entry.pop("ta_backoff", None)
         return m
 
     def _ta_kept(self, item: XboxItem, ov: dict, entry: dict) -> Match | None:
-        """A kept lookup result while it isn't due (`recheck_due`): a miss stored for the item's key, rebuilt exactly as
-        the lookup returned it (placeholder marker included), or an override page that was still a placeholder, kept
-        for its slug and the item's release state (transient for planning, as when fetched)."""
+        """A kept lookup result while it isn't due (`recheck_due`): a miss stored for the item's key (an override page
+        still a placeholder included), rebuilt exactly as the lookup returned it, placeholder marker included."""
         now, pid = self.deps.now(), item.product_id
         miss = entry.get("ta_miss")
         if isinstance(miss, dict) and miss.get("key") == _ta_miss_key(item, ov):
@@ -1443,23 +1439,17 @@ class _Run:
             if (checked is not None and status in ("none", "ambiguous") and isinstance(candidates, list)
                     and now < recheck_due(pid, item.kind, checked)):
                 return Match(status, None, [str(c) for c in candidates])
-        held = entry.get("ta_override_miss")
-        if (isinstance(held, dict) and ov.get("ta") and held.get("slug") == ov["ta"]
-                and held.get("kind") == item.kind):
-            checked = _utc(held.get("checked"))
-            if checked is not None and now < recheck_due(pid, item.kind, checked):
-                return transient(_placeholder_override(held.get("title") or ov["ta"]))
         return None
 
     def _ta_looked_up(self, item: XboxItem, ov: dict, m: Match) -> None:
         """Keep a fresh lookup's raw result, from before `_related_to_stale` (which runs on it every run): "none" or
-        "ambiguous" as a miss for the item's key, until due. A match keeps nothing (its mapping is the cache); an
-        override page still a placeholder was kept by `_ta_override`. A lookup that got an answer ends any back-off."""
+        "ambiguous" as a miss for the item's key, until due; an override page still a placeholder is such a "none",
+        keyed on the override. A match keeps nothing (its mapping is the cache). A lookup that got an answer ends any
+        back-off."""
         entry = self.state.mapping.setdefault(item.product_id, {})
         entry.pop("ta_backoff", None)
         entry.pop("ta_miss", None)
-        if not is_transient(m):
-            entry.pop("ta_override_miss", None)
+        entry.pop("ta_override_miss", None)  # a placeholder override's own record before 2026-11-21, dropped on its next lookup
         if m.status in ("none", "ambiguous") and not is_transient(m):
             now = self.deps.now()
             entry["ta_miss"] = {"status": m.status, "candidates": list(m.candidates), "checked": now.isoformat(),

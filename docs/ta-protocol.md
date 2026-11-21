@@ -357,7 +357,8 @@ the only place that counts and paces; a second client of the same run can't rest
   ambiguous result, a search cut off by the page cap) is kept under `mapping[productId]["ta_miss"]`
   with its candidates, the check time and a key: the base title, the feed's kind, the product kind and
   the TA override. It is reused without a request until due; a changed key looks up at once, a match
-  clears it. An override page that is still a placeholder is kept the same way as `ta_override_miss`.
+  clears it. An override page that is still a placeholder is such a "none" ("no page yet": no task, no removal
+  pause), under the override's key; a game with an override is never made ambiguous by a similar listed title.
   Due is the start of the product's first slot at least a day after the hour it was checked in: a
   released game's slot is its own hour of the day (daily), a game not out yet has its own hour of
   the week (weekly), both from a hash of the product id, so lookups made together don't come back

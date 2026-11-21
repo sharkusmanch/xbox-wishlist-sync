@@ -123,8 +123,9 @@ so it's looked up weekly: 1-8 days after a check outside the slot, then every 7 
 looked up in one run thus spread over the day and the week. A change to the game's base title, release state
 (`kind`), product kind or TrueAchievements override, an override's removal included, means a lookup at once, also
 during a back-off (whose failures then count from 1 again), and a match ends it. The ambiguity rule above still runs
-on kept results every run. An override whose page is still a placeholder is kept for its slug and the game's release
-state on the same schedule (it pauses TA removals, as before).
+on kept results every run. An override whose page is still a placeholder is "no page yet", kept like any miss under
+its override's key: no task, and no TA removal pause, since the override pins the game (the ambiguity rule skips games
+with an override).
 A lookup waits for a later run while the day's TrueAchievements request budget has no room for its 4 requests plus 10
 more kept for the TA adds and removes: no request, nothing kept, no back-off.
 
@@ -533,7 +534,7 @@ must never read as "remove everything"). If the wishlist really did shrink that 
 last failure's digest, the day's TrueAchievements request counts (`ta_requests`), the day the "request
 budget spent" task was opened for (`ta_budget_task`), the TA login back-off (`ta_login`), the resolved productId → Deku slug / TA game (and
 DLC) ids, the TrueAchievements lookups that found nothing to add (kept until due) and the failed
-ones' back-offs (all under the productId in `mapping`: `ta_miss` with its key and check time, `ta_override_miss`,
+ones' back-offs (all under the productId in `mapping`: `ta_miss` with its key and check time, and
 `ta_backoff`),
 TA game ids for DLC rows, the TrueAchievements Disc to Digital lists (a week, tried again after 24 h when a refresh fails with no copy) and XCT.live
 answers (7 days; at most 10 lookups a run, oldest attempt first), and for the collection step the
